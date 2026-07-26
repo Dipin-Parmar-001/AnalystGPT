@@ -1,0 +1,30 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python virtual environment & cache
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Telemetry & IDE configs
+.logfire/
+.vscode/
+.idea/
+.DS_Store
+
+# Ignore contents of folders while keeping folder structures
+scratch/*
+!scratch/.gitkeep
+
+uploads/*
+!uploads/.gitkeep
+
+outputs/*
+!outputs/.gitkeep
