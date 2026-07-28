@@ -284,6 +284,41 @@ class MessageHistoryManager:
                     self.state.files.append(n)
         return "\n\n".join(parts)
 
+    def prepare_user_prompt(self, user_prompt: str, files: Optional[Any] = None) -> str:
+        """Formats context block and input files, appends to message history, and returns prompt content."""
+        prompt_content = self.build_prompt_content(user_prompt, files=files)
+        self.append_user(prompt_content)
+        return prompt_content
+
+    def append_assistant_response(self, response_msg: Any) -> Dict[str, Any]:
+        """Serializes LLM response message object into history dictionary and updates action checklist."""
+        msg_dict: Dict[str, Any] = {
+            "role": "assistant",
+            "content": response_msg.content,
+        }
+        if getattr(response_msg, "tool_calls", None):
+            msg_dict["tool_calls"] = [
+                tc.model_dump() if hasattr(tc, "model_dump") else tc
+                for tc in response_msg.tool_calls
+            ]
+        self.append_assistant(msg_dict)
+        return msg_dict
+
+    def append_external_feedback(self, stdout: str, stderr: str, success: bool = True) -> str:
+        """Formats and appends external code execution results into history."""
+        output_summary = f"Execution Status: {'Success' if success else 'Failed'}\n"
+        if stdout:
+            output_summary += f"STDOUT:\n{stdout}\n"
+        if stderr:
+            output_summary += f"STDERR:\n{stderr}\n"
+
+        feedback_message = (
+            f"Code Execution Result:\n{output_summary}\n"
+            "Analyze these results, organize findings, and output the next step summary & code snippet (or final insights if complete)."
+        )
+        self.append_user(feedback_message)
+        return feedback_message
+
     def reset_conversation(self, keep_state: bool = True, keep_checklist: bool = True):
         self.messages = [{"role": "system", "content": self.system_prompt}]
         if not keep_state:
@@ -293,3 +328,4 @@ class MessageHistoryManager:
 
     def token_usage(self) -> Dict[str, int]:
         return {"total_tokens": self._total_tokens(), "budget": self.max_tokens_before_compact}
+

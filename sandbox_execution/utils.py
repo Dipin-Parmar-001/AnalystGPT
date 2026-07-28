@@ -44,7 +44,17 @@ DEFAULT_SANDBOX_PACKAGES = [
     "seaborn",
     "scikit-learn",
     "scipy",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "statsmodels",
+    "plotly",
+    "joblib",
     "openpyxl",
+    "xlrd",
+    "xlsxwriter",
+    "pyarrow",
+    "tabulate",
 ]
 
 
@@ -340,9 +350,9 @@ if HAS_MODAL:
 
     @_default_app.function(
         image=_default_image,
-        timeout=60,
-        memory=1024,
-        cpu=1.0,
+        timeout=500,
+        memory=2048,
+        cpu=2.0,
         serialized=True,
     )
     def global_execute_python_in_sandbox(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:

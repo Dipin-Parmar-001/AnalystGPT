@@ -16,7 +16,8 @@ if sys.stderr.encoding != 'utf-8':
 # Ensure workspace root is in sys.path for direct execution
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from agents.tools import execute_python, EXECUTE_PYTHON_TOOL_SPEC, reset_global_sandbox_manager
+from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
+from agents.tools import reset_global_sandbox_manager
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens
 
@@ -35,7 +36,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Registry of tools available to the agent
+# Legacy dictionary export for backwards compatibility
 AVAILABLE_TOOLS = {
     "execute_python": execute_python
 }
@@ -113,17 +114,17 @@ say so in your final answer and explain what would be needed, rather than making
  
 Do not use separate tool calls to "peek" at the dataset (e.g. df.head(), df.info() alone) before the
 real analysis — fold that inspection into the same script as the rest of the work.
-
+ 
 ==================================================
 EXECUTION STATE
 ==================================================
-
+ 
 All execute_python calls within the same user request share the same Python session and working directory.
-
+ 
 Variables, imported libraries, loaded DataFrames and generated files remain available between retries.
-
+ 
 Do not reload the dataset or recreate files unless necessary.
-
+ 
 If a retry is required, continue from the existing session whenever possible.
  
 ==================================================
@@ -165,6 +166,7 @@ class DataAnalystAgent:
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 200,
         max_tokens_before_compact: int = 3000,
+        tool_manager: Optional[ToolManager] = None,
     ):
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
@@ -202,6 +204,9 @@ class DataAnalystAgent:
             except Exception as e:
                 logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
 
+        # Tool execution workflow manager
+        self.tool_manager = tool_manager or ToolManager()
+
         # Memory and history manager instance
         self.memory_manager = MessageHistoryManager(
             system_prompt=SYSTEM_PROMPT,
@@ -224,7 +229,6 @@ class DataAnalystAgent:
         if not keep_state and reset_global_sandbox_manager is not None:
             reset_global_sandbox_manager()
 
-
     def token_usage(self) -> Dict[str, int]:
         """Returns token usage telemetry."""
         return self.memory_manager.token_usage()
@@ -238,8 +242,9 @@ class DataAnalystAgent:
             "model": "nvidia/nemotron-3-ultra-550b-a55b",
             "messages": messages,
         }
-        if tools:
-            kwargs["tools"] = tools
+        effective_tools = tools if tools is not None else self.tool_manager.get_tool_specs()
+        if effective_tools:
+            kwargs["tools"] = effective_tools
 
         def _do_call():
             try:
@@ -281,7 +286,7 @@ class DataAnalystAgent:
                 raise RuntimeError(f"Portkey Gateway call failed: {err}") from err
 
         if HAS_LOGFIRE:
-            tool_names = [t.get("function", {}).get("name") for t in tools] if tools else []
+            tool_names = [t.get("function", {}).get("name") for t in effective_tools] if effective_tools else []
             with logfire.span(
                 "LLM Completion Request",
                 model="nvidia/nemotron-3-ultra-550b-a55b",
@@ -311,26 +316,13 @@ class DataAnalystAgent:
         Sends a user prompt to the agent and runs an autonomous tool execution loop 
         using Modal cloud sandbox tools, managed with token-budgeted memory compaction and rich Logfire telemetry.
         """
-        prompt_content = self.memory_manager.build_prompt_content(user_prompt, files=files)
-        self.memory_manager.append_user(prompt_content)
+        self.memory_manager.prepare_user_prompt(user_prompt, files=files)
 
         def _run_turns():
             for turn in range(max_turns):
                 def _do_turn():
-                    response_msg = self._call_llm(self.memory_manager.messages, tools=[EXECUTE_PYTHON_TOOL_SPEC])
-                    
-                    # Serialize Assistant Message to dict for history
-                    msg_dict: Dict[str, Any] = {
-                        "role": "assistant",
-                        "content": response_msg.content,
-                    }
-                    if response_msg.tool_calls:
-                        msg_dict["tool_calls"] = [
-                            tc.model_dump() if hasattr(tc, "model_dump") else tc
-                            for tc in response_msg.tool_calls
-                        ]
-                    
-                    self.memory_manager.append_assistant(msg_dict)
+                    response_msg = self._call_llm(self.memory_manager.messages, tools=self.tool_manager.get_tool_specs())
+                    self.memory_manager.append_assistant_response(response_msg)
 
                     if response_msg.content:
                         if HAS_LOGFIRE:
@@ -351,102 +343,10 @@ class DataAnalystAgent:
                         print(f"[Agent] Model requested {len(tool_calls)} tool execution(s).", flush=True)
 
                     for tool_call in tool_calls:
-                        tool_call_id = tool_call.id
-                        fn_name = tool_call.function.name
-                        raw_args = tool_call.function.arguments or "{}"
+                        tool_call_id = getattr(tool_call, "id", None) or tool_call.get("id", "")
+                        fn_name = tool_call.function.name if hasattr(tool_call, "function") else tool_call.get("function", {}).get("name", "")
                         
-                        # Robust JSON decoding with explicit Logfire error capturing
-                        parse_error = None
-                        try:
-                            fn_args = json.loads(raw_args)
-                        except Exception as parse_err:
-                            fn_args = {}
-                            parse_error = f"{type(parse_err).__name__}: {str(parse_err)}"
-                            if HAS_LOGFIRE:
-                                logfire.error(
-                                    "LLM Tool Call JSON Argument Parsing Failed",
-                                    tool_call_id=tool_call_id,
-                                    fn_name=fn_name,
-                                    raw_arguments=raw_args,
-                                    parse_error=parse_error,
-                                    traceback=traceback.format_exc(),
-                                )
-                            else:
-                                print(f"[Tool Parse Error] Failed to parse JSON for '{fn_name}' (ID: {tool_call_id}). Raw: {raw_args}. Error: {parse_error}")
-
-                        def _execute_tool():
-                            if fn_name in AVAILABLE_TOOLS:
-                                if files and "files" not in fn_args:
-                                    fn_args["files"] = files
-
-                                try:
-                                    tool_res = AVAILABLE_TOOLS[fn_name](**fn_args)
-                                except Exception as err:
-                                    tool_res = {
-                                        "success": False,
-                                        "error": f"Tool execution raised exception: {str(err)}",
-                                        "stderr": traceback.format_exc(),
-                                    }
-                                    if HAS_LOGFIRE:
-                                        logfire.error(
-                                            "Tool Execution Raised Exception",
-                                            fn_name=fn_name,
-                                            tool_call_id=tool_call_id,
-                                            error=str(err),
-                                            traceback=traceback.format_exc(),
-                                        )
-                            else:
-                                tool_res = {
-                                    "success": False,
-                                    "error": f"Unknown tool requested by model: '{fn_name}'",
-                                }
-                                if HAS_LOGFIRE:
-                                    logfire.warn(
-                                        "Model requested unknown tool",
-                                        requested_tool=fn_name,
-                                        available_tools=list(AVAILABLE_TOOLS.keys()),
-                                    )
-
-                            is_success = tool_res.get("success", False)
-                            exec_time = tool_res.get("execution_time", 0.0)
-                            returned_files = tool_res.get("returned_files", [])
-                            stdout_str = str(tool_res.get("stdout", ""))
-                            stderr_str = str(tool_res.get("stderr", ""))
-
-                            if HAS_LOGFIRE:
-                                log_func = logfire.info if is_success else logfire.error
-                                log_func(
-                                    f"Tool Execution {'SUCCESS' if is_success else 'FAILED'}: {fn_name}",
-                                    fn_name=fn_name,
-                                    tool_call_id=tool_call_id,
-                                    success=is_success,
-                                    execution_time=exec_time,
-                                    code=fn_args.get("code", "") if isinstance(fn_args, dict) and "code" in fn_args else None,
-                                    returned_files=returned_files,
-                                    stdout_snippet=stdout_str[:500],
-                                    stderr_snippet=stderr_str[-500:] if len(stderr_str) > 500 else stderr_str,
-                                    error=tool_res.get("error"),
-                                    parse_error=parse_error,
-                                )
-                            else:
-                                print(f"[Tool Result]: status={'SUCCESS' if is_success else 'FAILED'} (time: {exec_time}s)", flush=True)
-
-                            return tool_res
-
-                        if HAS_LOGFIRE:
-                            with logfire.span(
-                                f"Tool Call: {fn_name}",
-                                fn_name=fn_name,
-                                tool_call_id=tool_call_id,
-                                raw_arguments=raw_args,
-                                parsed_arguments=fn_args,
-                                parse_error=parse_error,
-                            ):
-                                tool_result = _execute_tool()
-                        else:
-                            print(f"\n[Tool Execution Request]: '{fn_name}' (ID: {tool_call_id})", flush=True)
-                            tool_result = _execute_tool()
-
+                        tool_result = self.tool_manager.execute_tool_call(tool_call, files=files)
                         self.memory_manager.append_tool_result(tool_call_id, fn_name, tool_result)
 
                     return None
@@ -470,83 +370,67 @@ class DataAnalystAgent:
         else:
             return _run_turns()
 
-
     def send_execution_results(self, stdout: str, stderr: str, success: bool = True) -> str:
         """
         Feeds external execution outputs (stdout, stderr, status) from a cloud sandbox
         or runner environment back into the agent conversation loop.
         """
-        output_summary = f"Execution Status: {'Success' if success else 'Failed'}\n"
-        if stdout:
-            output_summary += f"STDOUT:\n{stdout}\n"
-        if stderr:
-            output_summary += f"STDERR:\n{stderr}\n"
-
-        feedback_message = (
-            f"Code Execution Result:\n{output_summary}\n"
-            "Analyze these results, organize findings, and output the next step summary & code snippet (or final insights if complete)."
-        )
-
-        self.memory_manager.append_user(feedback_message)
+        self.memory_manager.append_external_feedback(stdout, stderr, success)
         response_msg = self._call_llm(self.memory_manager.messages)
         res_text = response_msg.content or ""
-        self.memory_manager.append_assistant({"role": "assistant", "content": res_text})
+        self.memory_manager.append_assistant_response(response_msg)
         return res_text
-
-
 
 
 if __name__ == "__main__":
     print("Initializing Data Analyst Agent with Modal Cloud Sandbox Tool...")
     agent = DataAnalystAgent()
 
-    dataset_file = "uploads/test.csv"
-    user_request = f"""You are an expert business analyst.
+    dataset_file = "uploads/customer_churn_dataset.csv"
+    user_request = f"""You are an expert data scientist.
 
-The uploaded CSV "{dataset_file}" contains company sales data.
+Analyze the attached customer churn dataset '{dataset_file}' and perform a complete machine learning workflow.
 
-Perform a complete business analysis.
+Requirements:
 
-Your workflow should be:
+1. Load and inspect the dataset.
+2. Check for missing values, duplicate rows, and incorrect data types.
+3. Perform exploratory data analysis with meaningful visualizations.
+4. Explain the relationships between important features and customer churn.
+5. Encode categorical variables appropriately.
+6. Split the dataset into training and testing sets.
+7. Train multiple machine learning classification models including:
+   - Logistic Regression
+   - Random Forest
+   - Gradient Boosting
+   - XGBoost (if available)
+8. Perform hyperparameter tuning where appropriate.
+9. Compare all models using:
+   - Accuracy
+   - Precision
+   - Recall
+   - F1 Score
+   - ROC-AUC
+   - Confusion Matrix
+10. Select the best-performing model based on the evaluation metrics.
+11. Display feature importance (or model coefficients if applicable).
+12. Predict churn probability for the entire dataset using the best model.
+13. Save the predictions as:
+    predictions.csv
+14. Save every generated plot as PNG files.
+15. Write a detailed summary explaining:
+    - Which model performed best
+    - Why it performed best
+    - The most important factors affecting churn
+    - Practical business recommendations for reducing churn
 
-1. Load the CSV using Python.
-2. Clean the data if required.
-3. Validate column types.
-4. Compute descriptive statistics.
-5. Calculate:
-   - Total Revenue
-   - Total Profit
-   - Profit Margin
-   - Average Order Value
-   - Revenue by Region
-   - Revenue by Category
-   - Revenue by Product
-   - Revenue by Salesperson
-6. Identify:
-   - Best selling products
-   - Least selling products
-   - Most profitable products
-   - Least profitable products
-   - Highest performing region
-   - Lowest performing region
-7. Detect outliers.
-8. Find unusual trends.
-9. Create appropriate visualisations.
-10. Explain every chart.
-11. Produce executive insights.
-12. Recommend at least 10 actionable business recommendations.
-
-Return:
-- Summary
-- Tables
-- Charts
-- Insights
-- Recommendations
-
-Use Python whenever calculations or visualisations are required."""
+Important:
+- Do not stop after training one model.
+- Automatically recover from minor errors if they occur.
+- Produce publication-quality plots.
+- Save every output file."""
 
     print(f"\n--- User Request: {user_request} ---")
     final_analysis = agent.prompt_agent(user_prompt=user_request, files=[dataset_file])
     print("\n================ FINAL AGENT ANALYSIS ================")
     print(final_analysis)
-
