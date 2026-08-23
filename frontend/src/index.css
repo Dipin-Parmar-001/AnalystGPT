@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-primary: #0B0F19;
+    --card-bg: #141B2D;
+    --card-border: #1E293B;
+  }
+
+  body {
+    background-color: var(--bg-primary);
+    color: #F1F5F9;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* Custom sleek scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0B0F19;
+}
+::-webkit-scrollbar-thumb {
+  background: #1E293B;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+/* Glassmorphism utility */
+.glass-panel {
+  background: rgba(20, 27, 45, 0.75);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(30, 41, 59, 0.8);
+}
+
+.glass-card {
+  background: rgba(26, 34, 52, 0.6);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(51, 65, 85, 0.5);
+}
+
+/* Subtle glow badges */
+.glow-primary {
+  box-shadow: 0 0 15px rgba(99, 102, 241, 0.35);
+}
+.glow-danger {
+  box-shadow: 0 0 15px rgba(239, 68, 68, 0.35);
+}
+.glow-success {
+  box-shadow: 0 0 15px rgba(16, 185, 129, 0.35);
+}
+.glow-warning {
+  box-shadow: 0 0 15px rgba(245, 158, 11, 0.35);
+}
+
+/* Markdown styling inside reports */
+.markdown-body h1 {
+  @apply text-2xl font-bold text-slate-100 mt-6 mb-3 border-b border-slate-700/60 pb-2 flex items-center gap-2;
+}
+.markdown-body h2 {
+  @apply text-xl font-semibold text-brand-secondary mt-5 mb-2 border-b border-slate-800 pb-1;
+}
+.markdown-body h3 {
+  @apply text-lg font-medium text-slate-200 mt-4 mb-2;
+}
+.markdown-body p {
+  @apply text-slate-300 my-2 leading-relaxed text-sm;
+}
+.markdown-body ul, .markdown-body ol {
+  @apply pl-6 my-2 text-slate-300 text-sm space-y-1 list-disc;
+}
+.markdown-body ol {
+  @apply list-decimal;
+}
+.markdown-body table {
+  @apply w-full my-4 border-collapse text-xs;
+}
+.markdown-body th {
+  @apply bg-surface-100 border border-surface-border text-slate-200 font-semibold p-2.5 text-left;
+}
+.markdown-body td {
+  @apply border border-surface-border p-2 text-slate-300;
+}
+.markdown-body tr:nth-child(even) {
+  @apply bg-surface-200/40;
+}
+.markdown-body blockquote {
+  @apply border-l-4 border-brand-primary pl-4 py-1 my-3 bg-brand-primary/10 rounded-r text-slate-300 italic text-sm;
+}
+.markdown-body code {
+  @apply bg-surface-200 text-brand-secondary px-1.5 py-0.5 rounded font-mono text-xs border border-slate-700/50;
+}
+.markdown-body pre {
+  @apply bg-surface-200/90 border border-slate-700/80 p-3 rounded-lg overflow-x-auto my-3 font-mono text-xs;
+}
+.markdown-body pre code {
+  @apply bg-transparent p-0 border-none text-slate-200;
+}

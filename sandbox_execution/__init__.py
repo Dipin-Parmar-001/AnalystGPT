@@ -13,6 +13,8 @@ from sandbox_execution.utils import (
     format_execution_result,
     clean_output_stream,
     DEFAULT_SANDBOX_PACKAGES,
+    build_file_registry,
+    format_file_registry_prompt,
 )
 from sandbox_execution.tool_manager import (
     ToolManager,
@@ -31,6 +33,8 @@ __all__ = [
     "format_execution_result",
     "clean_output_stream",
     "DEFAULT_SANDBOX_PACKAGES",
+    "build_file_registry",
+    "format_file_registry_prompt",
     "ToolManager",
     "execute_python",
     "EXECUTE_PYTHON_TOOL_SPEC",

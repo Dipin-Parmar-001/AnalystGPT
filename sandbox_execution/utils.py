@@ -11,6 +11,7 @@ This module manages:
 
 import os
 import io
+import json
 import time
 import mimetypes
 import tempfile
@@ -40,21 +41,16 @@ except ImportError:
 DEFAULT_SANDBOX_PACKAGES = [
     "pandas",
     "numpy",
+    "scipy",
     "matplotlib",
     "seaborn",
     "scikit-learn",
-    "scipy",
     "xgboost",
     "lightgbm",
     "catboost",
-    "statsmodels",
-    "plotly",
+    "imbalanced-learn",
     "joblib",
     "openpyxl",
-    "xlrd",
-    "xlsxwriter",
-    "pyarrow",
-    "tabulate",
 ]
 
 
@@ -113,16 +109,138 @@ def build_sandbox_image(
 
 
 # ==========================================
-# 2. File Input / Sending Utilities
+# 2. File Registry & File Input Utilities
 # ==========================================
+
+def resolve_file_path(file_path: Union[str, Path]) -> str:
+    """
+    Robustly resolves a file path across:
+    1. Direct absolute/relative path
+    2. Project workspace root
+    3. uploads/ folder
+    4. outputs/ folder
+    5. Case-insensitive filename match in uploads/
+    """
+    if not file_path:
+        raise FileNotFoundError("Empty file path provided.")
+
+    p_str = str(file_path).strip()
+    if os.path.exists(p_str) and not os.path.isdir(p_str):
+        return os.path.abspath(p_str)
+
+    workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    base_name = os.path.basename(p_str)
+
+    candidates = [
+        os.path.join(workspace_root, p_str),
+        os.path.join(workspace_root, "uploads", base_name),
+        os.path.join(workspace_root, "uploads", p_str),
+        os.path.join(workspace_root, "outputs", base_name),
+        os.path.join(workspace_root, base_name),
+        os.path.join(os.getcwd(), "uploads", base_name),
+        os.path.join(os.getcwd(), "outputs", base_name),
+        os.path.join(os.getcwd(), "..", "uploads", base_name),
+        os.path.join(os.getcwd(), "..", "outputs", base_name),
+    ]
+
+    for cand in candidates:
+        if os.path.exists(cand) and not os.path.isdir(cand):
+            return os.path.abspath(cand)
+
+    # Case-insensitive fallback in uploads/
+    uploads_dir = os.path.join(workspace_root, "uploads")
+    if os.path.exists(uploads_dir):
+        for existing in os.listdir(uploads_dir):
+            if existing.lower() == base_name.lower():
+                cand_upload = os.path.join(uploads_dir, existing)
+                if os.path.exists(cand_upload) and not os.path.isdir(cand_upload):
+                    return os.path.abspath(cand_upload)
+
+    raise FileNotFoundError(f"File not found: '{file_path}'. Checked workspace and uploads folder.")
+
+
+def build_file_registry(
+    files: Optional[Union[List[str], Dict[str, Any]]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Constructs a structured FILE_REGISTRY dictionary mapping filename / relative path
+    to file metadata and concrete path inside the sandbox environment.
+    """
+    registry: Dict[str, Dict[str, Any]] = {}
+    if not files:
+        return registry
+
+    if isinstance(files, list):
+        for f in files:
+            if not f:
+                continue
+            base = os.path.basename(str(f))
+            ext = os.path.splitext(base)[1].lstrip(".").lower() or "unknown"
+            size = 0
+            try:
+                resolved_p = resolve_file_path(f)
+                size = os.path.getsize(resolved_p)
+            except Exception:
+                pass
+            entry = {
+                "filename": base,
+                "path": base,
+                "type": ext,
+                "size_bytes": size,
+            }
+            registry[base] = entry
+            # Also register normalized relative path if different
+            rel_norm = str(f).replace("\\", "/")
+            if rel_norm != base:
+                registry[rel_norm] = entry
+    elif isinstance(files, dict):
+        for fname, content in files.items():
+            base = os.path.basename(str(fname))
+            ext = os.path.splitext(base)[1].lstrip(".").lower() or "unknown"
+            size = len(content) if isinstance(content, (bytes, str)) else 0
+            entry = {
+                "filename": base,
+                "path": base,
+                "type": ext,
+                "size_bytes": size,
+            }
+            registry[base] = entry
+            if fname != base:
+                registry[fname] = entry
+
+    return registry
+
+
+def format_file_registry_prompt(files: Optional[Union[List[str], Dict[str, Any]]]) -> str:
+    """
+    Formats the file registry as a readable Python definition and guidelines block for LLM prompts.
+    """
+    if not files:
+        return "=== FILE REGISTRY ===\nNo uploaded files available.\n"
+    registry = build_file_registry(files)
+    # Simplify dictionary for prompt clarity (show unique basenames)
+    prompt_registry = {v["filename"]: {"path": v["path"], "type": v["type"]} for v in registry.values()}
+    lines = [
+        "=== FILE REGISTRY & DATASET PATHS ===",
+        "The following dataset file(s) are registered and available in the Python sandbox:",
+        "```python",
+        f"FILE_REGISTRY = {json.dumps(prompt_registry, indent=2)}",
+        "```",
+        "Loading Instructions:",
+        "- Load directly by registry filename: e.g. pd.read_csv('filename.csv')",
+        "- Or use the available helper function: e.g. pd.read_csv(get_file_path('filename.csv'))",
+        "- Do NOT use directory prefixes like 'uploads/' or 'data/' unless specified in the registry.",
+    ]
+    return "\n".join(lines) + "\n"
+
 
 def read_file_as_bytes(file_path: str) -> bytes:
     """
     Reads a local file and returns its content as binary bytes.
+    Automatically resolves file location across project root, uploads/, and outputs/ directories.
     """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-    with open(file_path, "rb") as f:
+    resolved_path = resolve_file_path(file_path)
+    with open(resolved_path, "rb") as f:
         return f.read()
 
 
@@ -131,6 +249,7 @@ def prepare_input_files(
 ) -> Dict[str, bytes]:
     """
     Prepares input files into a key-value byte map (`filename -> bytes`) for sending to the sandbox.
+    Also ensures both base filename and any relative subpaths are registered.
 
     Args:
         files: Either a list of file paths OR a dict mapping filename -> path/bytes.
@@ -142,16 +261,26 @@ def prepare_input_files(
 
     if isinstance(files, list):
         for file_path in files:
-            file_name = os.path.basename(file_path)
-            input_files_map[file_name] = read_file_as_bytes(file_path)
+            if not file_path:
+                continue
+            file_name = os.path.basename(str(file_path))
+            try:
+                content = read_file_as_bytes(file_path)
+                input_files_map[file_name] = content
+                # If path has a subfolder like uploads/file.csv, provide subpath too
+                rel_path = str(file_path).replace("\\", "/")
+                if rel_path != file_name:
+                    input_files_map[rel_path] = content
+            except Exception as e:
+                print(f"[prepare_input_files Warning] Could not read file '{file_path}': {e}")
     elif isinstance(files, dict):
         for file_name, content in files.items():
             if isinstance(content, bytes):
                 input_files_map[file_name] = content
             elif isinstance(content, str):
-                if os.path.exists(content):
+                try:
                     input_files_map[file_name] = read_file_as_bytes(content)
-                else:
+                except Exception:
                     # Assume text string content
                     input_files_map[file_name] = content.encode("utf-8")
             else:
@@ -219,9 +348,12 @@ def save_returned_files(
         List[str]: List of local file paths created.
     """
     saved_paths: List[str] = []
+    
+    workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    effective_target_dir = target_dir if (target_dir and os.path.isabs(target_dir)) else os.path.join(workspace_root, target_dir or "outputs")
 
     for filename, info in returned_files.items():
-        local_path = os.path.join(target_dir, filename)
+        local_path = os.path.join(effective_target_dir, filename)
         dir_name = os.path.dirname(local_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
@@ -311,13 +443,38 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
             with open(filename, "wb") as f:
                 f.write(content)
 
+        file_registry = build_file_registry(files)
+
+        def get_file_path(fname: str) -> str:
+            if not fname:
+                raise ValueError("Filename cannot be empty")
+            if fname in file_registry:
+                return file_registry[fname]["path"]
+            base = os.path.basename(fname)
+            if base in file_registry:
+                return file_registry[base]["path"]
+            for k, v in file_registry.items():
+                if k.lower() == fname.lower() or k.lower() == base.lower():
+                    return v["path"]
+            if os.path.exists(fname):
+                return fname
+            if os.path.exists(base):
+                return base
+            raise FileNotFoundError(f"File '{fname}' not found in FILE_REGISTRY: {list(file_registry.keys())}")
+
+        local_globals = {
+            "__name__": "__main__",
+            "FILE_REGISTRY": file_registry,
+            "get_file_path": get_file_path,
+        }
+
         initial_filenames = set(files.keys())
         success = False
         error_str = ""
 
         try:
             with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
-                exec(code, {})
+                exec(code, local_globals)
             success = True
         except Exception:
             success = False
@@ -473,6 +630,7 @@ class ModalSandboxManager:
         self._executor = None
         self._sandbox_dir: Optional[str] = None
         self._known_files: set = set()
+        self.file_registry: Dict[str, Dict[str, Any]] = {}
         self._globals: Dict[str, Any] = {"__name__": "__main__"}
 
     def initialize(self):
@@ -482,6 +640,7 @@ class ModalSandboxManager:
         if not self._sandbox_dir or not os.path.exists(self._sandbox_dir):
             self._sandbox_dir = tempfile.mkdtemp(prefix="analystgpt_sandbox_")
             self._known_files = set()
+            self.file_registry = {}
 
         if HAS_MODAL:
             try:
@@ -512,8 +671,28 @@ class ModalSandboxManager:
             logfire.info("Prepared input files for sandbox", count=len(prepared), filenames=list(prepared.keys()))
         return prepared
 
+    def get_file_path(self, filename: str) -> str:
+        """
+        Returns the resolved path for a registered file in the sandbox.
+        """
+        if not filename:
+            raise ValueError("Filename cannot be empty")
+        if filename in self.file_registry:
+            return self.file_registry[filename]["path"]
+        base = os.path.basename(filename)
+        if base in self.file_registry:
+            return self.file_registry[base]["path"]
+        for k, v in self.file_registry.items():
+            if k.lower() == filename.lower() or k.lower() == base.lower():
+                return v["path"]
+        if self._sandbox_dir and os.path.exists(os.path.join(self._sandbox_dir, filename)):
+            return filename
+        if self._sandbox_dir and os.path.exists(os.path.join(self._sandbox_dir, base)):
+            return base
+        raise FileNotFoundError(f"File '{filename}' not found in FILE_REGISTRY. Available files: {list(self.file_registry.keys())}")
+
     def run_code(
-        self, code: str, files: Optional[Dict[str, bytes]] = None
+        self, code: str, files: Optional[Union[List[str], Dict[str, Union[str, bytes]]]] = None
     ) -> Dict[str, Any]:
         """
         Executes Python code inside the persistent sandbox environment.
@@ -522,16 +701,32 @@ class ModalSandboxManager:
         if not self._sandbox_dir or not os.path.exists(self._sandbox_dir):
             self.initialize()
 
-        input_files = files or {}
+        if isinstance(files, list):
+            input_files = prepare_input_files(files)
+        elif isinstance(files, dict):
+            input_files = files
+        else:
+            input_files = {}
 
-        # 1. Write any incoming input files into persistent sandbox workspace
+        # 1. Update file registry
+        new_registry = build_file_registry(files if files else input_files)
+        self.file_registry.update(new_registry)
+
+        # 2. Write any incoming input files into persistent sandbox workspace
         for filename, content in input_files.items():
             file_path = os.path.join(self._sandbox_dir, filename)
             dir_path = os.path.dirname(file_path)
             if dir_path:
                 os.makedirs(dir_path, exist_ok=True)
             with open(file_path, "wb") as f:
-                f.write(content)
+                if isinstance(content, str):
+                    f.write(content.encode("utf-8"))
+                else:
+                    f.write(content)
+
+        # 3. Inject FILE_REGISTRY and get_file_path into global state
+        self._globals["FILE_REGISTRY"] = self.file_registry
+        self._globals["get_file_path"] = self.get_file_path
 
         def _execute():
             start_t = time.time()

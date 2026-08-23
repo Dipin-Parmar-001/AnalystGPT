@@ -1,0 +1,5 @@
+Strict History Trimming: Drops intermediate tool execution failures, raw logs, or repetitive retry attempts from the agent's active memory once a task succeeds.
+
+still explicitely using the OneHotencoding on the workflow.
+
+seperate task via planner agent for the feature engineering and hyper parameter tuning

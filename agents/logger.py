@@ -29,7 +29,7 @@ def setup_logfire(service_name: str = "analyst-gpt") -> bool:
         try:
             logfire.configure(
                 service_name=service_name,
-                send_to_logfire=True,
+                send_to_logfire="if-token-present",
             )
             # Instrument standard python logging module
             logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()])

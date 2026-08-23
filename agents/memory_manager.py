@@ -219,6 +219,63 @@ class MessageHistoryManager:
                 if action not in self._action_checklist:
                     self._action_checklist.append(action)
 
+    def trim_intermediate_failures(self):
+        """
+        Strict History Trimming: Drops intermediate tool execution failures, raw logs,
+        and repetitive retry attempts from the agent's active memory once a task/tool succeeds.
+        Removes both the assistant message that issued the failed tool call and the corresponding
+        tool failure response, maintaining strict OpenAI chat API message alignment.
+        """
+        if len(self.messages) <= 3:
+            return
+
+        # Identify all tool_call_ids that failed
+        failed_tool_ids = set()
+        for msg in self.messages:
+            if msg.get("role") == "tool":
+                try:
+                    content_str = msg.get("content", "{}")
+                    content_obj = json.loads(content_str) if isinstance(content_str, str) else content_str
+                    if isinstance(content_obj, dict) and not content_obj.get("success", True):
+                        tid = msg.get("tool_call_id")
+                        if tid:
+                            failed_tool_ids.add(tid)
+                except Exception:
+                    pass
+
+        if not failed_tool_ids:
+            return
+
+        # Keep system prompt (index 0) and original user prompt (index 1)
+        # Drop failed assistant-tool pairs from older turns (preserving the last active turn)
+        cleaned_messages = []
+        cleaned_messages.append(self.messages[0])
+
+        i = 1
+        last_turn_start = max(1, len(self.messages) - 2)
+
+        while i < len(self.messages):
+            msg = self.messages[i]
+
+            # In older turns, check if this message is a failed assistant tool_call or failed tool result
+            if i < last_turn_start:
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    # Check if all tool calls in this assistant message were failed attempts
+                    tcs = msg.get("tool_calls", [])
+                    if tcs and all(tc.get("id") in failed_tool_ids for tc in tcs):
+                        i += 1
+                        continue
+
+                elif msg.get("role") == "tool":
+                    if msg.get("tool_call_id") in failed_tool_ids:
+                        i += 1
+                        continue
+
+            cleaned_messages.append(msg)
+            i += 1
+
+        self.messages = cleaned_messages
+
     def append_tool_result(self, tool_call_id: str, name: str, tool_result: Dict[str, Any]):
         tool_result = self.clean_tool_result(tool_result)
         ok = tool_result.get("success", True)
@@ -232,6 +289,8 @@ class MessageHistoryManager:
             "name": name,
             "content": json.dumps(tool_result, default=str),
         })
+        if ok:
+            self.trim_intermediate_failures()
         self._maybe_compact()
 
     def _total_tokens(self) -> int:

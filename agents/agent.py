@@ -3,9 +3,10 @@ import re
 import sys
 import json
 import traceback
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
+
 
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
@@ -83,82 +84,7 @@ DEFAULT_PORTKEY_CONFIG = {
     ]
 }
 
-SYSTEM_PROMPT = """You are AnalystGPT, an expert AI Data Analyst and Business Intelligence assistant.
- 
-You analyse datasets using a Python execution tool (execute_python) that runs code inside a secure
-Modal cloud sandbox. Uploaded files are already in the working directory — read them directly by
-filename, e.g. pd.read_csv("sales.csv"), never pd.read_csv("uploads/sales.csv").
- 
-The sandbox already has: pandas, numpy, matplotlib, scipy, scikit-learn, openpyxl. Only request other
-packages if genuinely required.
- 
-==================================================
-HARD RULE: ONE SCRIPT, NOT A CHECKLIST
-==================================================
- 
-No matter how many analysis steps the user's request lists (inspection, cleaning, statistics, groupby
-metrics, outliers, trends, multiple charts, insights, recommendations...), that is a description of what
-ONE Python script should contain — not a sequence of separate tool calls. Inspection, cleaning,
-computation, and chart generation are all steps INSIDE a single script, executed together, not separate
-turns.
- 
-Budget: call execute_python at most 2 times per user request.
-  - Call 1: a single script that loads the data, inspects it, cleans it if needed, computes every
-    requested metric, detects outliers/trends, and generates and saves every requested chart — all in
-    one run, printing clearly labeled results (e.g. "REVENUE_BY_REGION:", "OUTLIERS:") at the end.
-  - Call 2 (only if call 1 errors, or the user asks for something new afterward): a corrected or
-    additional script. Fix the actual traceback cause — do not re-run unchanged code.
- 
-Never call execute_python a 3rd time for the same request. If something is still missing at that point,
-say so in your final answer and explain what would be needed, rather than making another call.
- 
-Do not use separate tool calls to "peek" at the dataset (e.g. df.head(), df.info() alone) before the
-real analysis — fold that inspection into the same script as the rest of the work.
- 
-==================================================
-EXECUTION STATE
-==================================================
- 
-All execute_python calls within the same user request share the same Python session and working directory.
- 
-Variables, imported libraries, loaded DataFrames and generated files remain available between retries.
- 
-Do not reload the dataset or recreate files unless necessary.
- 
-If a retry is required, continue from the existing session whenever possible.
- 
-==================================================
-HOW TO STRUCTURE THE ONE SCRIPT
-==================================================
- 
-Within that single script:
-1. Load the data and check shape/dtypes/missing values/duplicates.
-2. Clean only what's actually broken (never alter data that doesn't need it).
-3. Compute every statistic, aggregation, and metric the request asks for.
-4. Detect outliers/anomalies/trends if requested.
-5. Generate and save every requested chart (bar, line, scatter, histogram, box, heatmap, pie — pick
-   what fits the data and question).
-6. Print a clearly labeled summary of every result so you can write the final report from the output —
-   don't dump raw unlabeled tables.
- 
-==================================================
-ERROR HANDLING
-==================================================
- 
-If execution fails: read the traceback, fix only the actual cause, and use your one remaining retry.
-Never retry identical code.
- 
-==================================================
-FINAL RESPONSE
-==================================================
- 
-Never fabricate or estimate a number that Python could calculate — base every figure on executed output.
-Turn the printed results into a professional report, not a data dump: summarise tables, explain what each
-chart shows, and separate facts from insights from recommendations. Structure it with sections as
-relevant: Executive Summary, Dataset Overview, Data Quality, Key Metrics, Analysis, Visualisations,
-Insights, Recommendations, Limitations. Be concise but thorough — write like a senior data analyst, not
-a checklist-completion bot.
-"""
+from agents.prompts import SYSTEM_PROMPT
 
 class DataAnalystAgent:
     def __init__(
@@ -310,16 +236,27 @@ class DataAnalystAgent:
         self, 
         user_prompt: str, 
         files: Optional[Union[List[str], Dict[str, Any]]] = None,
-        max_turns: int = 10
+        max_turns: int = 10,
+        step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> str:
         """
         Sends a user prompt to the agent and runs an autonomous tool execution loop 
         using Modal cloud sandbox tools, managed with token-budgeted memory compaction and rich Logfire telemetry.
         """
+        def _safe_callback(event: str, data: Dict[str, Any]):
+            if step_callback:
+                try:
+                    step_callback(event, data)
+                except BaseException:
+                    pass
+
         self.memory_manager.prepare_user_prompt(user_prompt, files=files)
+        _safe_callback("prompt_started", {"user_prompt": user_prompt, "files": files})
 
         def _run_turns():
             for turn in range(max_turns):
+                _safe_callback("turn_start", {"turn": turn + 1, "max_turns": max_turns})
+
                 def _do_turn():
                     response_msg = self._call_llm(self.memory_manager.messages, tools=self.tool_manager.get_tool_specs())
                     self.memory_manager.append_assistant_response(response_msg)
@@ -329,11 +266,13 @@ class DataAnalystAgent:
                             logfire.info("AI Assistant Thought", thought=response_msg.content.strip())
                         else:
                             print(f"\n[AI Assistant Thought]:\n{response_msg.content.strip()}\n", flush=True)
+                        _safe_callback("llm_thought", {"turn": turn + 1, "thought": response_msg.content.strip()})
 
                     tool_calls = response_msg.tool_calls
                     if not tool_calls:
                         if HAS_LOGFIRE:
                             logfire.info("Agent turn loop finished with final response")
+                        _safe_callback("turn_finished", {"turn": turn + 1, "response": response_msg.content or ""})
                         return response_msg.content or ""
 
                     if HAS_LOGFIRE:
@@ -342,12 +281,19 @@ class DataAnalystAgent:
                         print(f"\n==================== [Agent Turn {turn + 1}] ====================", flush=True)
                         print(f"[Agent] Model requested {len(tool_calls)} tool execution(s).", flush=True)
 
+                    _safe_callback("tool_calls_requested", {"turn": turn + 1, "tool_count": len(tool_calls)})
+
                     for tool_call in tool_calls:
                         tool_call_id = getattr(tool_call, "id", None) or tool_call.get("id", "")
                         fn_name = tool_call.function.name if hasattr(tool_call, "function") else tool_call.get("function", {}).get("name", "")
+                        raw_args = tool_call.function.arguments if hasattr(tool_call, "function") else tool_call.get("function", {}).get("arguments", "{}")
+
+                        _safe_callback("tool_executing", {"turn": turn + 1, "tool_call_id": tool_call_id, "fn_name": fn_name, "raw_args": raw_args})
                         
                         tool_result = self.tool_manager.execute_tool_call(tool_call, files=files)
                         self.memory_manager.append_tool_result(tool_call_id, fn_name, tool_result)
+
+                        _safe_callback("tool_completed", {"turn": turn + 1, "tool_call_id": tool_call_id, "fn_name": fn_name, "result": tool_result})
 
                     return None
 
@@ -362,13 +308,17 @@ class DataAnalystAgent:
                         return turn_result
 
             last_msg = self.memory_manager.messages[-1]
-            return last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", "")
+            final_txt = last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", "")
+            if step_callback:
+                step_callback("prompt_finished", {"turn": max_turns, "response": final_txt})
+            return final_txt
 
         if HAS_LOGFIRE:
             with logfire.span("Prompt Agent Run", user_prompt=user_prompt[:200], files=files, token_usage=self.memory_manager.token_usage()):
                 return _run_turns()
         else:
             return _run_turns()
+
 
     def send_execution_results(self, stdout: str, stderr: str, success: bool = True) -> str:
         """
