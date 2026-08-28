@@ -6,7 +6,7 @@ from agents.data_analyst_agent import DataAnalystAgent
 from agents.ml_agent import MLAgent
 from agents.reporter_agent import ReporterAgent
 from agents.planner_agent import PlannerAgent, ExecutionPlan, TaskItem, PlanStatus
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
 from agents.tools import ToolManager
 from agents.prompts import (
     PLANNER_AGENT,
@@ -39,6 +39,7 @@ __all__ = [
     "MessageHistoryManager",
     "DatasetState",
     "count_tokens",
+    "sanitize_messages",
     "ToolManager",
     "PLANNER_AGENT",
     "PLANNER_SYSTEM_PROMPT",

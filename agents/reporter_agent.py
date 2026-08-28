@@ -1,10 +1,10 @@
 """
 Reporter Agent Module - AnalystGPT
 
-Specialized synthesis agent responsible for reading structured JSON summaries,
-metrics, and artifact lists from preceding agents (Data Analyst, ML) and producing
-an executive, clear, publication-grade markdown analysis report for stakeholders.
-Does not execute code or require sandbox tools.
+Specialized synthesis and verification agent responsible for reading structured
+JSON summaries, metrics, and artifact lists from preceding agents (Data Analyst, ML),
+verifying data consistency/avoiding contradictions via stateful Python execution tools,
+and producing an executive, clear, publication-grade markdown analysis report for stakeholders.
 """
 
 import os
@@ -25,7 +25,10 @@ if sys.stdout.encoding != 'utf-8':
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
+from agents.tools import reset_global_sandbox_manager
 from agents.logger import setup_logfire, HAS_LOGFIRE
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
 from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT
 from agents.cancellation import CancellationToken, WorkflowCancelledException
@@ -86,13 +89,18 @@ DEFAULT_PORTKEY_CONFIG = {
 
 class ReporterAgent:
     """
-    Reporter Agent that synthesizes multi-agent pipeline outputs into an
-    executive, stakeholder-friendly markdown report without code execution.
+    Reporter Agent that verifies metrics in the stateful sandbox and synthesizes
+    multi-agent pipeline outputs into an executive, stakeholder-friendly markdown report.
     """
 
     def __init__(
         self,
         model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        tool_manager: Optional[ToolManager] = None,
+        max_tool_calls: int = 7,
+        keep_last_tool_pairs: int = 2,
+        stdout_stderr_token_limit: int = 300,
+        max_tokens_before_compact: int = 3000,
     ):
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
@@ -129,7 +137,12 @@ class ReporterAgent:
                 logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
 
         self.model_name = model_name
+        self.tool_manager = tool_manager or ToolManager()
+        self.max_tool_calls = max_tool_calls
         self.agent_name = "ReporterAgent"
+        self.keep_last_tool_pairs = keep_last_tool_pairs
+        self.stdout_stderr_token_limit = stdout_stderr_token_limit
+        self.max_tokens_before_compact = max_tokens_before_compact
 
     def _normalize_agent_name(self, name: str) -> str:
         if not name:
@@ -146,6 +159,37 @@ class ReporterAgent:
             or "report" in normalized
         )
 
+    def _call_llm(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> Any:
+        sanitized_messages = sanitize_messages(messages)
+        kwargs = {
+            "model": self.model_name,
+            "messages": sanitized_messages,
+            "temperature": 0.2,
+        }
+        effective_tools = tools if tools is not None else self.tool_manager.get_tool_specs()
+        if effective_tools:
+            kwargs["tools"] = effective_tools
+
+        def _do_call():
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                message = response.choices[0].message
+                return message
+            except Exception as err:
+                if HAS_LOGFIRE:
+                    logfire.error("ReporterAgent LLM request failed", error=str(err))
+                raise RuntimeError(f"ReporterAgent LLM call failed: {err}") from err
+
+        if HAS_LOGFIRE:
+            with logfire.span("ReporterAgent LLM Call", model=self.model_name):
+                return _do_call()
+        else:
+            return _do_call()
+
     def generate_report(
         self,
         user_goal: str,
@@ -155,11 +199,13 @@ class ReporterAgent:
         task_results: Optional[List[Dict[str, Any]]] = None,
         file_contents: Optional[Dict[str, str]] = None,
         plan: Optional[Union[ExecutionPlan, Dict[str, Any]]] = None,
+        max_tool_calls: Optional[int] = None,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> str:
         """
-        Synthesizes structured task summaries into the final executive markdown report.
+        Synthesizes structured task summaries and sandbox artifacts into the final executive markdown report.
+        Allows up to max_tool_calls (default 7) executions in the stateful sandbox to verify metrics and check contradictions.
         
         Args:
             user_goal: The user's original request/goal.
@@ -169,6 +215,7 @@ class ReporterAgent:
             task_results: Optional fallback list of completed task result items.
             file_contents: Optional file contents (legacy/fallback).
             plan: Optional original execution plan.
+            max_tool_calls: Override for maximum tool calls (default: 7).
             step_callback: Optional execution callback.
             cancellation_token: Optional token to halt execution.
             
@@ -178,8 +225,20 @@ class ReporterAgent:
         if cancellation_token:
             cancellation_token.check_cancelled(step_name="ReporterAgent initializing synthesis")
 
-        if step_callback:
-            step_callback("report_generation_started", {"agent": self.agent_name, "user_goal": user_goal})
+        effective_max_calls = max_tool_calls if max_tool_calls is not None else self.max_tool_calls
+
+        def _safe_callback(event: str, data: Dict[str, Any]):
+            if step_callback:
+                try:
+                    step_callback(event, data)
+                except BaseException:
+                    pass
+
+        _safe_callback("report_generation_started", {
+            "agent": self.agent_name,
+            "user_goal": user_goal,
+            "max_tool_calls": effective_max_calls
+        })
 
         plan_info = ""
         if plan:
@@ -210,7 +269,6 @@ class ReporterAgent:
             if file_contents:
                 file_blocks = []
                 for fname, fcontent in file_contents.items():
-                    # Truncate content to avoid token overflow
                     file_blocks.append(f"--- FILE: {fname} ---\n{fcontent[:2000]}\n")
                 user_content_parts.append("=== GROUND-TRUTH METRIC FILES ===\n" + "\n".join(file_blocks))
             elif task_results:
@@ -227,57 +285,157 @@ class ReporterAgent:
 
         # 4. Artifacts List
         artifacts_str = json.dumps(artifacts or [], indent=2, default=str)
-        user_content_parts.append(f"=== GENERATED ARTIFACTS LIST ===\n{artifacts_str}\n")
+        user_content_parts.append(f"=== GENERATED ARTIFACTS LIST IN STATEFUL ENVIRONMENT ===\n{artifacts_str}\n")
 
         user_content_parts.append(
             "Instructions:\n"
-            "Synthesize the summaries above into the structured executive markdown report. "
-            "STRICT GROUNDING: Directly quote exact metrics, baseline numbers, confusion matrix counts, sample counts, and feature importance rankings from the summaries above. "
-            "Do NOT recalculate, assume, or alter any numbers. Ensure all report sections are detailed and executive-ready."
+            "1. You have access to `execute_python` in the shared stateful Modal Cloud Sandbox containing ALL generated artifacts.\n"
+            f"2. You have a budget of MAX {effective_max_calls} tool calls.\n"
+            "3. BATCH VERIFICATION DISCIPLINE: If you need to inspect files, check numbers, or verify consistency across artifacts (e.g. `cleaned_dataset.csv`, `model_comparison.csv`, `feature_importance.csv`, `analyst_summary.json`, `ml_summary.json`, `predictions.csv`), write ONE comprehensive script that verifies all necessary items at once to preserve your turn budget.\n"
+            "4. STRICT GROUNDING: Directly quote exact metrics, baseline numbers, confusion matrix counts, sample counts, row reconciliation figures, and feature importance rankings from the verified summaries and artifacts. Do NOT recalculate, assume, or alter any numbers.\n"
+            "5. Once verification is complete (or if no verification is needed), generate the final executive markdown report following the structured format."
         )
 
         user_content = "\n\n".join(user_content_parts)
 
-        messages = [
-            {"role": "system", "content": REPORTER_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content}
-        ]
+        memory_manager = MessageHistoryManager(
+            system_prompt=REPORTER_SYSTEM_PROMPT,
+            keep_last_tool_pairs=self.keep_last_tool_pairs,
+            stdout_stderr_token_limit=self.stdout_stderr_token_limit,
+            max_tokens_before_compact=self.max_tokens_before_compact
+        )
+        memory_manager.messages.append({"role": "user", "content": user_content})
 
-        if cancellation_token:
-            cancellation_token.check_cancelled(step_name="ReporterAgent before LLM synthesis call")
+        tool_calls_count = 0
+        final_report = ""
+        turn = 0
 
-        def _do_call():
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=0.2
+        while tool_calls_count < effective_max_calls:
+            if cancellation_token:
+                cancellation_token.check_cancelled(step_name=f"{self.agent_name} turn {turn + 1}")
+
+            turn += 1
+            _safe_callback("turn_start", {"agent": self.agent_name, "turn": turn, "tool_calls_used": tool_calls_count})
+
+            assistant_msg = self._call_llm(memory_manager.messages, tools=self.tool_manager.get_tool_specs())
+
+            if cancellation_token:
+                cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn}")
+
+            thought = assistant_msg.content or ""
+            tool_calls = assistant_msg.tool_calls or []
+
+            if thought:
+                _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
+
+            msg_dict: Dict[str, Any] = {"role": "assistant"}
+            if assistant_msg.content:
+                msg_dict["content"] = assistant_msg.content
+            if tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "id": getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else f"call_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", ""),
+                            "arguments": tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+                        }
+                    }
+                    for i, tc in enumerate(tool_calls)
+                ]
+
+            memory_manager.append_assistant(msg_dict)
+
+            # If model produced report without tool calls, we're done
+            if not tool_calls:
+                final_report = thought
+                break
+
+            # Execute tool calls
+            for tc in tool_calls:
+                if cancellation_token:
+                    cancellation_token.check_cancelled(step_name=f"{self.agent_name} before tool call")
+
+                fn_name = tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", "")
+                fn_args_raw = tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+                tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else f"call_{tool_calls_count + 1}")
+
+                if tool_calls_count >= effective_max_calls:
+                    memory_manager.append_tool_result(
+                        tool_call_id=tc_id,
+                        name=fn_name or "tool",
+                        tool_result={"status": "tool_limit_reached", "message": f"Maximum tool call limit of {effective_max_calls} reached."}
+                    )
+                    continue
+
+                tool_calls_count += 1
+
+                _safe_callback("tool_executing", {
+                    "agent": self.agent_name,
+                    "turn": turn,
+                    "tool_call_id": tc_id,
+                    "fn_name": fn_name,
+                    "raw_args": fn_args_raw,
+                    "tool_call_num": tool_calls_count
+                })
+
+                exec_result = self.tool_manager.execute_tool_call(tool_call=tc)
+
+                if cancellation_token:
+                    cancellation_token.check_cancelled(step_name=f"{self.agent_name} after tool {fn_name}")
+
+                memory_manager.append_tool_result(
+                    tool_call_id=tc_id,
+                    name=fn_name,
+                    tool_result=exec_result
                 )
-                return response.choices[0].message.content or ""
-            except Exception as err:
+
                 if HAS_LOGFIRE:
-                    logfire.error("ReporterAgent LLM request failed", error=str(err))
-                raise RuntimeError(f"ReporterAgent LLM call failed: {err}") from err
+                    logfire.info(
+                        f"ReporterAgent Tool Executed: {fn_name}",
+                        agent="ReporterAgent",
+                        tool=fn_name,
+                        success=exec_result.get("success", True),
+                        execution_time=exec_result.get("execution_time", 0.0),
+                        returned_files=exec_result.get("returned_files", [])
+                    )
+
+                _safe_callback("tool_completed", {
+                    "agent": self.agent_name,
+                    "turn": turn,
+                    "tool_call_id": tc_id,
+                    "fn_name": fn_name,
+                    "result": exec_result
+                })
+
+        if not final_report and tool_calls_count >= effective_max_calls:
+            if cancellation_token:
+                cancellation_token.check_cancelled(step_name=f"{self.agent_name} final report synthesis")
+            memory_manager.messages.append({
+                "role": "user",
+                "content": f"[SYSTEM WARNING] You have reached the maximum limit of {effective_max_calls} tool calls. "
+                           f"Do NOT make any more tool calls. Synthesize and output the final executive markdown report now based on all verified findings."
+            })
+            assistant_msg = self._call_llm(memory_manager.messages, tools=[])
+            final_report = assistant_msg.content or ""
+            memory_manager.append_assistant({"role": "assistant", "content": final_report})
 
         if HAS_LOGFIRE:
-            with logfire.span("ReporterAgent Generate Report", user_goal=user_goal[:200]):
-                report_md = _do_call()
-                logfire.info(
-                    "ReporterAgent Synthesized Executive Report",
-                    agent="ReporterAgent",
-                    report_length=len(report_md),
-                    artifact_count=len(artifacts or [])
-                )
-        else:
-            report_md = _do_call()
+            logfire.info(
+                "ReporterAgent Synthesized Executive Report",
+                agent="ReporterAgent",
+                report_length=len(final_report),
+                tool_calls_used=tool_calls_count,
+                artifact_count=len(artifacts or [])
+            )
 
-        if cancellation_token:
-            cancellation_token.check_cancelled(step_name="ReporterAgent after LLM synthesis call")
+        _safe_callback("report_generated", {
+            "agent": self.agent_name,
+            "report_length": len(final_report),
+            "tool_calls_used": tool_calls_count
+        })
 
-        if step_callback:
-            step_callback("report_generated", {"agent": self.agent_name, "report_length": len(report_md)})
-
-        return report_md
+        return final_report
 
     def run_task(
         self,
@@ -288,6 +446,7 @@ class ReporterAgent:
         artifacts: Optional[List[Union[str, Dict[str, str]]]] = None,
         file_contents: Optional[Dict[str, str]] = None,
         plan: Optional[Union[ExecutionPlan, Dict[str, Any]]] = None,
+        max_tool_calls: Optional[int] = None,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> Dict[str, Any]:
@@ -302,6 +461,7 @@ class ReporterAgent:
             artifacts=artifacts,
             file_contents=file_contents,
             plan=plan,
+            max_tool_calls=max_tool_calls,
             step_callback=step_callback,
             cancellation_token=cancellation_token,
         )
@@ -314,8 +474,7 @@ class ReporterAgent:
         }
 
 
-
 if __name__ == "__main__":
     print("Testing ReporterAgent initialization...")
     reporter = ReporterAgent()
-    print("ReporterAgent initialized successfully (Pure Synthesis, No Code Sandbox)!")
+    print("ReporterAgent initialized successfully with stateful sandbox verification tool support!")

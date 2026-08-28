@@ -26,12 +26,13 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager
+from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
 from agents.prompts import ML_AGENT, ML_SYSTEM_PROMPT
 from agents.cancellation import CancellationToken, WorkflowCancelledException
+
 
 
 try:
@@ -196,9 +197,10 @@ class MLAgent:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Any:
+        sanitized_messages = sanitize_messages(messages)
         kwargs = {
             "model": self.model_name,
-            "messages": messages,
+            "messages": sanitized_messages,
         }
         effective_tools = tools if tools is not None else self.tool_manager.get_tool_specs()
         if effective_tools:
@@ -360,21 +362,41 @@ class MLAgent:
                 _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
 
             if not tool_calls:
-                final_text = thought
-                completed_success = True
-                memory_manager.append_assistant_response(assistant_msg)
-                break
+                # Check for fallback code in thought/content (e.g. 'Malformed function call:' or markdown python block)
+                fallback_code = extract_code_from_content(thought)
+                if fallback_code and tool_calls_count < effective_max_calls:
+                    if HAS_LOGFIRE:
+                        logfire.info("MLAgent detected code in assistant response via fallback parser", code_snippet=fallback_code[:200])
+                    else:
+                        print(f"[MLAgent Fallback] Extracted Python code from non-standard LLM response ({len(fallback_code)} chars). Executing in sandbox...")
+                    synthetic_tc = create_synthetic_execute_tool_call(fallback_code, f"fallback_call_{turn}_{tool_calls_count + 1}")
+                    tool_calls = [synthetic_tc]
+                else:
+                    final_text = thought
+                    completed_success = True
+                    memory_manager.append_assistant_response(assistant_msg)
+                    break
 
             memory_manager.append_assistant_response(assistant_msg)
+
 
             for tc in tool_calls:
                 if cancellation_token:
                     cancellation_token.check_cancelled(step_name=f"{self.agent_name} before tool call", task_id=task_id if isinstance(task_id, int) else None)
 
-                tool_calls_count += 1
                 fn_name = tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", "")
                 fn_args_raw = tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
-                tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else f"call_{tool_calls_count}")
+                tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else f"call_{tool_calls_count + 1}")
+
+                if tool_calls_count >= effective_max_calls:
+                    memory_manager.append_tool_result(
+                        tool_call_id=tc_id,
+                        name=fn_name or "tool",
+                        tool_result={"status": "tool_limit_reached", "message": f"Maximum tool call limit of {effective_max_calls} reached."}
+                    )
+                    continue
+
+                tool_calls_count += 1
 
                 _safe_callback("tool_executing", {
                     "agent": self.agent_name,
@@ -426,9 +448,6 @@ class MLAgent:
                     "fn_name": fn_name,
                     "result": exec_result
                 })
-
-                if tool_calls_count >= effective_max_calls:
-                    break
 
         if not completed_success and tool_calls_count >= effective_max_calls:
             if cancellation_token:

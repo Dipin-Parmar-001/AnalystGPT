@@ -28,11 +28,12 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager
+from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
 from agents.cancellation import CancellationToken, WorkflowCancelledException
+
 
 
 try:
@@ -190,9 +191,10 @@ class DataAnalystAgent:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Any:
+        sanitized_messages = sanitize_messages(messages)
         kwargs = {
             "model": self.model_name,
-            "messages": messages,
+            "messages": sanitized_messages,
         }
         effective_tools = tools if tools is not None else self.tool_manager.get_tool_specs()
         if effective_tools:
@@ -310,7 +312,7 @@ class DataAnalystAgent:
             f"1. Complete the assigned task(s) above using Python code execution.\n"
             f"2. You have a budget of MAX {effective_max_calls} tool calls.\n"
             f"3. Load datasets using the exact filename in FILE_REGISTRY or via get_file_path('filename').\n"
-            f"4. RAW DATA INSPECTION (CRITICAL): Calculate duplicates (`df.duplicated().sum()`) and nulls (`df.isnull().sum()`) on the RAW dataset FIRST before any column exclusions.\n"
+            f"4. RAW DATA INSPECTION & ROW RECONCILIATION (CRITICAL): Calculate duplicates (`df.duplicated().sum()`) and nulls (`df.isnull().sum()`) on the RAW dataset FIRST before any column exclusions. Track `initial_rows`, explicit `removed` breakdown with reason and count, and `retained` rows.\n"
             f"5. IDENTIFIER PRESERVATION: Do NOT drop identifier columns (e.g., customerID, id). Except/exclude them from feature correlations and plots, but KEEP them in the dataset.\n"
             f"6. EXPORT CLEANED DATASET: ALWAYS save the cleaned dataset to `cleaned_dataset.csv` (e.g., `df.to_csv('cleaned_dataset.csv', index=False)`).\n"
             f"7. Save `analyst_summary.json` (and `analyst_summary_task_{task_id_val}.json`) and all visualization PNGs.\n"
@@ -374,35 +376,39 @@ class DataAnalystAgent:
 
             tool_calls = response_msg.tool_calls
 
-            # If no tool calls requested, model has finished
+            # If no tool calls requested, check fallback for malformed or raw code in content
             if not tool_calls:
-                final_response = response_msg.content or ""
-                break
+                fallback_code = extract_code_from_content(response_msg.content or "")
+                if fallback_code and tool_calls_count < effective_max_calls:
+                    if HAS_LOGFIRE:
+                        logfire.info("DataAnalystAgent detected code in assistant response via fallback parser", code_snippet=fallback_code[:200])
+                    else:
+                        print(f"[DataAnalystAgent Fallback] Extracted Python code from non-standard LLM response ({len(fallback_code)} chars). Executing in sandbox...")
+                    synthetic_tc = create_synthetic_execute_tool_call(fallback_code, f"fallback_call_{turn + 1}_{tool_calls_count + 1}")
+                    tool_calls = [synthetic_tc]
+                else:
+                    final_response = response_msg.content or ""
+                    break
+
 
             # Process requested tool calls
             for tool_call in tool_calls:
                 if cancellation_token:
                     cancellation_token.check_cancelled(step_name=f"{self.agent_name} before tool call", task_id=task_id)
 
-                if tool_calls_count >= effective_max_calls:
-                    _safe_callback("tool_limit_warning", {
-                        "agent": self.agent_name,
-                        "message": f"Reached max tool call limit of {effective_max_calls}. Requesting final answer."
-                    })
-                    agent_status = "tool_limit_reached"
-                    memory_manager.messages.append({
-                        "role": "user",
-                        "content": f"[SYSTEM WARNING] You have reached the maximum limit of {effective_max_calls} tool calls. "
-                                   f"Do NOT make any more tool calls. Write your final, complete data analysis report now based on the execution outputs obtained so far."
-                    })
-                    final_msg = self._call_llm(memory_manager.messages, tools=[])
-                    memory_manager.append_assistant({"role": "assistant", "content": final_msg.content or ""})
-                    final_response = final_msg.content or ""
-                    break
-
-                tool_call_id = getattr(tool_call, "id", None) or tool_call.get("id", "")
+                tool_call_id = getattr(tool_call, "id", None) or (tool_call.get("id") if isinstance(tool_call, dict) else f"call_{tool_calls_count + 1}")
                 fn_name = tool_call.function.name if hasattr(tool_call, "function") else tool_call.get("function", {}).get("name", "")
                 raw_args = tool_call.function.arguments if hasattr(tool_call, "function") else tool_call.get("function", {}).get("arguments", "{}")
+
+                if tool_calls_count >= effective_max_calls:
+                    agent_status = "tool_limit_reached"
+                    # Complete tool call response so API schema is never broken
+                    memory_manager.append_tool_result(
+                        tool_call_id,
+                        fn_name or "tool",
+                        {"status": "tool_limit_reached", "message": f"Maximum tool call limit of {effective_max_calls} reached."}
+                    )
+                    continue
 
                 try:
                     parsed_args = json.loads(raw_args)
@@ -454,8 +460,18 @@ class DataAnalystAgent:
                 if not final_response:
                     if cancellation_token:
                         cancellation_token.check_cancelled(step_name=f"{self.agent_name} final synthesis", task_id=task_id)
+                    _safe_callback("tool_limit_warning", {
+                        "agent": self.agent_name,
+                        "message": f"Reached max tool call limit of {effective_max_calls}. Requesting final answer."
+                    })
+                    memory_manager.messages.append({
+                        "role": "user",
+                        "content": f"[SYSTEM WARNING] You have reached the maximum limit of {effective_max_calls} tool calls. "
+                                   f"Do NOT make any more tool calls. Write your final, complete data analysis report now based on the execution outputs obtained so far."
+                    })
                     final_msg = self._call_llm(memory_manager.messages, tools=[])
                     final_response = final_msg.content or ""
+                    memory_manager.append_assistant({"role": "assistant", "content": final_response})
                 break
 
         # Mark tasks completed or failed
@@ -514,10 +530,13 @@ class DataAnalystAgent:
                     "identifier_columns": ["customerID"]
                 },
                 "data_cleaning": {
-                    "raw_duplicates_detected": 0,
+                    "row_reconciliation": {
+                        "initial_rows": 0,
+                        "removed": [],
+                        "retained": 0
+                    },
                     "missing_values_handled": {},
                     "imputation_methods": {"numerical": "median", "categorical": "mode"},
-                    "duplicates_removed": 0,
                     "identifier_columns_excepted": ["customerID (retained in dataset for prediction traceability)"],
                     "dropped_columns": [],
                     "encoding": {"method": "One-Hot Encoding (drop_first=True)"},

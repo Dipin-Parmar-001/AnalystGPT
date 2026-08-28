@@ -79,7 +79,8 @@ class WorkflowOrchestrator:
             tool_manager=self.tool_manager
         )
         self.reporter_agent = ReporterAgent(
-            model_name=reporter_model
+            model_name=reporter_model,
+            tool_manager=self.tool_manager
         )
 
         self.current_plan: Optional[ExecutionPlan] = None
@@ -208,6 +209,7 @@ class WorkflowOrchestrator:
         user_query: str,
         dataset_context: Optional[str] = None,
         files: Optional[List[str]] = None,
+        max_tool_calls_per_task: Optional[int] = None,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> ExecutionPlan:
@@ -223,6 +225,7 @@ class WorkflowOrchestrator:
         plan = self.planner_agent.create_plan(
             user_query=user_query,
             dataset_context=dataset_context,
+            max_tool_calls_per_task=max_tool_calls_per_task,
             cancellation_token=cancellation_token
         )
         self.current_plan = plan
@@ -757,6 +760,7 @@ class WorkflowOrchestrator:
         user_query: str,
         files: Optional[List[str]] = None,
         dataset_context: Optional[str] = None,
+        max_tool_calls_per_agent: int = 7,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> Dict[str, Any]:
@@ -772,6 +776,7 @@ class WorkflowOrchestrator:
             user_query=user_query,
             dataset_context=dataset_context,
             files=files,
+            max_tool_calls_per_task=max_tool_calls_per_agent,
             step_callback=step_callback,
             cancellation_token=self.cancellation_token
         )
@@ -782,6 +787,7 @@ class WorkflowOrchestrator:
             plan=plan,
             user_query=user_query,
             files=files,
+            max_tool_calls_per_agent=max_tool_calls_per_agent,
             step_callback=step_callback,
             cancellation_token=self.cancellation_token
         )

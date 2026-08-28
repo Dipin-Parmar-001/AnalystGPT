@@ -9,6 +9,13 @@ from sandbox_execution.tool_manager import (
     execute_python,
     EXECUTE_PYTHON_TOOL_SPEC,
 )
+from agents.fallback_parser import (
+    extract_code_from_content,
+    create_synthetic_execute_tool_call,
+    unwrap_envelope,
+    SyntheticToolCall,
+    SyntheticFunction,
+)
 
 try:
     from sandbox_execution.utils import reset_global_sandbox_manager
@@ -20,4 +27,10 @@ __all__ = [
     "execute_python",
     "EXECUTE_PYTHON_TOOL_SPEC",
     "reset_global_sandbox_manager",
+    "extract_code_from_content",
+    "create_synthetic_execute_tool_call",
+    "unwrap_envelope",
+    "SyntheticToolCall",
+    "SyntheticFunction",
 ]
+

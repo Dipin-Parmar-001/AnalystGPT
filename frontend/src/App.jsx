@@ -279,6 +279,7 @@ export default function App() {
         body: JSON.stringify({
           query,
           files: selectedFiles,
+          max_tool_calls_per_task: maxToolCalls,
         }),
       });
 

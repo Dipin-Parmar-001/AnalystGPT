@@ -11,7 +11,7 @@ import json
 import uuid
 import re
 from enum import Enum
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Union
 from dataclasses import dataclass, field, asdict
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.cancellation import CancellationToken, WorkflowCancelledException
+from agents.memory_manager import sanitize_messages
 
 
 try:
@@ -111,6 +112,7 @@ class TaskItem:
     depends_on: List[Any] = field(default_factory=list)
     inputs: List[str] = field(default_factory=list)
     result: Optional[Any] = None
+    est_tool_calls: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -126,7 +128,8 @@ class TaskItem:
             expected_output=data.get("expected_output", ""),
             depends_on=data.get("depends_on", []),
             inputs=data.get("inputs", []),
-            result=data.get("result")
+            result=data.get("result"),
+            est_tool_calls=data.get("est_tool_calls")
         )
 
 
@@ -172,30 +175,56 @@ class ExecutionPlan:
 
 
 
-def _extract_json(text: str) -> Dict[str, Any]:
-    """Helper to extract and parse JSON object from LLM string output."""
-    text = text.strip()
+def _extract_json(text: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Helper to extract and parse JSON object from LLM string output or envelopes."""
+    if isinstance(text, dict):
+        if "body" in text or "choices" in text:
+            from agents.fallback_parser import unwrap_envelope
+            unwrapped = unwrap_envelope(text)
+            if isinstance(unwrapped, dict):
+                return unwrapped
+            text = str(unwrapped)
+        else:
+            return text
+
+    text_str = str(text).strip()
+
+    # Strip any 'Malformed function call:' prefix
+    malformed_match = re.match(r"^Malformed function call:?\s*", text_str, re.IGNORECASE)
+    if malformed_match:
+        text_str = text_str[malformed_match.end():].strip()
+
     # Match markdown json block if present
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_str, re.DOTALL)
     if match:
         json_str = match.group(1)
     else:
         # Fallback: search for first { to last }
-        start = text.find("{")
-        end = text.rfind("}")
+        start = text_str.find("{")
+        end = text_str.rfind("}")
         if start != -1 and end != -1 and end > start:
-            json_str = text[start : end + 1]
+            json_str = text_str[start : end + 1]
         else:
-            json_str = text
+            json_str = text_str
 
-    return json.loads(json_str)
+    parsed = json.loads(json_str)
+    if isinstance(parsed, dict) and ("body" in parsed or "choices" in parsed):
+        from agents.fallback_parser import unwrap_envelope
+        inner = unwrap_envelope(parsed)
+        if isinstance(inner, dict):
+            return inner
+        if isinstance(inner, str) and inner != json_str:
+            return _extract_json(inner)
+    return parsed
+
 
 
 class PlannerAgent:
     def __init__(
         self,
         available_agents: Optional[List[str]] = None,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b"
+        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        max_tool_calls_per_task: int = 7
     ):
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
@@ -227,12 +256,14 @@ class PlannerAgent:
 
         self.available_agents = available_agents or DEFAULT_AVAILABLE_AGENTS
         self.model_name = model_name
+        self.max_tool_calls_per_task = max_tool_calls_per_task
 
     def create_plan(
         self,
         user_query: str,
         dataset_context: Optional[str] = None,
         custom_agents: Optional[List[str]] = None,
+        max_tool_calls_per_task: Optional[int] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> ExecutionPlan:
         """
@@ -243,16 +274,24 @@ class PlannerAgent:
 
         agents_list = custom_agents or self.available_agents
         agents_str = ", ".join(agents_list)
+        effective_max_tool_calls = (
+            max_tool_calls_per_task
+            if max_tool_calls_per_task is not None
+            else getattr(self, "max_tool_calls_per_task", 7)
+        )
 
-        system_msg = PLANNER_SYSTEM_PROMPT.format(available_agents_list=agents_str)
+        system_msg = PLANNER_SYSTEM_PROMPT.format(
+            available_agents_list=agents_str,
+            max_tool_calls_per_task=effective_max_tool_calls
+        )
         user_msg = f"User Request: {user_query}"
         if dataset_context:
             user_msg += f"\nDataset Context / Files: {dataset_context}"
 
-        messages = [
+        messages = sanitize_messages([
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg}
-        ]
+        ])
 
         def _do_create_plan():
             if cancellation_token:
@@ -281,7 +320,10 @@ class PlannerAgent:
                         description=task_raw.get("description", ""),
                         assigned_agent=task_raw.get("assigned_agent", selected_agents[0]),
                         status="pending",
-                        expected_output=task_raw.get("expected_output", "")
+                        expected_output=task_raw.get("expected_output", ""),
+                        depends_on=task_raw.get("depends_on", []),
+                        inputs=task_raw.get("inputs", []),
+                        est_tool_calls=task_raw.get("est_tool_calls")
                     )
                     tasks.append(task)
 
@@ -319,7 +361,8 @@ class PlannerAgent:
                     description=user_query,
                     assigned_agent="DataAnalystAgent",
                     status="pending",
-                    expected_output="Analysis output report"
+                    expected_output="Analysis output report",
+                    est_tool_calls=4
                 )
                 return ExecutionPlan(
                     plan_id=str(uuid.uuid4())[:8],
@@ -360,9 +403,9 @@ class PlannerAgent:
             available_agents_list=agents_str
         )
 
-        messages = [
+        messages = sanitize_messages([
             {"role": "user", "content": prompt}
-        ]
+        ])
 
         try:
             response = self.client.chat.completions.create(
@@ -386,7 +429,10 @@ class PlannerAgent:
                     description=task_raw.get("description", ""),
                     assigned_agent=task_raw.get("assigned_agent", selected_agents[0]),
                     status="pending",
-                    expected_output=task_raw.get("expected_output", "")
+                    expected_output=task_raw.get("expected_output", ""),
+                    depends_on=task_raw.get("depends_on", []),
+                    inputs=task_raw.get("inputs", []),
+                    est_tool_calls=task_raw.get("est_tool_calls")
                 )
                 tasks.append(task)
 

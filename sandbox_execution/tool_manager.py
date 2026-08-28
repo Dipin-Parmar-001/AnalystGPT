@@ -242,22 +242,38 @@ class ToolManager:
 
         # JSON parsing of arguments
         parse_error = None
-        try:
-            fn_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-        except Exception as parse_err:
-            fn_args = {}
-            parse_error = f"{type(parse_err).__name__}: {str(parse_err)}"
-            if HAS_LOGFIRE:
-                logfire.error(
-                    "LLM Tool Call JSON Argument Parsing Failed",
-                    tool_call_id=tool_call_id,
-                    fn_name=fn_name,
-                    raw_arguments=raw_args,
-                    parse_error=parse_error,
-                    traceback=traceback.format_exc(),
-                )
-            else:
-                print(f"[Tool Parse Error] Failed to parse JSON for '{fn_name}' (ID: {tool_call_id}). Raw: {raw_args}. Error: {parse_error}")
+        if isinstance(raw_args, dict):
+            fn_args = raw_args
+        else:
+            try:
+                fn_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except Exception as parse_err:
+                extracted = None
+                try:
+                    from agents.fallback_parser import extract_code_from_content
+                    extracted = extract_code_from_content(str(raw_args))
+                except Exception:
+                    pass
+
+                if extracted and (fn_name == "execute_python" or fn_name == "unknown"):
+                    fn_name = "execute_python"
+                    fn_args = {"code": extracted}
+                    parse_error = None
+                else:
+                    fn_args = {}
+                    parse_error = f"{type(parse_err).__name__}: {str(parse_err)}"
+                    if HAS_LOGFIRE:
+                        logfire.error(
+                            "LLM Tool Call JSON Argument Parsing Failed",
+                            tool_call_id=tool_call_id,
+                            fn_name=fn_name,
+                            raw_arguments=raw_args,
+                            parse_error=parse_error,
+                            traceback=traceback.format_exc(),
+                        )
+                    else:
+                        print(f"[Tool Parse Error] Failed to parse JSON for '{fn_name}' (ID: {tool_call_id}). Raw: {raw_args}. Error: {parse_error}")
+
 
         def _do_execute() -> Dict[str, Any]:
             if fn_name in self.tools:

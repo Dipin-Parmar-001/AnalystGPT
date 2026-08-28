@@ -149,6 +149,121 @@ def _extract_code_from_tool_call(tool_call: Dict[str, Any]) -> str:
 # 3. History Manager: Bounds raw transcript and compacts old turns
 # ---------------------------------------------------------------------------
 
+def sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Sanitizes message history to strictly conform to OpenAI and Google Gemini API schemas.
+    
+    Guarantees:
+    1. At most one system message at index 0.
+    2. First non-system turn is a 'user' turn.
+    3. Every 'assistant' message with 'tool_calls' is immediately followed by 'tool' messages
+       for every single tool_call_id present in that assistant message.
+    4. No orphan 'tool' messages (every 'tool' message must correspond to an active tool_call_id
+       in the immediately preceding 'assistant' message).
+    5. No 'assistant' tool_call turn directly after 'system' without an intervening 'user' turn.
+    6. Properly handles tool limit / partial turns without breaking API contracts.
+    """
+    if not messages:
+        return [{"role": "user", "content": "Please proceed."}]
+
+    system_contents: List[str] = []
+    raw_conv_messages: List[Dict[str, Any]] = []
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            content = m.get("content", "")
+            if content:
+                system_contents.append(str(content))
+        elif role in ("user", "assistant", "tool"):
+            raw_conv_messages.append(m)
+
+    if not raw_conv_messages:
+        raw_conv_messages = [{"role": "user", "content": "Please proceed with the assigned task."}]
+
+    sanitized_conv: List[Dict[str, Any]] = []
+
+    # Gemini requires the conversation after system to start with a 'user' turn
+    if raw_conv_messages[0].get("role") != "user":
+        sanitized_conv.append({"role": "user", "content": "Please execute the assigned data analysis workflow."})
+
+    i = 0
+    while i < len(raw_conv_messages):
+        msg = raw_conv_messages[i]
+        role = msg.get("role")
+
+        if role == "user":
+            sanitized_conv.append(msg)
+            i += 1
+
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                sanitized_conv.append(msg)
+                i += 1
+            else:
+                # Assistant with tool_calls: MUST come after 'user' or 'tool'
+                if not sanitized_conv or sanitized_conv[-1].get("role") not in ("user", "tool"):
+                    sanitized_conv.append({"role": "user", "content": "Please execute the next required tool call."})
+
+                sanitized_conv.append(msg)
+                i += 1
+
+                # Gather expected tool_call_ids
+                expected_ids: Dict[str, str] = {}
+                for tc in tool_calls:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    fn_name = ""
+                    if isinstance(tc, dict):
+                        fn_name = tc.get("function", {}).get("name", "tool")
+                    elif hasattr(tc, "function"):
+                        fn_name = getattr(tc.function, "name", "tool")
+                    if tc_id:
+                        expected_ids[tc_id] = fn_name or "tool"
+
+                # Look ahead for matching tool messages
+                tool_responses: Dict[str, Dict[str, Any]] = {}
+                while i < len(raw_conv_messages) and raw_conv_messages[i].get("role") == "tool":
+                    t_msg = raw_conv_messages[i]
+                    t_id = t_msg.get("tool_call_id")
+                    if t_id and t_id in expected_ids:
+                        tool_responses[t_id] = t_msg
+                    i += 1
+
+                # For every expected tool_call_id, emit tool response (or synthetic stub if missing)
+                for tc_id, fn_name in expected_ids.items():
+                    if tc_id in tool_responses:
+                        sanitized_conv.append(tool_responses[tc_id])
+                    else:
+                        sanitized_conv.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "name": fn_name,
+                            "content": json.dumps({"status": "completed", "note": f"Execution for {fn_name} recorded."}),
+                        })
+
+        elif role == "tool":
+            # Orphan tool response without preceding assistant tool_calls
+            t_content = msg.get("content", "")
+            t_name = msg.get("name", "tool")
+            sanitized_conv.append({
+                "role": "user",
+                "content": f"[Tool Execution Output - {t_name}]: {t_content}"
+            })
+            i += 1
+        else:
+            i += 1
+
+    final_messages: List[Dict[str, Any]] = []
+    if system_contents:
+        final_messages.append({"role": "system", "content": "\n\n".join(system_contents)})
+
+    final_messages.extend(sanitized_conv)
+    return final_messages
+
+
 class MessageHistoryManager:
     """
     Manages chat message history for agent turns.
@@ -224,7 +339,7 @@ class MessageHistoryManager:
         Strict History Trimming: Drops intermediate tool execution failures, raw logs,
         and repetitive retry attempts from the agent's active memory once a task/tool succeeds.
         Removes both the assistant message that issued the failed tool call and the corresponding
-        tool failure response, maintaining strict OpenAI chat API message alignment.
+        tool failure response, maintaining strict OpenAI and Gemini chat API message alignment.
         """
         if len(self.messages) <= 3:
             return
@@ -246,8 +361,6 @@ class MessageHistoryManager:
         if not failed_tool_ids:
             return
 
-        # Keep system prompt (index 0) and original user prompt (index 1)
-        # Drop failed assistant-tool pairs from older turns (preserving the last active turn)
         cleaned_messages = []
         cleaned_messages.append(self.messages[0])
 
@@ -257,10 +370,8 @@ class MessageHistoryManager:
         while i < len(self.messages):
             msg = self.messages[i]
 
-            # In older turns, check if this message is a failed assistant tool_call or failed tool result
             if i < last_turn_start:
                 if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    # Check if all tool calls in this assistant message were failed attempts
                     tcs = msg.get("tool_calls", [])
                     if tcs and all(tc.get("id") in failed_tool_ids for tc in tcs):
                         i += 1
@@ -274,7 +385,7 @@ class MessageHistoryManager:
             cleaned_messages.append(msg)
             i += 1
 
-        self.messages = cleaned_messages
+        self.messages = sanitize_messages(cleaned_messages)
 
     def append_tool_result(self, tool_call_id: str, name: str, tool_result: Dict[str, Any]):
         tool_result = self.clean_tool_result(tool_result)
@@ -301,6 +412,13 @@ class MessageHistoryManager:
         if before_tokens < self.max_tokens_before_compact:
             return
 
+        # Preserve the initial user prompt so context is never severed
+        initial_user_msg = None
+        for m in self.messages:
+            if m.get("role") == "user":
+                initial_user_msg = m
+                break
+
         keep_tail = 2 * self.keep_last_tool_pairs + 2
         if len(self.messages) <= keep_tail + 1:
             return  # nothing meaningful to compact yet
@@ -316,7 +434,12 @@ class MessageHistoryManager:
             checklist_block = "\n\n[ACTIONS COMPLETED SO FAR — do not repeat]\n" + "\n".join(confirmed)
 
         compacted_system = self.system_prompt + checklist_block
-        self.messages = [{"role": "system", "content": compacted_system}] + tail
+        reconstructed = [{"role": "system", "content": compacted_system}]
+        if initial_user_msg:
+            reconstructed.append(initial_user_msg)
+        reconstructed.extend(tail)
+
+        self.messages = sanitize_messages(reconstructed)
         after_tokens = self._total_tokens()
 
         if HAS_LOGFIRE:
