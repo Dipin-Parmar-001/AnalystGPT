@@ -101,12 +101,35 @@ class PlanStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+def infer_task_type(title: str = "", description: str = "", assigned_agent: str = "") -> str:
+    """Infers task_type from task title, description, and assigned agent."""
+    combined = f"{title} {description} {assigned_agent}".lower()
+    if "feature_engineering" in combined or "feature engineering" in combined or "engineer feature" in combined or "derived feature" in combined:
+        return "feature_engineering"
+    if "hyperparameter_tuning" in combined or "hyperparameter tuning" in combined or "hyperparameter" in combined or "tuning" in combined or "hpt" in combined:
+        return "hyperparameter_tuning"
+    if "clean" in combined or "inspection" in combined or "imputation" in combined or ("preprocessing" in combined and "ml" not in combined):
+        return "cleaning"
+    if "model" in combined or "train" in combined or "comparison" in combined or "evaluat" in combined or "predict" in combined or "classif" in combined or "regress" in combined:
+        return "model_comparison"
+    if "report" in combined or "synthesis" in combined or "executive" in combined:
+        return "report"
+
+    agent_lower = (assigned_agent or "").lower()
+    if "ml" in agent_lower or "machinelearning" in agent_lower:
+        return "model_comparison"
+    elif "report" in agent_lower:
+        return "report"
+    return "stats_and_viz"
+
+
 @dataclass
 class TaskItem:
     task_id: Any = 1
     title: str = ""
     description: str = ""
     assigned_agent: str = "DataAnalystAgent"
+    task_type: Optional[str] = None  # cleaning, feature_engineering, stats_and_viz, model_comparison, hyperparameter_tuning, report
     status: str = "pending"  # pending, in_progress, completed, failed, skipped, cancelled
     expected_output: str = ""
     depends_on: List[Any] = field(default_factory=list)
@@ -119,11 +142,17 @@ class TaskItem:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TaskItem":
+        assigned = data.get("assigned_agent") or data.get("agent", "DataAnalystAgent")
+        title = data.get("title", "")
+        desc = data.get("description") or data.get("objective", "")
+        ttype = data.get("task_type") or infer_task_type(title, desc, assigned)
+
         return cls(
             task_id=data.get("task_id", 1),
-            title=data.get("title", ""),
-            description=data.get("description") or data.get("objective", ""),
-            assigned_agent=data.get("assigned_agent") or data.get("agent", "DataAnalystAgent"),
+            title=title,
+            description=desc,
+            assigned_agent=assigned,
+            task_type=ttype,
             status=data.get("status", "pending"),
             expected_output=data.get("expected_output", ""),
             depends_on=data.get("depends_on", []),
@@ -172,6 +201,230 @@ class ExecutionPlan:
             notes=data.get("notes", ""),
             revision_count=data.get("revision_count", 0)
         )
+
+
+def validate_plan_prerequisites(plan: ExecutionPlan) -> tuple[bool, list[str], dict[str, Any]]:
+    """
+    Validates structural pipeline prerequisites for Feature Engineering and Hyperparameter Tuning.
+    
+    Returns:
+        (is_valid, errors, details)
+        - is_valid: True if plan satisfies all prerequisites (or only needs reordering).
+        - errors: List of validation error strings if prerequisites are completely missing.
+        - details: Dict with flags (needs_reorder, missing_cleaning, missing_model_comparison).
+    """
+    errors: list[str] = []
+    details: dict[str, Any] = {
+        "needs_reorder": False,
+        "missing_cleaning": False,
+        "missing_model_comparison": False,
+        "fe_task_ids": [],
+        "hpt_task_ids": [],
+    }
+
+    tasks = plan.tasks
+    cleaning_indices = [i for i, t in enumerate(tasks) if t.task_type == "cleaning" or "clean" in t.title.lower()]
+    model_indices = [i for i, t in enumerate(tasks) if t.task_type == "model_comparison" or ("model" in t.title.lower() and "tuning" not in t.title.lower())]
+
+    # 1. Feature Engineering Check
+    for idx, t in enumerate(tasks):
+        if t.task_type == "feature_engineering" or ("feature" in t.title.lower() and "engineering" in t.title.lower()):
+            details["fe_task_ids"].append(t.task_id)
+            if not cleaning_indices:
+                details["missing_cleaning"] = True
+                errors.append(
+                    f"Feature Engineering task #{t.task_id} ('{t.title}') requires a preceding Data Inspection & Cleaning task "
+                    f"that produces 'cleaned_dataset.csv'. No cleaning task was found in the plan."
+                )
+            else:
+                earliest_cleaning = min(cleaning_indices)
+                if earliest_cleaning > idx:
+                    details["needs_reorder"] = True
+
+    # 2. Hyperparameter Tuning Check
+    for idx, t in enumerate(tasks):
+        if t.task_type == "hyperparameter_tuning" or ("tuning" in t.title.lower() or "hyperparameter" in t.title.lower() or "hpt" in t.title.lower()):
+            details["hpt_task_ids"].append(t.task_id)
+            if not model_indices:
+                details["missing_model_comparison"] = True
+                errors.append(
+                    f"Hyperparameter Tuning task #{t.task_id} ('{t.title}') requires a preceding Model Training & Comparison task "
+                    f"that produces 'model_comparison.csv' and 'best_model.pkl'. No model comparison task was found in the plan."
+                )
+            else:
+                earliest_model = min(model_indices)
+                if earliest_model > idx:
+                    details["needs_reorder"] = True
+
+    is_valid = len(errors) == 0
+    return is_valid, errors, details
+
+
+def reorder_plan_tasks(plan: ExecutionPlan) -> ExecutionPlan:
+    """
+    Reorders tasks so that prerequisites strictly precede dependent tasks:
+    Cleaning -> Feature Engineering -> Stats/Viz -> Model Comparison -> Hyperparameter Tuning -> Report.
+    Re-indexes task IDs (1, 2, ...) and reconciles depends_on / inputs.
+    """
+    if not plan.tasks:
+        return plan
+
+    type_order = {
+        "cleaning": 10,
+        "feature_engineering": 20,
+        "stats_and_viz": 30,
+        "model_comparison": 40,
+        "hyperparameter_tuning": 50,
+        "report": 60
+    }
+
+    indexed_tasks = list(enumerate(plan.tasks))
+    # Sort by task type precedence, preserving relative order of same-type tasks
+    sorted_pairs = sorted(
+        indexed_tasks,
+        key=lambda pair: (type_order.get(pair[1].task_type or "stats_and_viz", 35), pair[0])
+    )
+    sorted_tasks = [pair[1] for pair in sorted_pairs]
+
+    # Build old_id -> new_id map
+    id_map: dict[Any, int] = {}
+    for new_idx, task in enumerate(sorted_tasks, start=1):
+        id_map[task.task_id] = new_idx
+        id_map[str(task.task_id)] = new_idx
+
+    # Assign new IDs and reconcile dependencies
+    cleaning_new_id = None
+    fe_new_id = None
+    model_new_id = None
+
+    for new_idx, task in enumerate(sorted_tasks, start=1):
+        task.task_id = new_idx
+        if task.task_type == "cleaning":
+            cleaning_new_id = new_idx
+        elif task.task_type == "feature_engineering":
+            fe_new_id = new_idx
+        elif task.task_type == "model_comparison":
+            model_new_id = new_idx
+
+    # Reconcile depends_on and dataset inputs
+    current_dataset = "cleaned_dataset.csv" if cleaning_new_id else "dataset.csv"
+    if fe_new_id:
+        current_dataset_after_fe = "feature_engineered_dataset.csv"
+    else:
+        current_dataset_after_fe = current_dataset
+
+    for task in sorted_tasks:
+        # Remap existing depends_on
+        remapped_deps = []
+        for dep in task.depends_on:
+            if dep in id_map:
+                remapped_deps.append(id_map[dep])
+            elif str(dep) in id_map:
+                remapped_deps.append(id_map[str(dep)])
+
+        if task.task_type == "cleaning":
+            task.depends_on = [d for d in remapped_deps if d < task.task_id]
+            if not task.inputs:
+                task.inputs = ["dataset.csv"]
+            if not task.expected_output:
+                task.expected_output = "cleaned_dataset.csv, cleaning_summary.json"
+
+        elif task.task_type == "feature_engineering":
+            if cleaning_new_id and cleaning_new_id not in remapped_deps:
+                remapped_deps.append(cleaning_new_id)
+            task.depends_on = sorted(list(set([d for d in remapped_deps if d < task.task_id])))
+            task.inputs = ["cleaned_dataset.csv"]
+            if not task.expected_output:
+                task.expected_output = "feature_engineered_dataset.csv, feature_engineering_summary.json"
+
+        elif task.task_type == "stats_and_viz":
+            task.depends_on = sorted(list(set([d for d in remapped_deps if d < task.task_id])))
+            task.inputs = [current_dataset_after_fe if fe_new_id else current_dataset]
+            if not task.expected_output:
+                task.expected_output = "analyst_summary.json"
+
+        elif task.task_type == "model_comparison":
+            if fe_new_id and fe_new_id not in remapped_deps:
+                remapped_deps.append(fe_new_id)
+            elif cleaning_new_id and cleaning_new_id not in remapped_deps:
+                remapped_deps.append(cleaning_new_id)
+            task.depends_on = sorted(list(set([d for d in remapped_deps if d < task.task_id])))
+            task.inputs = [current_dataset_after_fe]
+            if not task.expected_output:
+                task.expected_output = "model_comparison.csv, best_model.pkl, ml_summary.json, predictions.csv, feature_importance.csv"
+
+        elif task.task_type == "hyperparameter_tuning":
+            if model_new_id and model_new_id not in remapped_deps:
+                remapped_deps.append(model_new_id)
+            task.depends_on = sorted(list(set([d for d in remapped_deps if d < task.task_id])))
+            task.inputs = ["model_comparison.csv", "best_model.pkl"]
+            if not task.expected_output:
+                task.expected_output = "tuned_model_comparison.csv, best_params.json, hyperparameter_tuning_summary.json"
+
+        elif task.task_type == "report":
+            prior_task_ids = [t.task_id for t in sorted_tasks if t.task_id < task.task_id]
+            task.depends_on = prior_task_ids
+            if not task.expected_output:
+                task.expected_output = "final_report.md"
+
+    plan.tasks = sorted_tasks
+    # Update selected_agents
+    all_assigned = list(set([t.assigned_agent for t in plan.tasks if t.assigned_agent]))
+    plan.selected_agents = sorted(all_assigned, key=lambda a: ["DataAnalystAgent", "MLAgent", "ReporterAgent"].index(a) if a in ["DataAnalystAgent", "MLAgent", "ReporterAgent"] else 99)
+
+    return plan
+
+
+def insert_missing_prerequisites_fallback(plan: ExecutionPlan, details: dict[str, Any]) -> ExecutionPlan:
+    """
+    Fallback insertion: Inserts missing prerequisite tasks (Cleaning for FE, Model Comparison for HPT)
+    only after the Planner retry loop has exceeded its maximum attempts. Logs a warning.
+    """
+    inserted_descriptions = []
+
+    if details.get("missing_cleaning"):
+        cleaning_task = TaskItem(
+            task_id=991,
+            title="Data Inspection & Cleaning",
+            description="Inspect raw data for duplicates/missing values and anomalies, clean and export cleaned_dataset.csv.",
+            assigned_agent="DataAnalystAgent",
+            task_type="cleaning",
+            status="pending",
+            expected_output="cleaned_dataset.csv, cleaning_summary.json",
+            depends_on=[],
+            inputs=["dataset.csv"],
+            est_tool_calls=6
+        )
+        plan.tasks.append(cleaning_task)
+        if "DataAnalystAgent" not in plan.selected_agents:
+            plan.selected_agents.append("DataAnalystAgent")
+        inserted_descriptions.append("Data Inspection & Cleaning (required by Feature Engineering)")
+
+    if details.get("missing_model_comparison"):
+        model_task = TaskItem(
+            task_id=992,
+            title="Model Training & Comparison",
+            description="Train, evaluate, and compare baseline candidate models; export model_comparison.csv and best_model.pkl.",
+            assigned_agent="MLAgent",
+            task_type="model_comparison",
+            status="pending",
+            expected_output="model_comparison.csv, best_model.pkl, ml_summary.json",
+            depends_on=[],
+            inputs=["feature_engineered_dataset.csv" if details.get("missing_cleaning") or any(t.task_type == "feature_engineering" for t in plan.tasks) else "cleaned_dataset.csv"],
+            est_tool_calls=6
+        )
+        plan.tasks.append(model_task)
+        if "MLAgent" not in plan.selected_agents:
+            plan.selected_agents.append("MLAgent")
+        inserted_descriptions.append("Model Training & Comparison (required by Hyperparameter Tuning)")
+
+    warn_msg = f"[Planner Warning] Fallback insertion applied after retry limit: Auto-inserted {', '.join(inserted_descriptions)}."
+    if HAS_LOGFIRE:
+        logfire.warn(warn_msg, plan_id=plan.plan_id, inserted=inserted_descriptions)
+    print(warn_msg, file=sys.stderr)
+
+    plan.notes = (plan.notes + f" | {warn_msg}").strip(" |")
+    return reorder_plan_tasks(plan)
 
 
 
@@ -298,14 +551,37 @@ class PlannerAgent:
                 cancellation_token.check_cancelled(step_name="PlannerAgent before LLM plan generation")
 
             try:
-                response = self.client.chat.completions.create(
+                delays = [10, 20, 30]
+
+                for attempt, delay in enumerate(delays + [0]):
+
+                    try:
+
+                        response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=messages,
                     temperature=0.2
                 )
+
+                        break
+
+                    except Exception as err:
+
+                        if attempt < len(delays):
+
+                            import time
+
+                            print(f"[PlannerAgent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+
+                            time.sleep(delay)
+
+                            continue
+
+                        raise err
                 if cancellation_token:
                     cancellation_token.check_cancelled(step_name="PlannerAgent after LLM plan generation")
 
+                # 1. Parse initial plan
                 raw_content = response.choices[0].message.content
                 parsed = _extract_json(raw_content)
 
@@ -319,6 +595,7 @@ class PlannerAgent:
                         title=task_raw.get("title", f"Task {idx}"),
                         description=task_raw.get("description", ""),
                         assigned_agent=task_raw.get("assigned_agent", selected_agents[0]),
+                        task_type=task_raw.get("task_type") or infer_task_type(task_raw.get("title", ""), task_raw.get("description", ""), task_raw.get("assigned_agent", selected_agents[0])),
                         status="pending",
                         expected_output=task_raw.get("expected_output", ""),
                         depends_on=task_raw.get("depends_on", []),
@@ -337,14 +614,98 @@ class PlannerAgent:
                     revision_count=0
                 )
 
+                # 2. Validate prerequisites
+                is_valid, errors, details = validate_plan_prerequisites(plan)
+
+                # 3. Retry loop (max 2 iterations) if missing prerequisites
+                current_messages = list(messages)
+                current_messages.append({"role": "assistant", "content": raw_content})
+
+                attempt = 0
+                while not is_valid and errors and attempt < 2:
+                    attempt += 1
+                    if cancellation_token:
+                        cancellation_token.check_cancelled(step_name=f"PlannerAgent retry loop attempt {attempt}")
+
+                    retry_prompt = (
+                        f"The execution plan has validation errors that violate mandatory pipeline prerequisites:\n"
+                        + "\n".join(f"- {e}" for e in errors)
+                        + "\n\nPlease correct the JSON plan:\n"
+                        + "- If there is a Feature Engineering task, it MUST be preceded by a Data Inspection & Cleaning task producing 'cleaned_dataset.csv'.\n"
+                        + "- If there is a Hyperparameter Tuning task, it MUST be preceded by a Model Training & Comparison task producing 'model_comparison.csv' and 'best_model.pkl'.\n"
+                        + "- Ensure depends_on and inputs correctly reflect this sequence."
+                    )
+                    current_messages.append({"role": "user", "content": retry_prompt})
+
+                    try:
+                        delays = [10, 20, 30]
+
+                        for attempt, delay in enumerate(delays + [0]):
+                            try:
+                                retry_resp = self.client.chat.completions.create(
+                                    model=self.model_name,
+                                    messages=sanitize_messages(current_messages),
+                                    temperature=0.2
+                                )
+                                break
+                            except Exception as err:
+                                if attempt < len(delays):
+                                    import time
+                                    print(f"[PlannerAgent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+                                    time.sleep(delay)
+                                    continue
+                                raise err
+                            
+                        retry_raw = retry_resp.choices[0].message.content
+                        current_messages.append({"role": "assistant", "content": retry_raw})
+                        retry_parsed = _extract_json(retry_raw)
+
+                        retry_tasks = []
+                        retry_agents = retry_parsed.get("selected_agents", plan.selected_agents)
+                        for idx, task_raw in enumerate(retry_parsed.get("tasks", []), start=1):
+                            rt = TaskItem(
+                                task_id=task_raw.get("task_id", idx),
+                                title=task_raw.get("title", f"Task {idx}"),
+                                description=task_raw.get("description", ""),
+                                assigned_agent=task_raw.get("assigned_agent", retry_agents[0]),
+                                task_type=task_raw.get("task_type") or infer_task_type(task_raw.get("title", ""), task_raw.get("description", ""), task_raw.get("assigned_agent", retry_agents[0])),
+                                status="pending",
+                                expected_output=task_raw.get("expected_output", ""),
+                                depends_on=task_raw.get("depends_on", []),
+                                inputs=task_raw.get("inputs", []),
+                                est_tool_calls=task_raw.get("est_tool_calls")
+                            )
+                            retry_tasks.append(rt)
+
+                        plan = ExecutionPlan(
+                            plan_id=plan.plan_id,
+                            query=user_query,
+                            selected_agents=retry_agents,
+                            tasks=retry_tasks,
+                            status=PlanStatus.DRAFT,
+                            notes=retry_parsed.get("notes", plan.notes),
+                            revision_count=attempt
+                        )
+                        is_valid, errors, details = validate_plan_prerequisites(plan)
+                    except Exception as retry_err:
+                        print(f"[PlannerAgent Notice] Retry attempt {attempt} failed: {retry_err}", file=sys.stderr)
+                        break
+
+                # 4. Fallback insertion if still invalid after max attempts
+                if not is_valid and errors:
+                    plan = insert_missing_prerequisites_fallback(plan, details)
+
+                # 5. Final reordering to guarantee sequential order and correct dependencies
+                plan = reorder_plan_tasks(plan)
+
                 if HAS_LOGFIRE:
                     logfire.info(
                         "PlannerAgent Created Plan",
                         plan_id=plan.plan_id,
-                        selected_agents=selected_agents,
-                        task_count=len(tasks),
-                        task_summary=[{"id": t.task_id, "title": t.title, "agent": t.assigned_agent} for t in tasks],
-                        notes=notes
+                        selected_agents=plan.selected_agents,
+                        task_count=len(plan.tasks),
+                        task_summary=[{"id": t.task_id, "title": t.title, "agent": t.assigned_agent, "type": t.task_type} for t in plan.tasks],
+                        notes=plan.notes
                     )
 
                 return plan
@@ -360,6 +721,7 @@ class PlannerAgent:
                     title="Execute Data Analysis",
                     description=user_query,
                     assigned_agent="DataAnalystAgent",
+                    task_type="stats_and_viz",
                     status="pending",
                     expected_output="Analysis output report",
                     est_tool_calls=4
@@ -408,11 +770,33 @@ class PlannerAgent:
         ])
 
         try:
-            response = self.client.chat.completions.create(
+            delays = [10, 20, 30]
+
+            for attempt, delay in enumerate(delays + [0]):
+
+                try:
+
+                    response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 temperature=0.2
             )
+
+                    break
+
+                except Exception as err:
+
+                    if attempt < len(delays):
+
+                        import time
+
+                        print(f"[PlannerAgent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+
+                        time.sleep(delay)
+
+                        continue
+
+                    raise err
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name="PlannerAgent after plan modification")
             raw_content = response.choices[0].message.content
@@ -428,6 +812,7 @@ class PlannerAgent:
                     title=task_raw.get("title", f"Task {idx}"),
                     description=task_raw.get("description", ""),
                     assigned_agent=task_raw.get("assigned_agent", selected_agents[0]),
+                    task_type=task_raw.get("task_type") or infer_task_type(task_raw.get("title", ""), task_raw.get("description", ""), task_raw.get("assigned_agent", selected_agents[0])),
                     status="pending",
                     expected_output=task_raw.get("expected_output", ""),
                     depends_on=task_raw.get("depends_on", []),
@@ -445,6 +830,13 @@ class PlannerAgent:
                 notes=notes,
                 revision_count=current_plan.revision_count + 1
             )
+
+            # Validate and self-correct if modified plan has prerequisite errors
+            is_valid, errors, details = validate_plan_prerequisites(updated_plan)
+            if not is_valid and errors:
+                updated_plan = insert_missing_prerequisites_fallback(updated_plan, details)
+
+            updated_plan = reorder_plan_tasks(updated_plan)
 
             if HAS_LOGFIRE:
                 logfire.info("Execution plan modified", plan_id=updated_plan.plan_id, revision=updated_plan.revision_count)

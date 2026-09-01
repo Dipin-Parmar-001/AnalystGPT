@@ -89,7 +89,13 @@ def execute_python(
         )
 
         # 3. Run code statefully inside Modal container sandbox
-        result = manager.run_code(code=code, files=input_files_map)
+        # Inject MPLBACKEND to prevent Tkinter RuntimeError in threads
+        injection = "import os\nos.environ['MPLBACKEND'] = 'Agg'\n"
+        modified_code = code
+        if not modified_code.startswith("import os\nos.environ['MPLBACKEND']"):
+            modified_code = injection + modified_code
+            
+        result = manager.run_code(code=modified_code, files=input_files_map)
 
         # 4. Save returned files locally to host disk
         saved_file_paths = manager.save_outputs(result, output_dir=target_output_dir)
@@ -111,8 +117,8 @@ def execute_python(
 
         stdout_str = result.get("stdout", "")
         stderr_str = result.get("stderr", "")
-        if len(stdout_str) > 2000:
-            stdout_str = stdout_str[:2000] + "\n... [stdout truncated at 2000 characters limit]"
+        if len(stdout_str) > 4000:
+            stdout_str = stdout_str[:4000] + "\n... [stdout truncated at 4000 characters limit]"
         if len(stderr_str) > 2000:
             stderr_str = "... [stderr truncated from start, showing last 2000 characters limit]\n" + stderr_str[-2000:]
 

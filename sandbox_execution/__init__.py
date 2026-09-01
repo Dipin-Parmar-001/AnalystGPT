@@ -22,6 +22,10 @@ from sandbox_execution.tool_manager import (
     EXECUTE_PYTHON_TOOL_SPEC,
 )
 
+from sandbox_execution.verification_script import (
+    build_verified_metrics,
+)
+
 __all__ = [
     "ModalSandboxManager",
     "get_global_sandbox_manager",
@@ -38,5 +42,6 @@ __all__ = [
     "ToolManager",
     "execute_python",
     "EXECUTE_PYTHON_TOOL_SPEC",
+    "build_verified_metrics",
 ]
 

@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import traceback
+import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
 from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 
 
 
@@ -175,17 +176,19 @@ class DataAnalystAgent:
             kwargs["tools"] = effective_tools
 
         def _do_call():
-            try:
-                response = self.client.chat.completions.create(**kwargs)
-                message = response.choices[0].message
+            delays = [10, 20, 30]
+            for attempt, delay in enumerate(delays + [0]):
+                try:
+                    response = self.client.chat.completions.create(**kwargs)
+                    message = response.choices[0].message
 
-                if HAS_LOGFIRE:
-                    tool_calls_summary = []
-                    if message.tool_calls:
-                        for tc in message.tool_calls:
-                            tool_calls_summary.append({
-                                "id": tc.id,
-                                "function": tc.function.name,
+                    if HAS_LOGFIRE:
+                        tool_calls_summary = []
+                        if message.tool_calls:
+                            for tc in message.tool_calls:
+                                tool_calls_summary.append({
+                                    "id": tc.id,
+                                    "function": tc.function.name,
                                 "arguments_raw": tc.function.arguments,
                             })
                     logfire.info(
@@ -198,8 +201,38 @@ class DataAnalystAgent:
                         finish_reason=getattr(response.choices[0], "finish_reason", None),
                         usage=getattr(response, "usage", None),
                     )
-                return message
-            except Exception as err:
+                    return message
+                except Exception as err:
+                    err_str = str(err).lower()
+                    # If provider fails on tool calling schema (e.g. Google Role 'function' error or tool format rejection)
+                    if "role 'function'" in err_str or "not supported" in err_str or "invalid_argument" in err_str or "400" in err_str:
+                        if HAS_LOGFIRE:
+                            logfire.warn("Portkey/Provider rejected tool schema in agent.py. Falling back to plain chat format.", error=str(err))
+                        else:
+                            print(f"[Agent] Provider tool schema rejected ({err}). Falling back to robust plain chat format...")
+                        
+                        plain_msgs = convert_to_plain_chat(messages)
+                        fallback_kwargs = {
+                            "model": kwargs.get("model", "nvidia/nemotron-3-ultra-550b-a55b"),
+                            "messages": plain_msgs,
+                        }
+                        try:
+                            fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            return fallback_resp.choices[0].message
+                        except Exception as fallback_err:
+                            if HAS_LOGFIRE:
+                                logfire.error("Agent fallback LLM request failed", error=str(fallback_err))
+                            raise RuntimeError(f"Agent LLM call failed after fallback: {fallback_err}") from fallback_err
+
+
+                if attempt < len(delays):
+                    if HAS_LOGFIRE:
+                        logfire.warn(f"LLM request failed (attempt {attempt + 1}), retrying in {delay}s...", error=str(err))
+                    else:
+                        print(f"[{agent} Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+                    time.sleep(delay)
+                    continue
+
                 if HAS_LOGFIRE:
                     logfire.error(
                         "Portkey Gateway LLM Request Failed",

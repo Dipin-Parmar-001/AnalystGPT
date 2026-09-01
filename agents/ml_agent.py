@@ -11,6 +11,7 @@ import sys
 import json
 import re
 import traceback
+import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
 from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
 from agents.prompts import ML_AGENT, ML_SYSTEM_PROMPT
 from agents.cancellation import CancellationToken, WorkflowCancelledException
@@ -207,11 +208,43 @@ class MLAgent:
             kwargs["tools"] = effective_tools
 
         def _do_call():
-            try:
-                response = self.client.chat.completions.create(**kwargs)
-                message = response.choices[0].message
-                return message
-            except Exception as err:
+            delays = [10, 20, 30]
+            for attempt, delay in enumerate(delays + [0]):
+                try:
+                    response = self.client.chat.completions.create(**kwargs)
+                    message = response.choices[0].message
+                    return message
+                except Exception as err:
+                    err_str = str(err).lower()
+                    # If provider fails on tool calling schema (e.g. Google Role 'function' error or tool format rejection)
+                    if "role 'function'" in err_str or "not supported" in err_str or "invalid_argument" in err_str or "400" in err_str:
+                        if HAS_LOGFIRE:
+                            logfire.warn("Portkey/Provider rejected tool schema in MLAgent. Falling back to plain chat format.", error=str(err))
+                        else:
+                            print(f"[MLAgent] Provider tool schema rejected ({err}). Falling back to robust plain chat format...")
+                        
+                        plain_msgs = convert_to_plain_chat(messages)
+                        fallback_kwargs = {
+                            "model": self.model_name,
+                            "messages": plain_msgs,
+                        }
+                        try:
+                            fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            return fallback_resp.choices[0].message
+                        except Exception as fallback_err:
+                            if HAS_LOGFIRE:
+                                logfire.error("MLAgent fallback LLM request failed", error=str(fallback_err))
+                            raise RuntimeError(f"MLAgent LLM call failed after fallback: {fallback_err}") from fallback_err
+
+
+                    if attempt < len(delays):
+                        if HAS_LOGFIRE:
+                            logfire.warn(f"LLM request failed (attempt {attempt + 1}), retrying in {delay}s...", error=str(err))
+                        else:
+                            print(f"[Agent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+                        time.sleep(delay)
+                        continue
+
                 if HAS_LOGFIRE:
                     logfire.error("MLAgent LLM request failed", error=str(err))
                 raise RuntimeError(f"MLAgent LLM call failed: {err}") from err
@@ -298,27 +331,49 @@ class MLAgent:
         if plan_summary:
             composite_prompt += f"=== PLAN CONTEXT ===\n{plan_summary}\n\n"
 
+        primary_task = assigned_tasks[0] if assigned_tasks else None
+        task_type = getattr(primary_task, "task_type", None) or "model_comparison"
+
+        if task_type == "hyperparameter_tuning":
+            task_specific_instructions = (
+                f"Instructions for Hyperparameter Tuning:\n"
+                f"1. You have a budget of MAX {effective_max_calls} tool calls.\n"
+                f"2. Load `model_comparison.csv` and `best_model.pkl` directly from FILE_REGISTRY.\n"
+                f"3. Reconstruct training data using identical split and preprocessing from baseline.\n"
+                f"4. Bounded search: Run GridSearchCV or RandomizedSearchCV with cv=5 over the bounded parameter search space specified in your task description.\n"
+                f"5. Honest reporting: Only overwrite `best_model.pkl` if the tuned model's primary metric strictly outperforms baseline.\n"
+                f"6. MANDATORY OUTPUT ARTIFACTS:\n"
+                f"   - `tuned_model_comparison.csv` (Comparing baseline vs tuned metrics side by side)\n"
+                f"   - `best_params.json` (Winning hyperparameter combination and best CV score)\n"
+                f"   - `hyperparameter_tuning_summary.json` (Structured tuning summary JSON)\n"
+                f"   - `best_model.pkl` (Updated only if tuned model won)\n"
+                f"7. Provide a concise summary of tuning results, parameter improvements, and test metric deltas."
+            )
+        else:
+            task_specific_instructions = (
+                f"Instructions for Model Training & Comparison:\n"
+                f"1. Dataset Loading: If `feature_engineered_dataset.csv` or `cleaned_dataset.csv` is available in FILE_REGISTRY or inputs, load it directly. If not available, use the main dataset provided.\n"
+                f"2. Identifier Preservation: Retain identifier columns (e.g., `customerID`, `id`) in `predictions.csv` for entity traceability, but EXCLUDE them from training feature matrix `X`.\n"
+                f"3. Preprocessing: Use One-Hot Encoding (`pd.get_dummies(..., drop_first=True)` or `OneHotEncoder`) for nominal features, `LabelEncoder()` strictly for classification target `y`, `StandardScaler()` fit strictly on `X_train`, and `train_test_split(..., test_size=0.2, random_state=42, stratify=y if classification else None)`.\n"
+                f"4. Metrics: For classification, evaluate Accuracy, Precision, Recall, F1, ROC-AUC, **PR-AUC** (`average_precision_score`), and **5-Fold Stratified Cross-Validation** (`CV_Mean`, `CV_Std`). For regression, evaluate RMSE, MAE, R2, MSE, and 5-Fold CV R2.\n"
+                f"5. Directional Feature Importance: Extract signed `coefficient`, `absolute_importance`, and `direction` (e.g., `'reduces_churn'` / `'increases_churn'` or `'reduces_target'` / `'increases_target'`) and save to `feature_importance.csv`.\n"
+                f"6. Business-Aware Model Selection: Provide a comparative multi-metric rationale (e.g. 'Model A has highest ROC-AUC/PR-AUC while Model B has higher recall. Model A was selected because ROC-AUC was designated as primary metric...').\n"
+                f"7. MANDATORY 7 ARTIFACTS: Your script MUST save all 7 core files:\n"
+                f"   - `model_comparison.csv` (Comparing models across Accuracy, Precision, Recall, F1, ROC_AUC, PR_AUC, CV_Mean, CV_Std)\n"
+                f"   - `baseline_score.json` (Dummy baseline benchmark)\n"
+                f"   - `feature_importance.csv` (Columns: feature, coefficient, absolute_importance, direction)\n"
+                f"   - `confusion_matrix.json` (Confusion matrix data for best model)\n"
+                f"   - `predictions.csv` (Predictions with customerID, actual, predicted, probability)\n"
+                f"   - `best_model.pkl` (Best model saved via joblib.dump)\n"
+                f"   - `ml_summary.json` (Structured machine learning summary)\n"
+                f"8. You have a budget of MAX {effective_max_calls} tool calls.\n"
+                f"9. Output the final structured JSON summary and metric details."
+            )
+
         composite_prompt += (
             f"=== ASSIGNED ML TASKS FOR {self.agent_name} ===\n"
             f"{tasks_block}\n\n"
-            f"Instructions:\n"
-            f"1. Dataset Loading: If `cleaned_dataset.csv` is available in FILE_REGISTRY or inputs, load it directly (e.g. `pd.read_csv('cleaned_dataset.csv')`). If not available, use the main dataset provided.\n"
-            f"2. Identifier Preservation: Retain identifier columns (e.g., `customerID`, `id`) in `predictions.csv` for entity traceability, but EXCLUDE them from training feature matrix `X`.\n"
-            f"3. Preprocessing: Use One-Hot Encoding (`pd.get_dummies(..., drop_first=True)` or `OneHotEncoder`) for nominal features, `LabelEncoder()` strictly for classification target `y`, `StandardScaler()` fit strictly on `X_train`, and `train_test_split(..., test_size=0.2, random_state=42, stratify=y if classification else None)`.\n"
-            f"4. Metrics: For classification, evaluate Accuracy, Precision, Recall, F1, ROC-AUC, **PR-AUC** (`average_precision_score`), and **5-Fold Stratified Cross-Validation** (`CV_Mean`, `CV_Std`). For regression, evaluate RMSE, MAE, R2, MSE, and 5-Fold CV R2.\n"
-            f"5. Directional Feature Importance: Extract signed `coefficient`, `absolute_importance`, and `direction` (e.g., `'reduces_churn'` / `'increases_churn'` or `'reduces_target'` / `'increases_target'`) and save to `feature_importance.csv`.\n"
-            f"6. Business-Aware Model Selection: Provide a comparative multi-metric rationale (e.g. 'Model A has highest ROC-AUC/PR-AUC while Model B has higher recall. Model A was selected because ROC-AUC was designated as primary metric...').\n"
-            f"7. MANDATORY 7 ARTIFACTS: Your script MUST save all 7 core files:\n"
-            f"   - `model_comparison.csv` (Comparing models across Accuracy, Precision, Recall, F1, ROC_AUC, PR_AUC, CV_Mean, CV_Std)\n"
-            f"   - `baseline_score.json` (Dummy baseline benchmark)\n"
-            f"   - `feature_importance.csv` (Columns: feature, coefficient, absolute_importance, direction)\n"
-            f"   - `confusion_matrix.json` (Confusion matrix data for best model)\n"
-            f"   - `predictions.csv` (Predictions with customerID, actual, predicted, probability)\n"
-            f"   - `best_model.pkl` (Best model saved via joblib.dump)\n"
-            f"   - `ml_summary.json` (Structured machine learning summary)\n"
-            f"   (You may also save additional plots/files if helpful).\n"
-            f"8. You have a budget of MAX {effective_max_calls} tool calls.\n"
-            f"9. Output the final structured JSON summary and metric details."
+            f"{task_specific_instructions}"
         )
 
         memory_manager = MessageHistoryManager(

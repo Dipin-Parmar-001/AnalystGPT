@@ -149,6 +149,79 @@ def _extract_code_from_tool_call(tool_call: Dict[str, Any]) -> str:
 # 3. History Manager: Bounds raw transcript and compacts old turns
 # ---------------------------------------------------------------------------
 
+def convert_to_plain_chat(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Converts message history containing tool_calls and tool messages into
+    a strictly alternating user/assistant plain chat transcript with markdown code blocks.
+    
+    This format is guaranteed to work seamlessly with ANY LLM provider (Google Gemini,
+    OpenRouter, Nvidia, Mistral, OpenAI, etc.) even when Portkey or the provider's API
+    rejects native tool/function roles.
+    """
+    if not messages:
+        return [{"role": "user", "content": "Please proceed with the assigned task."}]
+
+    system_contents: List[str] = []
+    plain_conv: List[Dict[str, Any]] = []
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            c = m.get("content", "")
+            if c:
+                system_contents.append(str(c))
+        elif role == "user":
+            plain_conv.append({"role": "user", "content": str(m.get("content", ""))})
+        elif role == "assistant":
+            content = str(m.get("content") or "").strip()
+            tool_calls = m.get("tool_calls", [])
+            for tc in tool_calls:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
+                args_str = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    if isinstance(args, dict) and "code" in args:
+                        content += f"\n\n```python\n{args['code']}\n```"
+                except Exception:
+                    pass
+            plain_conv.append({"role": "assistant", "content": content or "Executing required tool..."})
+        elif role in ("tool", "function"):
+            fn_name = m.get("name", "execute_python")
+            tool_content = m.get("content", "")
+            if isinstance(tool_content, (dict, list)):
+                tool_content = json.dumps(tool_content, default=str)
+            else:
+                tool_content = str(tool_content)
+            plain_conv.append({
+                "role": "user",
+                "content": f"[Tool Execution Result for {fn_name}]:\n{tool_content}\n\nPlease analyze these execution results and proceed with the next step, code snippet, or final summary."
+            })
+
+    # Merge consecutive messages with same role to ensure strict alternating turn structure
+    merged_conv: List[Dict[str, Any]] = []
+    for msg in plain_conv:
+        if not merged_conv:
+            merged_conv.append(msg)
+        else:
+            prev = merged_conv[-1]
+            if prev["role"] == msg["role"]:
+                prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            else:
+                merged_conv.append(msg)
+
+    # Gemini & Anthropic require the conversation after system to start with 'user'
+    if merged_conv and merged_conv[0]["role"] != "user":
+        merged_conv.insert(0, {"role": "user", "content": "Please proceed with the assigned data analysis workflow."})
+
+    final_msgs: List[Dict[str, Any]] = []
+    if system_contents:
+        final_msgs.append({"role": "system", "content": "\n\n".join(system_contents)})
+    final_msgs.extend(merged_conv)
+    return final_msgs
+
+
 def sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Sanitizes message history to strictly conform to OpenAI and Google Gemini API schemas.
@@ -161,7 +234,8 @@ def sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     4. No orphan 'tool' messages (every 'tool' message must correspond to an active tool_call_id
        in the immediately preceding 'assistant' message).
     5. No 'assistant' tool_call turn directly after 'system' without an intervening 'user' turn.
-    6. Properly handles tool limit / partial turns without breaking API contracts.
+    6. Converts any legacy 'function' role into 'tool' or 'user' format.
+    7. Properly handles tool limit / partial turns without breaking API contracts.
     """
     if not messages:
         return [{"role": "user", "content": "Please proceed."}]
@@ -179,6 +253,15 @@ def sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 system_contents.append(str(content))
         elif role in ("user", "assistant", "tool"):
             raw_conv_messages.append(m)
+        elif role == "function":
+            # Legacy function role conversion
+            converted = {
+                "role": "tool",
+                "tool_call_id": m.get("tool_call_id", f"call_{m.get('name', 'tool')}"),
+                "name": m.get("name", "tool"),
+                "content": m.get("content", ""),
+            }
+            raw_conv_messages.append(converted)
 
     if not raw_conv_messages:
         raw_conv_messages = [{"role": "user", "content": "Please proceed with the assigned task."}]

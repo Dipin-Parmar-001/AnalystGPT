@@ -372,7 +372,7 @@ def save_returned_files(
 # ==========================================
 
 
-def clean_output_stream(stream_text: str, max_chars: int = 2000, truncate_from_start: bool = False) -> str:
+def clean_output_stream(stream_text: str, max_chars: int = 4000, truncate_from_start: bool = False) -> str:
     """
     Cleans and formats stdout or stderr output streams, limiting output to max_chars.
     If truncate_from_start is True (default for stderr), truncates from the starting (head) and keeps the end (tail).
@@ -394,19 +394,20 @@ def format_execution_result(
     execution_time: float,
     files: Optional[Dict[str, Dict[str, Any]]] = None,
     error: str = "",
-    max_chars: int = 2000,
+    max_stdout_chars: int = 4000,
+    max_stderr_chars: int = 2000,
 ) -> Dict[str, Any]:
     """
-    Formats raw sandbox execution results into a clean dictionary, slicing stdout/stderr to max 2000 chars.
+    Formats raw sandbox execution results into a clean dictionary, slicing stdout to max 4000 chars and stderr to max 2000 chars.
     Truncates stderr from the start so that final traceback/exception errors at the end are preserved.
     """
-    formatted_stdout = clean_output_stream(stdout, max_chars=max_chars, truncate_from_start=False)
-    formatted_stderr = clean_output_stream(stderr, max_chars=max_chars, truncate_from_start=True)
+    formatted_stdout = clean_output_stream(stdout, max_chars=max_stdout_chars, truncate_from_start=False)
+    formatted_stderr = clean_output_stream(stderr, max_chars=max_stderr_chars, truncate_from_start=True)
 
     if error:
-        cleaned_error = clean_output_stream(error, max_chars=max_chars, truncate_from_start=True)
+        cleaned_error = clean_output_stream(error, max_chars=max_stderr_chars, truncate_from_start=True)
         if formatted_stderr:
-            formatted_stderr = clean_output_stream(f"{formatted_stderr}\n{cleaned_error}", max_chars=max_chars, truncate_from_start=True)
+            formatted_stderr = clean_output_stream(f"{formatted_stderr}\n{cleaned_error}", max_chars=max_stderr_chars, truncate_from_start=True)
         else:
             formatted_stderr = cleaned_error
 
@@ -434,7 +435,7 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
 
     with tempfile.TemporaryDirectory() as tempdir:
         os.chdir(tempdir)
-        
+
         # Write incoming input files into container workspace
         for filename, content in files.items():
             dir_path = os.path.dirname(filename)
@@ -472,8 +473,22 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
         success = False
         error_str = ""
 
+        # CRITICAL FIX: Set matplotlib to use 'Agg' backend (non-interactive) BEFORE executing user code.
+        # This prevents Tkinter threading errors ("main thread is not in main loop") that occur when
+        # matplotlib tries to use a GUI backend in a background thread (Modal sandbox).
+        # We inject this setup code at the beginning of the user's code execution context.
+        matplotlib_setup_code = (
+            "import os\n"
+            "os.environ['MPLBACKEND'] = 'Agg'\n"
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n"
+        )
+
         try:
             with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                # First execute matplotlib backend setup
+                exec(matplotlib_setup_code, local_globals)
+                # Then execute user code
                 exec(code, local_globals)
             success = True
         except Exception:
@@ -744,9 +759,22 @@ class ModalSandboxManager:
             success = False
             error_str = ""
 
+            # CRITICAL FIX: Set matplotlib to use 'Agg' backend (non-interactive) BEFORE executing user code.
+            # This prevents Tkinter threading errors ("main thread is not in main loop") that occur when
+            # matplotlib tries to use a GUI backend in a background thread (Modal sandbox).
+            matplotlib_setup_code = (
+                "import os\n"
+                "os.environ['MPLBACKEND'] = 'Agg'\n"
+                "import matplotlib\n"
+                "matplotlib.use('Agg')\n"
+            )
+
             try:
                 os.chdir(self._sandbox_dir)
                 with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                    # First execute matplotlib backend setup
+                    exec(matplotlib_setup_code, self._globals)
+                    # Then execute user code
                     exec(code, self._globals)
                 success = True
             except Exception:

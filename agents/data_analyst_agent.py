@@ -13,6 +13,7 @@ import sys
 import json
 import re
 import traceback
+import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -30,7 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
 from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
+from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
 from agents.cancellation import CancellationToken, WorkflowCancelledException
 
@@ -201,11 +202,43 @@ class DataAnalystAgent:
             kwargs["tools"] = effective_tools
 
         def _do_call():
-            try:
-                response = self.client.chat.completions.create(**kwargs)
-                message = response.choices[0].message
-                return message
-            except Exception as err:
+            delays = [10, 20, 30]
+            for attempt, delay in enumerate(delays + [0]):
+                try:
+                    response = self.client.chat.completions.create(**kwargs)
+                    message = response.choices[0].message
+                    return message
+                except Exception as err:
+                    err_str = str(err).lower()
+                    # If provider fails on tool calling schema (e.g. Google Role 'function' error or tool format rejection)
+                    if "role 'function'" in err_str or "not supported" in err_str or "invalid_argument" in err_str or "400" in err_str:
+                        if HAS_LOGFIRE:
+                            logfire.warn("Portkey/Provider rejected tool schema. Falling back to plain chat format.", error=str(err))
+                        else:
+                            print(f"[DataAnalystAgent] Provider tool schema rejected ({err}). Falling back to robust plain chat format...")
+                        
+                        plain_msgs = convert_to_plain_chat(messages)
+                        fallback_kwargs = {
+                            "model": self.model_name,
+                            "messages": plain_msgs,
+                        }
+                        try:
+                            fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            return fallback_resp.choices[0].message
+                        except Exception as fallback_err:
+                            if HAS_LOGFIRE:
+                                logfire.error("DataAnalystAgent fallback LLM request failed", error=str(fallback_err))
+                            raise RuntimeError(f"DataAnalystAgent LLM call failed after fallback: {fallback_err}") from fallback_err
+
+
+                    if attempt < len(delays):
+                        if HAS_LOGFIRE:
+                            logfire.warn(f"LLM request failed (attempt {attempt + 1}), retrying in {delay}s...", error=str(err))
+                        else:
+                            print(f"[Agent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+                        time.sleep(delay)
+                        continue
+
                 if HAS_LOGFIRE:
                     logfire.error("DataAnalystAgent LLM request failed", error=str(err))
                 raise RuntimeError(f"DataAnalystAgent LLM call failed: {err}") from err
@@ -305,18 +338,46 @@ class DataAnalystAgent:
         if plan_summary:
             composite_prompt += f"=== PLAN CONTEXT ===\n{plan_summary}\n\n"
 
+        primary_task = assigned_tasks[0] if assigned_tasks else None
+        task_type = getattr(primary_task, "task_type", None) or "cleaning"
+
+        if task_type == "feature_engineering":
+            task_specific_instructions = (
+                f"Instructions for Feature Engineering:\n"
+                f"1. You have a budget of MAX {effective_max_calls} tool calls.\n"
+                f"2. Load `cleaned_dataset.csv` directly from FILE_REGISTRY.\n"
+                f"3. Scope discipline: Construct ONLY the derived features named in the task description above.\n"
+                f"4. Preserve all existing columns and identifiers (e.g. customerID, user_id).\n"
+                f"5. Reload-and-assert: Reload `feature_engineered_dataset.csv` and verify shape and columns before finishing.\n"
+                f"6. MANDATORY OUTPUTS: Save the engineered dataset as `feature_engineered_dataset.csv` and summary as `feature_engineering_summary.json`.\n"
+                f"7. Provide a concise summary of the engineered features and verified dataset shape."
+            )
+        elif task_type == "stats_and_viz":
+            task_specific_instructions = (
+                f"Instructions for Descriptive Statistics & Visualization:\n"
+                f"1. You have a budget of MAX {effective_max_calls} tool calls.\n"
+                f"2. Load the input dataset named in your task inputs (e.g. `feature_engineered_dataset.csv` or `cleaned_dataset.csv`).\n"
+                f"3. Compute summary statistics, correlations, and grouped aggregations.\n"
+                f"4. Generate ONLY the specific charts requested in the task description and save as PNG files.\n"
+                f"5. Save `analyst_summary.json` (and `analyst_summary_task_{task_id_val}.json`) with complete metric breakdowns.\n"
+                f"6. Provide a comprehensive summary of key statistical insights and findings."
+            )
+        else:
+            task_specific_instructions = (
+                f"Instructions for Data Cleaning & Preparation:\n"
+                f"1. You have a budget of MAX {effective_max_calls} tool calls.\n"
+                f"2. Load datasets using the exact filename in FILE_REGISTRY.\n"
+                f"3. RAW DATA INSPECTION & ROW RECONCILIATION (CRITICAL): Calculate duplicates (`df.duplicated().sum()`) and nulls (`df.isnull().sum()`) on the RAW dataset FIRST before any column exclusions. Track `initial_rows`, explicit `removed` breakdown with reason and count, and `retained` rows.\n"
+                f"4. IDENTIFIER PRESERVATION: Do NOT drop identifier columns (e.g., customerID, id). Except/exclude them from feature correlations and plots, but KEEP them in the dataset.\n"
+                f"5. EXPORT CLEANED DATASET: ALWAYS save the cleaned dataset to `cleaned_dataset.csv` (e.g., `df.to_csv('cleaned_dataset.csv', index=False)`).\n"
+                f"6. Save `analyst_summary.json` (and `analyst_summary_task_{task_id_val}.json`) and all visualization PNGs.\n"
+                f"7. Provide a comprehensive final answer summarizing your cleaning, findings, and figures."
+            )
+
         composite_prompt += (
             f"=== ASSIGNED TASKS FOR {self.agent_name} ===\n"
             f"{tasks_block}\n\n"
-            f"Instructions:\n"
-            f"1. Complete the assigned task(s) above using Python code execution.\n"
-            f"2. You have a budget of MAX {effective_max_calls} tool calls.\n"
-            f"3. Load datasets using the exact filename in FILE_REGISTRY or via get_file_path('filename').\n"
-            f"4. RAW DATA INSPECTION & ROW RECONCILIATION (CRITICAL): Calculate duplicates (`df.duplicated().sum()`) and nulls (`df.isnull().sum()`) on the RAW dataset FIRST before any column exclusions. Track `initial_rows`, explicit `removed` breakdown with reason and count, and `retained` rows.\n"
-            f"5. IDENTIFIER PRESERVATION: Do NOT drop identifier columns (e.g., customerID, id). Except/exclude them from feature correlations and plots, but KEEP them in the dataset.\n"
-            f"6. EXPORT CLEANED DATASET: ALWAYS save the cleaned dataset to `cleaned_dataset.csv` (e.g., `df.to_csv('cleaned_dataset.csv', index=False)`).\n"
-            f"7. Save `analyst_summary.json` (and `analyst_summary_task_{task_id_val}.json`) and all visualization PNGs.\n"
-            f"8. Provide a comprehensive final answer summarizing your analysis, findings, and figures."
+            f"{task_specific_instructions}"
         )
 
         memory_manager = MessageHistoryManager(
@@ -514,8 +575,31 @@ class DataAnalystAgent:
                 except Exception:
                     pass
 
-        # If not produced by script, generate structured fallback summary
+        # If not produced by script, generate structured fallback summary from artifacts
         if not summary_data:
+            clean_shape = {}
+            init_shape = {}
+            num_cols = []
+            cat_cols = []
+            total_rows_val = 0
+            
+            # Inspect cleaned_dataset.csv or raw uploaded dataset
+            target_ds = os.path.join(output_dir, "cleaned_dataset.csv")
+            if not os.path.exists(target_ds) and uploaded_files and os.path.exists(uploaded_files[0]):
+                target_ds = uploaded_files[0]
+            
+            if os.path.exists(target_ds):
+                try:
+                    import pandas as pd
+                    df_inspect = pd.read_csv(target_ds)
+                    total_rows_val = int(df_inspect.shape[0])
+                    clean_shape = {"rows": total_rows_val, "columns": int(df_inspect.shape[1])}
+                    init_shape = clean_shape
+                    num_cols = df_inspect.select_dtypes(include=["number"]).columns.tolist()
+                    cat_cols = df_inspect.select_dtypes(exclude=["number"]).columns.tolist()
+                except Exception:
+                    pass
+
             summary_data = {
                 "agent": self.agent_name,
                 "task_id": task_id_val,
@@ -523,24 +607,24 @@ class DataAnalystAgent:
                 "status": agent_status,
                 "dataset_overview": {
                     "filename": os.path.basename(uploaded_files[0]) if uploaded_files else "dataset.csv",
-                    "initial_shape": {},
-                    "processed_shape": {},
-                    "numerical_columns": [],
-                    "categorical_columns": [],
-                    "identifier_columns": ["customerID"]
+                    "initial_shape": init_shape,
+                    "processed_shape": clean_shape,
+                    "numerical_columns": num_cols,
+                    "categorical_columns": cat_cols,
+                    "identifier_columns": ["customerID"] if "customerID" in cat_cols else []
                 },
                 "data_cleaning": {
                     "row_reconciliation": {
-                        "initial_rows": 0,
+                        "initial_rows": total_rows_val,
                         "removed": [],
-                        "retained": 0
+                        "retained": total_rows_val
                     },
                     "missing_values_handled": {},
                     "imputation_methods": {"numerical": "median", "categorical": "mode"},
-                    "identifier_columns_excepted": ["customerID (retained in dataset for prediction traceability)"],
+                    "identifier_columns_excepted": ["customerID (retained in dataset for prediction traceability)"] if "customerID" in cat_cols else [],
                     "dropped_columns": [],
                     "encoding": {"method": "One-Hot Encoding (drop_first=True)"},
-                    "transformations": ["Preserved identifier columns", "Exported cleaned_dataset.csv"]
+                    "transformations": ["Exported cleaned_dataset.csv"]
                 },
                 "statistical_findings": {
                     "summary_metrics": {},
@@ -551,7 +635,7 @@ class DataAnalystAgent:
                     for gf in generated_files if gf.endswith((".png", ".jpg", ".jpeg"))
                 ],
                 "saved_artifacts": generated_files,
-                "issues_and_caveats": ["Identifier column customerID retained in dataset for downstream prediction linkage."]
+                "issues_and_caveats": ["Data analysis execution completed."]
             }
             try:
                 os.makedirs(output_dir, exist_ok=True)

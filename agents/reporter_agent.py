@@ -14,6 +14,7 @@ import re
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
+from agents.logger import setup_logfire, HAS_LOGFIRE
 
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
@@ -25,17 +26,16 @@ if sys.stdout.encoding != 'utf-8':
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager
-from agents.logger import setup_logfire, HAS_LOGFIRE
-from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages
-from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
+from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC, build_verified_metrics
 from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT
+from agents.memory_manager import MessageHistoryManager, sanitize_messages, convert_to_plain_chat
+from agents.planner_agent import ExecutionPlan
 from agents.cancellation import CancellationToken, WorkflowCancelledException
-
+from agents.numeric_verifier import verify_report_numbers, attach_verification_warning
 
 try:
     import logfire
+    HAS_LOGFIRE = True
 except ImportError:
     logfire = None
 
@@ -97,10 +97,10 @@ class ReporterAgent:
         self,
         model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
-        max_tool_calls: int = 7,
+        max_tool_calls: int = 10,
         keep_last_tool_pairs: int = 2,
-        stdout_stderr_token_limit: int = 300,
-        max_tokens_before_compact: int = 3000,
+        stdout_stderr_token_limit: int = 1000,
+        max_tokens_before_compact: int = 4000,
     ):
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
@@ -175,11 +175,44 @@ class ReporterAgent:
             kwargs["tools"] = effective_tools
 
         def _do_call():
-            try:
-                response = self.client.chat.completions.create(**kwargs)
-                message = response.choices[0].message
-                return message
-            except Exception as err:
+            delays = [10, 20, 30]
+            for attempt, delay in enumerate(delays + [0]):
+                try:
+                    response = self.client.chat.completions.create(**kwargs)
+                    message = response.choices[0].message
+                    return message
+                except Exception as err:
+                    err_str = str(err).lower()
+                    # If provider fails on tool calling schema (e.g. Google Role 'function' error or tool format rejection)
+                    if "role 'function'" in err_str or "not supported" in err_str or "invalid_argument" in err_str or "400" in err_str:
+                        if HAS_LOGFIRE:
+                            logfire.warn("Portkey/Provider rejected tool schema in ReporterAgent. Falling back to plain chat format.", error=str(err))
+                        else:
+                            print(f"[ReporterAgent] Provider tool schema rejected ({err}). Falling back to robust plain chat format...")
+                        
+                        plain_msgs = convert_to_plain_chat(messages)
+                        fallback_kwargs = {
+                            "model": self.model_name,
+                            "messages": plain_msgs,
+                            "temperature": 0.2,
+                        }
+                        try:
+                            fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            return fallback_resp.choices[0].message
+                        except Exception as fallback_err:
+                            if HAS_LOGFIRE:
+                                logfire.error("ReporterAgent fallback LLM request failed", error=str(fallback_err))
+                            raise RuntimeError(f"ReporterAgent LLM call failed after fallback: {fallback_err}") from fallback_err
+
+                    if attempt < len(delays):
+                        import time
+                        if HAS_LOGFIRE:
+                            logfire.warn(f"LLM request failed (attempt {attempt + 1}), retrying in {delay}s...", error=str(err))
+                        else:
+                            print(f"[Agent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+                        time.sleep(delay)
+                        continue
+
                 if HAS_LOGFIRE:
                     logfire.error("ReporterAgent LLM request failed", error=str(err))
                 raise RuntimeError(f"ReporterAgent LLM call failed: {err}") from err
@@ -202,10 +235,11 @@ class ReporterAgent:
         max_tool_calls: Optional[int] = None,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
+        verified_metrics: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Synthesizes structured task summaries and sandbox artifacts into the final executive markdown report.
-        Allows up to max_tool_calls (default 7) executions in the stateful sandbox to verify metrics and check contradictions.
+        Grounds every numeric claim in VERIFIED_METRICS and performs a deterministic post-generation verification loop.
         
         Args:
             user_goal: The user's original request/goal.
@@ -215,9 +249,10 @@ class ReporterAgent:
             task_results: Optional fallback list of completed task result items.
             file_contents: Optional file contents (legacy/fallback).
             plan: Optional original execution plan.
-            max_tool_calls: Override for maximum tool calls (default: 7).
+            max_tool_calls: Override for maximum tool calls (default: 10).
             step_callback: Optional execution callback.
             cancellation_token: Optional token to halt execution.
+            verified_metrics: Optional pre-computed ground-truth verified metrics block.
             
         Returns:
             Executive analysis markdown report.
@@ -240,6 +275,18 @@ class ReporterAgent:
             "max_tool_calls": effective_max_calls
         })
 
+        # Ensure ground-truth verified metrics exist
+        raw_output_dir = getattr(self.tool_manager, "output_dir", "outputs")
+        workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        output_dir = raw_output_dir if (raw_output_dir and os.path.isabs(raw_output_dir)) else os.path.join(workspace_root, raw_output_dir or "outputs")
+
+        if not verified_metrics:
+            try:
+                verified_metrics = build_verified_metrics(output_dir)
+            except Exception as vm_err:
+                print(f"[ReporterAgent Warning] build_verified_metrics notice: {vm_err}")
+                verified_metrics = {}
+
         plan_info = ""
         if plan:
             if isinstance(plan, ExecutionPlan):
@@ -254,22 +301,27 @@ class ReporterAgent:
         if plan_info:
             user_content_parts.append(f"=== PLAN CONTEXT ===\n{plan_info}\n")
 
-        # 1. Data Analyst Summaries
+        # 1. Authoritative Ground Truth Verified Metrics
+        if verified_metrics:
+            verified_str = json.dumps(verified_metrics, indent=2, default=str)
+            user_content_parts.append(f"=== VERIFIED_METRICS (GROUND TRUTH — COMPUTED DIRECTLY FROM ARTIFACTS) ===\n{verified_str}\n")
+
+        # 2. Data Analyst Summaries (Context Only)
         if analyst_summaries:
             analyst_str = json.dumps(analyst_summaries, indent=2, default=str)
-            user_content_parts.append(f"=== DATA ANALYST SUMMARY / FINDINGS (`analyst_summary.json`) ===\n{analyst_str}\n")
+            user_content_parts.append(f"=== DATA ANALYST SUMMARY / FINDINGS (`analyst_summary.json` - CONTEXT ONLY) ===\n{analyst_str}\n")
 
-        # 2. Machine Learning Summaries
+        # 3. Machine Learning Summaries (Context Only)
         if ml_summaries:
             ml_str = json.dumps(ml_summaries, indent=2, default=str)
-            user_content_parts.append(f"=== MACHINE LEARNING SUMMARY / MODEL EVALUATION (`ml_summary.json`) ===\n{ml_str}\n")
+            user_content_parts.append(f"=== MACHINE LEARNING SUMMARY / MODEL EVALUATION (`ml_summary.json` - CONTEXT ONLY) ===\n{ml_str}\n")
 
-        # 3. Fallback: If neither analyst_summaries nor ml_summaries was provided, use task_results or file_contents
+        # 4. Fallback: If neither analyst_summaries nor ml_summaries was provided, use task_results or file_contents
         if not analyst_summaries and not ml_summaries:
             if file_contents:
                 file_blocks = []
                 for fname, fcontent in file_contents.items():
-                    file_blocks.append(f"--- FILE: {fname} ---\n{fcontent[:2000]}\n")
+                    file_blocks.append(f"--- FILE: {fname} ---\n{fcontent[:4000]}\n")
                 user_content_parts.append("=== GROUND-TRUTH METRIC FILES ===\n" + "\n".join(file_blocks))
             elif task_results:
                 clean_results = []
@@ -283,17 +335,17 @@ class ReporterAgent:
                     })
                 user_content_parts.append(f"=== COMPLETED TASK SUMMARIES ===\n{json.dumps(clean_results, indent=2)}\n")
 
-        # 4. Artifacts List
+        # 5. Artifacts List
         artifacts_str = json.dumps(artifacts or [], indent=2, default=str)
         user_content_parts.append(f"=== GENERATED ARTIFACTS LIST IN STATEFUL ENVIRONMENT ===\n{artifacts_str}\n")
 
         user_content_parts.append(
             "Instructions:\n"
             "1. You have access to `execute_python` in the shared stateful Modal Cloud Sandbox containing ALL generated artifacts.\n"
-            f"2. You have a budget of MAX {effective_max_calls} tool calls.\n"
-            "3. BATCH VERIFICATION DISCIPLINE: If you need to inspect files, check numbers, or verify consistency across artifacts (e.g. `cleaned_dataset.csv`, `model_comparison.csv`, `feature_importance.csv`, `analyst_summary.json`, `ml_summary.json`, `predictions.csv`), write ONE comprehensive script that verifies all necessary items at once to preserve your turn budget.\n"
-            "4. STRICT GROUNDING: Directly quote exact metrics, baseline numbers, confusion matrix counts, sample counts, row reconciliation figures, and feature importance rankings from the verified summaries and artifacts. Do NOT recalculate, assume, or alter any numbers.\n"
-            "5. Once verification is complete (or if no verification is needed), generate the final executive markdown report following the structured format."
+            f"2. You have a budget of up to {effective_max_calls} tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently.\n"
+            "3. STRICT GROUNDING: Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim. Do not compute, round, or estimate any number yourself. If a number the report needs isn't present in `VERIFIED_METRICS`, write \"not verified in current run\" instead of guessing.\n"
+            "4. On contradiction: `VERIFIED_METRICS` is authoritative. Note any upstream discrepancies in Operational Caveats.\n"
+            "5. Generate the complete executive markdown report following the required structure."
         )
 
         user_content = "\n\n".join(user_content_parts)
@@ -346,7 +398,7 @@ class ReporterAgent:
 
             memory_manager.append_assistant(msg_dict)
 
-            # If model produced report without tool calls, we're done
+            # If model produced report without tool calls, we're done with tool execution
             if not tool_calls:
                 final_report = thought
                 break
@@ -414,11 +466,76 @@ class ReporterAgent:
             memory_manager.messages.append({
                 "role": "user",
                 "content": f"[SYSTEM WARNING] You have reached the maximum limit of {effective_max_calls} tool calls. "
-                           f"Do NOT make any more tool calls. Synthesize and output the final executive markdown report now based on all verified findings."
+                           f"Do NOT make any more tool calls. Synthesize and output the final executive markdown report now based on VERIFIED_METRICS and all verified findings."
             })
             assistant_msg = self._call_llm(memory_manager.messages, tools=[])
             final_report = assistant_msg.content or ""
             memory_manager.append_assistant({"role": "assistant", "content": final_report})
+
+        # ==============================================================================
+        # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
+        # ==============================================================================
+        if final_report and verified_metrics:
+            _safe_callback("verification_loop_started", {
+                "agent": self.agent_name,
+                "report_length": len(final_report)
+            })
+
+            max_correction_turns = 2
+            correction_turn = 0
+            verification_res = verify_report_numbers(final_report, verified_metrics)
+
+            while not verification_res.is_valid and correction_turn < max_correction_turns:
+                correction_turn += 1
+                if cancellation_token:
+                    cancellation_token.check_cancelled(step_name=f"{self.agent_name} verification correction turn {correction_turn}")
+
+                _safe_callback("verification_correction_turn", {
+                    "agent": self.agent_name,
+                    "correction_turn": correction_turn,
+                    "unverified_count": verification_res.unverified_count,
+                    "unverified_claims": [c.raw_str for c in verification_res.unverified_claims[:10]]
+                })
+
+                if HAS_LOGFIRE:
+                    logfire.warn(
+                        f"ReporterAgent Post-Verification Discrepancies (Turn {correction_turn})",
+                        unverified_count=verification_res.unverified_count,
+                        unverified_samples=[c.raw_str for c in verification_res.unverified_claims[:5]]
+                    )
+
+                # Send targeted deterministic correction prompt to LLM
+                memory_manager.messages.append({
+                    "role": "user",
+                    "content": verification_res.correction_prompt
+                })
+
+                assistant_msg = self._call_llm(memory_manager.messages, tools=[])
+                corrected_report = assistant_msg.content or ""
+                if corrected_report:
+                    final_report = corrected_report
+                    memory_manager.append_assistant({"role": "assistant", "content": final_report})
+
+                # Re-verify the revised report
+                verification_res = verify_report_numbers(final_report, verified_metrics)
+
+            # If still unverified after max correction turns, attach fallback warning banner
+            if not verification_res.is_valid:
+                if HAS_LOGFIRE:
+                    logfire.warn(
+                        "ReporterAgent Verification Max Turns Exceeded, attaching warning banner",
+                        remaining_unverified=verification_res.unverified_count
+                    )
+                final_report = attach_verification_warning(final_report, verification_res.unverified_claims)
+
+            _safe_callback("verification_completed", {
+                "agent": self.agent_name,
+                "is_valid": verification_res.is_valid,
+                "total_claims": verification_res.total_claims_count,
+                "verified_count": verification_res.verified_count,
+                "unverified_count": verification_res.unverified_count,
+                "correction_turns_used": correction_turn
+            })
 
         if HAS_LOGFIRE:
             logfire.info(
@@ -449,6 +566,7 @@ class ReporterAgent:
         max_tool_calls: Optional[int] = None,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
+        verified_metrics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Unified entry point to run the reporting task.
@@ -464,6 +582,7 @@ class ReporterAgent:
             max_tool_calls=max_tool_calls,
             step_callback=step_callback,
             cancellation_token=cancellation_token,
+            verified_metrics=verified_metrics,
         )
 
         return {
