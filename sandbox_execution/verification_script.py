@@ -2,7 +2,9 @@
 Verification Script Module for AnalystGPT Sandbox Execution.
 
 Builds ground-truth verified metrics directly from physical artifacts on disk or in the Modal Cloud Sandbox
-(e.g., cleaned_dataset.csv, model_comparison.csv, feature_importance.csv, confusion_matrix.json, baseline_score.json, predictions.csv).
+(e.g., cleaned_dataset.csv, model_comparison.csv, feature_importance.csv, confusion_matrix.json, baseline_score.json, predictions.csv,
+tuned_model_comparison.csv, best_params.json, hyperparameter_tuning_summary.json, model_registry.json, champion_model.json,
+and versioned model artifacts like logistic_regression_p0.pkl, random_forest_p0.pkl, xgboost_p0.pkl, logistic_regression_p1_tuned.pkl).
 
 Can be executed as a standalone script inside the sandbox or imported as a Python module.
 """
@@ -65,6 +67,21 @@ def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
                     "size_bytes": item.stat().st_size,
                     "extension": item.suffix.lower()
                 })
+
+    # 1b. Versioned Model Artifacts (e.g., logistic_regression_p0.pkl, random_forest_p1_tuned.pkl)
+    versioned_model_artifacts = []
+    for item in sorted(run_path.glob("*_p*.pkl")):
+        if item.is_file():
+            # Parse version info from filename
+            # Patterns: logistic_regression_p0.pkl, random_forest_p1_tuned.pkl, xgboost_p2_tuned.pkl
+            versioned_model_artifacts.append({
+                "filename": item.name,
+                "size_bytes": item.stat().st_size,
+                "model_family": item.name.split("_p")[0] if "_p" in item.name else "unknown",
+                "version": item.name.split("_p")[-1].replace(".pkl", "") if "_p" in item.name else "unknown"
+            })
+    if versioned_model_artifacts:
+        verified["versioned_model_artifacts"] = versioned_model_artifacts
 
     # 2. Dataset Verification (cleaned_dataset.csv or fallback dataset CSVs)
     dataset_candidates = [
@@ -191,14 +208,14 @@ def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
         except Exception as e:
             verified["dataset"] = {"error": f"Failed to parse dataset {target_csv.name}: {str(e)}"}
 
-    # 4. Model Comparison (model_comparison.csv)
+    # 4. Model Comparison (model_comparison.csv & tuned_model_comparison.csv)
     mc_path = run_path / "model_comparison.csv"
     if mc_path.exists() and mc_path.is_file():
         try:
             mc = pd.read_csv(mc_path)
             # Standardize numeric columns
             for col in mc.columns:
-                if col.lower() not in ["model", "algorithm", "name", "notes"]:
+                if col.lower() not in ["model", "algorithm", "name", "notes", "model_artifact", "artifact", "configuration"]:
                     mc[col] = pd.to_numeric(mc[col], errors="coerce")
 
             # Round numeric columns to 4 decimals
@@ -221,10 +238,10 @@ def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
                 verified["model_metrics"] = metrics_map
 
                 # Determine best model
-                # Priority metrics: F1, F1-Score, ROC-AUC, ROC_AUC, AUC, Accuracy, R2, RMSE
+                # Priority metrics: ROC-AUC, ROC_AUC, roc_auc, PR-AUC, F1, F1-Score, f1_score, f1, AUC, Accuracy, accuracy, R2, RMSE
                 target_metric = None
                 sort_ascending = False
-                for m_candidate in ["F1", "F1-Score", "f1_score", "f1", "ROC-AUC", "ROC_AUC", "roc_auc", "AUC", "Accuracy", "accuracy", "R2", "r2_score"]:
+                for m_candidate in ["ROC-AUC", "ROC_AUC", "roc_auc", "PR-AUC", "pr_auc", "F1", "F1-Score", "f1_score", "f1", "AUC", "Accuracy", "accuracy", "R2", "r2_score"]:
                     found_col = next((c for c in mc.columns if c.strip().lower() == m_candidate.lower()), None)
                     if found_col:
                         target_metric = found_col
@@ -249,6 +266,67 @@ def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
                         }
         except Exception as e:
             verified["models_error"] = f"Failed to parse model_comparison.csv: {str(e)}"
+
+    # 4b. Tuned Model Comparison (tuned_model_comparison.csv)
+    tuned_mc_path = run_path / "tuned_model_comparison.csv"
+    if tuned_mc_path.exists() and tuned_mc_path.is_file():
+        try:
+            tmc = pd.read_csv(tuned_mc_path)
+            for col in tmc.columns:
+                if col.lower() not in ["model", "algorithm", "name", "notes", "model_artifact", "artifact", "configuration"]:
+                    tmc[col] = pd.to_numeric(tmc[col], errors="coerce")
+            numeric_cols = tmc.select_dtypes(include=[np.number]).columns
+            tmc[numeric_cols] = tmc[numeric_cols].round(4)
+            verified["tuned_models"] = tmc.to_dict(orient="records")
+
+            model_col = "model" if "model" in tmc.columns else (tmc.columns[0] if len(tmc.columns) > 0 else None)
+            if model_col:
+                tuned_metrics_map = {}
+                for _, row in tmc.iterrows():
+                    m_name = str(row[model_col])
+                    m_dict = {}
+                    for col in tmc.columns:
+                        if col != model_col:
+                            val = row[col]
+                            m_dict[col] = round(float(val), 4) if isinstance(val, (int, float, np.number)) and not np.isnan(val) else val
+                    tuned_metrics_map[m_name] = m_dict
+                verified["tuned_model_metrics"] = tuned_metrics_map
+        except Exception as e:
+            verified["tuned_models_error"] = f"Failed to parse tuned_model_comparison.csv: {str(e)}"
+
+    # 4c. Hyperparameter Tuning Summary & Best Params
+    hpt_summary_path = run_path / "hyperparameter_tuning_summary.json"
+    if hpt_summary_path.exists() and hpt_summary_path.is_file():
+        try:
+            with open(hpt_summary_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["hyperparameter_tuning_summary"] = json.load(f)
+        except Exception as e:
+            verified["hyperparameter_tuning_summary_error"] = f"Failed to parse hyperparameter_tuning_summary.json: {str(e)}"
+
+    best_params_path = run_path / "best_params.json"
+    if best_params_path.exists() and best_params_path.is_file():
+        try:
+            with open(best_params_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["best_params"] = json.load(f)
+        except Exception as e:
+            verified["best_params_error"] = f"Failed to parse best_params.json: {str(e)}"
+
+    # 4d. Model Registry & Champion Pointer
+    reg_path = run_path / "model_registry.json"
+    if reg_path.exists() and reg_path.is_file():
+        try:
+            with open(reg_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["model_registry"] = json.load(f)
+        except Exception as e:
+            verified["model_registry_error"] = f"Failed to parse model_registry.json: {str(e)}"
+
+    champ_path = run_path / "champion_model.json"
+    if champ_path.exists() and champ_path.is_file():
+        try:
+            with open(champ_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["champion_model"] = json.load(f)
+        except Exception as e:
+            verified["champion_model_error"] = f"Failed to parse champion_model.json: {str(e)}"
 
     # 5. Feature Importance (feature_importance.csv)
     fi_path = run_path / "feature_importance.csv"

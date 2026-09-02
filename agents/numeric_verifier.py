@@ -5,6 +5,16 @@ Extracts numeric claims from draft markdown reports via regex and cross-referenc
 against authoritative ground-truth metrics (VERIFIED_METRICS).
 
 Operates deterministically via pure Python code (NO LLM calls).
+
+VERIFIED_METRICS now includes:
+- Dataset metrics (rows, cols, missing values, numeric/categorical stats)
+- Data quality findings (bound violations, distribution anomalies, near duplicates)
+- Model comparison metrics (Accuracy, Precision, Recall, F1, ROC-AUC, PR-AUC, CV_Mean, CV_Std)
+- Tuned model comparison metrics
+- Hyperparameter tuning summary and best params
+- Model registry entries and champion model pointer
+- Versioned model artifacts (logistic_regression_p0.pkl, random_forest_p1_tuned.pkl, etc.)
+- Feature importance, confusion matrix, baseline score, predictions summary
 """
 
 import re
@@ -96,11 +106,11 @@ def extract_numeric_claims(markdown_text: str) -> List[NumericClaim]:
         # 2. Top N phrases: "top 5", "top 10"
         working_line = RE_TOP_N.sub(" [TOP_N] ", working_line)
         # 3. File names: "analyst_summary_task_1.json", "chart1.png"
-        working_line = RE_FILE_EXT_DIGIT.sub(" [FILE] ", working_line)
+        working_line = re.sub(r"\b[\w\-]+_task_\d+\b|\b[A-Za-z0-9_\-]+\.[A-Za-z]{2,5}\b", " [FILE] ", working_line)
 
         # Regex to capture numeric tokens: percentages, floats, comma-ints, standalone ints
-        # Examples: 85.4%, 0.8543, 102,058, 7043, 12.5, -0.45
-        pattern = r"(?<![\w\.\-])([+\-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?)(?![\w\.\-])"
+        # Matches patterns like 0.851, 1,397.47, 26.54%, 7043, 199, -0.45, etc.
+        pattern = r"(?<![A-Za-z0-9_])([+\-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?)(?![A-Za-z0-9_])"
 
         for match in re.finditer(pattern, working_line):
             token = match.group(1).strip()
