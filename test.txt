@@ -1,0 +1,13 @@
+I have uploaded a telecom customer churn dataset and I want to build a useful churn prediction solution from it.
+
+First, understand the dataset and figure out what customer characteristics and service-related factors are most associated with customers leaving the company. Look at things like customer demographics, contract type, tenure, internet and payment methods, monthly charges, total charges, and the other available variables.
+
+Before building any models, check the data carefully for missing or invalid values, duplicates, incorrect data types, unusual values, and class imbalance. I want the analysis to be based only on the uploaded dataset, so please do not create or assume a replacement dataset if there is any problem reading or processing the file.
+
+Then perform appropriate preprocessing and feature engineering. Build a few different classification models that would be reasonable for predicting churn and compare their performance. Since identifying customers who are actually going to churn is important, don't rely only on accuracy—include suitable metrics such as precision, recall, F1-score, ROC-AUC, and a confusion matrix.
+
+After comparing the models, select the strongest candidate and perform hyperparameter tuning to see whether its performance can be improved. Make sure the evaluation is done properly using a holdout/test set and avoid any data leakage during preprocessing, feature engineering, or tuning.
+
+Finally, give me a practical final report explaining the major churn patterns you found, the most important predictors, how the models performed, which model you recommend, and what the business could potentially do with the predictions to reduce customer churn.
+
+Please keep all conclusions tied to the actual uploaded data and results produced by the analysis. Do not invent values, observations, model results, or datasets.

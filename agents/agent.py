@@ -166,7 +166,12 @@ class DataAnalystAgent:
         Calls Portkey Gateway which handles multi-provider fallbacks, 
         parameter overrides, and provider routing seamlessly.
         """
-        sanitized_messages = sanitize_messages(messages)
+        if getattr(self, "_plain_chat_mode", False):
+            # Provider (e.g. Gemini) already rejected the OpenAI tool-message schema;
+            # send plain user/assistant history while still exposing tools.
+            sanitized_messages = convert_to_plain_chat(messages)
+        else:
+            sanitized_messages = sanitize_messages(messages)
         kwargs = {
             "model": "nvidia/nemotron-3-ultra-550b-a55b",
             "messages": sanitized_messages,
@@ -204,20 +209,33 @@ class DataAnalystAgent:
                     return message
                 except Exception as err:
                     err_str = str(err).lower()
-                    # If provider fails on tool calling schema (e.g. Google Role 'function' error or tool format rejection)
-                    if "role 'function'" in err_str or "not supported" in err_str or "invalid_argument" in err_str or "400" in err_str:
+                    # Provider rejected the OpenAI tool-calling message schema (e.g. Gemini:
+                    # "Role 'function' is not supported") - retry with plain user/assistant
+                    # history. Tools are preserved so the agent loop keeps working.
+                    is_schema_rejection = (
+                        "role 'function'" in err_str
+                        or 'role "function"' in err_str
+                        or "role 'tool'" in err_str
+                        or 'role "tool"' in err_str
+                        or ("role" in err_str and "not supported" in err_str)
+                        or ("tool" in err_str and "invalid" in err_str)
+                    )
+                    if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool schema in agent.py. Falling back to plain chat format.", error=str(err))
+                            logfire.warn("Portkey/Provider rejected tool message schema in agent.py. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
-                            print(f"[Agent] Provider tool schema rejected ({err}). Falling back to robust plain chat format...")
-                        
+                            print(f"[Agent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
+
                         plain_msgs = convert_to_plain_chat(messages)
                         fallback_kwargs = {
                             "model": kwargs.get("model", "nvidia/nemotron-3-ultra-550b-a55b"),
                             "messages": plain_msgs,
                         }
+                        if effective_tools:
+                            fallback_kwargs["tools"] = effective_tools
                         try:
                             fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            self._plain_chat_mode = True
                             return fallback_resp.choices[0].message
                         except Exception as fallback_err:
                             if HAS_LOGFIRE:

@@ -37,6 +37,12 @@ from agents.data_analyst_agent import DataAnalystAgent
 from agents.ml_agent import MLAgent
 from agents.reporter_agent import ReporterAgent
 from agents.cancellation import CancellationToken, WorkflowCancelledException
+from agents.artifact_validator import (
+    validate_artifacts,
+    validate_and_get_warning,
+    build_hallucination_warning_prompt,
+    ValidationResult
+)
 
 
 try:
@@ -65,22 +71,25 @@ class WorkflowOrchestrator:
         # Shared ToolManager across all sandbox-interacting agents
         self.tool_manager = tool_manager or ToolManager()
 
-        # Initialize specialized agents
+        # Initialize specialized agents with increased tool call budget (10 instead of 7)
         self.planner_agent = PlannerAgent(
             available_agents=["DataAnalystAgent", "MLAgent", "ReporterAgent"],
             model_name=planner_model
         )
         self.data_analyst_agent = DataAnalystAgent(
             model_name=analyst_model,
-            tool_manager=self.tool_manager
+            tool_manager=self.tool_manager,
+            max_tool_calls=10
         )
         self.ml_agent = MLAgent(
             model_name=ml_model,
-            tool_manager=self.tool_manager
+            tool_manager=self.tool_manager,
+            max_tool_calls=10
         )
         self.reporter_agent = ReporterAgent(
             model_name=reporter_model,
-            tool_manager=self.tool_manager
+            tool_manager=self.tool_manager,
+            max_tool_calls=10
         )
 
         self.current_plan: Optional[ExecutionPlan] = None
@@ -89,6 +98,10 @@ class WorkflowOrchestrator:
         self.final_report: str = ""
         self.current_output_dir: str = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token: Optional[CancellationToken] = None
+
+        # Artifact validation settings
+        self.max_validation_retries: int = 2  # Max times to re-prompt agent for missing artifacts
+        self.extra_tool_calls_on_retry: int = 3  # Extra tool calls when retrying after validation failure
 
     def reset(self, keep_sandbox: bool = False):
         """Resets orchestrator state, memory, and optionally global sandbox."""
@@ -304,7 +317,7 @@ class WorkflowOrchestrator:
         plan: Optional[ExecutionPlan] = None,
         user_query: Optional[str] = None,
         files: Optional[List[str]] = None,
-        max_tool_calls_per_agent: int = 7,
+        max_tool_calls_per_agent: int = 10,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> Dict[str, Any]:
@@ -388,233 +401,383 @@ class WorkflowOrchestrator:
 
                     def _execute_task():
                         nonlocal has_reporter_task
-                        if isinstance(agent_instance, ReporterAgent):
-                            has_reporter_task = True
-                            summaries = self._collect_agent_summaries(self.current_output_dir)
-                            try:
-                                verified_metrics = build_verified_metrics(self.current_output_dir)
-                                if "verified_metrics.json" not in self.generated_artifacts:
-                                    self.generated_artifacts.append("verified_metrics.json")
-                            except Exception as vm_err:
-                                print(f"[Orchestrator Notice] build_verified_metrics error: {vm_err}")
-                                verified_metrics = {}
+                        nonlocal agent_class_name
 
-                            reporter_res = agent_instance.run_task(
-                                prompt=query_text,
-                                analyst_summaries=summaries.get("analyst_summaries", []),
-                                ml_summaries=summaries.get("ml_summaries", []),
-                                artifacts=self.generated_artifacts,
-                                plan=active_plan,
-                                step_callback=step_callback,
-                                cancellation_token=self.cancellation_token,
-                                verified_metrics=verified_metrics,
-                            )
-                            self.final_report = reporter_res.get("final_report", "")
-                            task.status = "completed"
-                            task.result = self.final_report
-                            self.completed_task_results.append({
-                                "task_id": task.task_id,
-                                "title": task.title,
-                                "agent": agent_class_name,
-                                "status": "completed",
-                                "summary": "Executive report generated.",
-                                "report_snippet": self.final_report[:500]
-                            })
-                            if HAS_LOGFIRE:
-                                logfire.info(
-                                    f"Task #{task.task_id} Completed ({agent_class_name})",
-                                    task_id=task.task_id,
-                                    agent=agent_class_name,
-                                    status="completed",
-                                    report_length=len(self.final_report)
+                        # ================================================================
+                        # TASK EXECUTION WITH ARTIFACT VALIDATION & RETRY LOGIC
+                        # ================================================================
+                        # We use a while loop with a hard-coded max retry count (2) to prevent
+                        # infinite loops. On validation failure, task status is set back to
+                        # "pending" and re-executed with hallucination warning + extra tool budget.
+                        # After max retries, we mark validation_failed and continue workflow.
+                        #
+                        # Validation errors from the immediately previous attempt are stored in
+                        # last_validation_errors and passed to the next retry. This ensures the
+                        # agent receives specific feedback about what failed, rather than relying
+                        # on completed_task_results which is only updated after all retries.
+
+                        max_retries = self.max_validation_retries  # 2
+                        attempt = 0
+                        validation_passed = False
+                        task_validation_failed = False  # True if task exhausted retries without passing
+                        last_validation_errors = []  # Errors from the immediately previous attempt
+
+                        while attempt <= max_retries and not validation_passed and not task_validation_failed:
+                            if attempt > 0:
+                                # Re-prompt: set status back to pending and add hallucination warning
+                                task.status = "pending"
+                                print(f"[Orchestrator] Retry attempt {attempt}/{max_retries} for Task #{task.task_id} ({agent_class_name})")
+
+                                if HAS_LOGFIRE:
+                                    logfire.info(
+                                        "Retrying task after artifact validation failure",
+                                        task_id=task.task_id,
+                                        agent=agent_class_name,
+                                        attempt=attempt,
+                                        max_retries=max_retries
+                                    )
+
+                            # Determine tool call budget for this attempt
+                            current_tool_budget = max_tool_calls_per_agent
+                            if attempt > 0:
+                                current_tool_budget += self.extra_tool_calls_on_retry  # +3 extra calls on retry
+
+                            # Use validation errors from the immediately previous attempt
+                            validation_errors = last_validation_errors
+
+                            # Execute the task based on agent type
+                            agent_res = None
+                            task_out = ""
+
+                            if isinstance(agent_instance, ReporterAgent):
+                                has_reporter_task = True
+                                summaries = self._collect_agent_summaries(self.current_output_dir)
+                                try:
+                                    verified_metrics = build_verified_metrics(self.current_output_dir)
+                                    if "verified_metrics.json" not in self.generated_artifacts:
+                                        self.generated_artifacts.append("verified_metrics.json")
+                                except Exception as vm_err:
+                                    print(f"[Orchestrator Notice] build_verified_metrics error: {vm_err}")
+                                    verified_metrics = {}
+
+                                # Build prompt - add warning if this is a retry
+                                reporter_prompt = query_text
+                                if attempt > 0 and validation_errors:
+                                    reporter_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                        is_valid=False,
+                                        missing_artifacts=[],
+                                        existing_artifacts=[],
+                                        fallback_detected=False,
+                                        hallucination_warnings=validation_errors,
+                                        report_structure_valid=False,
+                                        report_structure_issues=[]
+                                    ), agent_class_name, '', task.description)}\n\nOriginal Query: {query_text}"
+
+                                agent_res = agent_instance.run_task(
+                                    prompt=reporter_prompt,
+                                    analyst_summaries=summaries.get("analyst_summaries", []),
+                                    ml_summaries=summaries.get("ml_summaries", []),
+                                    artifacts=self.generated_artifacts,
+                                    plan=active_plan,
+                                    step_callback=step_callback,
+                                    cancellation_token=self.cancellation_token,
+                                    verified_metrics=verified_metrics,
+                                    max_tool_calls=current_tool_budget,
+                                )
+                                self.final_report = agent_res.get("final_report", "")
+                                task_out = self.final_report
+
+                                # Write final_report.md IMMEDIATELY after ReporterAgent generates it,
+                                # BEFORE validation, so the validator can verify the file exists.
+                                if self.final_report:
+                                    report_filename = "final_report.md"
+                                    report_filepath = os.path.join(self.current_output_dir, report_filename)
+                                    try:
+                                        with open(report_filepath, "w", encoding="utf-8") as rf:
+                                            rf.write(self.final_report)
+                                        print(f"[Orchestrator] ReporterAgent task #{task.task_id}: wrote final_report.md for validation")
+                                    except Exception as write_err:
+                                        print(f"[Orchestrator Warning] Failed to save {report_filepath}: {write_err}")
+
+                            elif isinstance(agent_instance, MLAgent):
+                                # Resolve current dataset artifact
+                                current_dataset_file = None
+                                for cand in ["feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"]:
+                                    cand_path = os.path.join(self.current_output_dir, cand)
+                                    if cand in self.generated_artifacts or os.path.exists(cand_path):
+                                        current_dataset_file = cand
+                                        break
+
+                                ml_files = list(files_list)
+                                if current_dataset_file:
+                                    full_cand_path = os.path.join(self.current_output_dir, current_dataset_file)
+                                    if full_cand_path not in ml_files and current_dataset_file not in ml_files:
+                                        ml_files.insert(0, full_cand_path)
+
+                                # Check if this is a Hyperparameter Tuning task
+                                is_hpt_task = (
+                                    getattr(task, "task_type", None) == "hyperparameter_tuning"
+                                    or "hyperparameter" in task.title.lower()
+                                    or "tuning" in task.title.lower()
+                                    or "hpt" in task.title.lower()
                                 )
 
-                        elif isinstance(agent_instance, MLAgent):
-                            # Resolve current dataset artifact
-                            current_dataset_file = None
-                            for cand in ["feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"]:
-                                cand_path = os.path.join(self.current_output_dir, cand)
-                                if cand in self.generated_artifacts or os.path.exists(cand_path):
-                                    current_dataset_file = cand
-                                    break
+                                if is_hpt_task:
+                                    # Validate presence of model comparison artifacts
+                                    model_artifacts = ["model_comparison.csv", "best_model.pkl"]
+                                    missing_model_artifacts = [
+                                        art for art in model_artifacts
+                                        if art not in self.generated_artifacts and not os.path.exists(os.path.join(self.current_output_dir, art))
+                                    ]
 
-                            ml_files = list(files_list)
-                            if current_dataset_file:
-                                full_cand_path = os.path.join(self.current_output_dir, current_dataset_file)
-                                if full_cand_path not in ml_files and current_dataset_file not in ml_files:
-                                    ml_files.insert(0, full_cand_path)
+                                    if missing_model_artifacts:
+                                        warn_msg = f"[Orchestrator Warning] Skipping Task #{task.task_id} ({task.title}): Hyperparameter Tuning requires prior model comparison artifacts ({', '.join(model_artifacts)}), but {', '.join(missing_model_artifacts)} were not found."
+                                        if HAS_LOGFIRE:
+                                            logfire.warn(warn_msg, task_id=task.task_id, missing=missing_model_artifacts)
+                                        print(warn_msg, file=sys.stderr)
 
-                            # Check if this is a Hyperparameter Tuning task
-                            is_hpt_task = (
-                                getattr(task, "task_type", None) == "hyperparameter_tuning"
-                                or "hyperparameter" in task.title.lower()
-                                or "tuning" in task.title.lower()
-                                or "hpt" in task.title.lower()
+                                        task.status = "skipped"
+                                        task.result = f"Skipped: Required model comparison artifacts ({', '.join(missing_model_artifacts)}) not found."
+                                        self.completed_task_results.append({
+                                            "task_id": task.task_id,
+                                            "title": task.title,
+                                            "agent": agent_class_name,
+                                            "status": "skipped",
+                                            "output": task.result,
+                                            "warning": warn_msg
+                                        })
+                                        return
+
+                                    # Add comparison artifacts to ml_files
+                                    for art in ["model_comparison.csv", "best_model.pkl", "ml_summary.json"]:
+                                        art_path = os.path.join(self.current_output_dir, art)
+                                        if os.path.exists(art_path) and art_path not in ml_files and art not in ml_files:
+                                            ml_files.append(art_path)
+
+                                    data_context_note = f"\n[INPUT DATASET CONTEXT]: Load trained model from 'best_model.pkl' and baseline scores from 'model_comparison.csv'. Dataset is '{current_dataset_file or 'dataset.csv'}'."
+                                elif current_dataset_file:
+                                    data_context_note = f"\n[INPUT DATASET CONTEXT]: Processed dataset is available as '{current_dataset_file}'. Load and train on this dataset directly (e.g. pd.read_csv('{current_dataset_file}')). Do NOT re-calculate raw duplicate/missing values."
+                                else:
+                                    main_name = os.path.basename(files_list[0]) if files_list else "dataset.csv"
+                                    data_context_note = f"\n[INPUT DATASET CONTEXT]: Main dataset is available as '{main_name}'. Note: No pre-cleaned dataset artifact was produced; proceed directly with this main dataset."
+
+                                # Build prompt - add warning if this is a retry
+                                ml_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}{data_context_note}"
+                                if attempt > 0 and validation_errors:
+                                    ml_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                        is_valid=False,
+                                        missing_artifacts=[],
+                                        existing_artifacts=[],
+                                        fallback_detected=False,
+                                        hallucination_warnings=validation_errors,
+                                        report_structure_valid=True,
+                                        report_structure_issues=[]
+                                    ), agent_class_name, '', task.description)}\n\n{ml_prompt}"
+
+                                agent_res = agent_instance.run_task(
+                                    prompt=ml_prompt,
+                                    uploaded_files=ml_files,
+                                    plan=active_plan,
+                                    task_id=task.task_id,
+                                    max_tool_calls=current_tool_budget,
+                                    step_callback=step_callback,
+                                    cancellation_token=self.cancellation_token
+                                )
+
+                                task_out = agent_res.get("response") or agent_res.get("final_response") or ""
+
+                            elif isinstance(agent_instance, DataAnalystAgent):
+                                analyst_files = list(files_list)
+                                # Pass existing cleaned or feature engineered datasets if available
+                                for cand in ["feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"]:
+                                    cand_path = os.path.join(self.current_output_dir, cand)
+                                    if (cand in self.generated_artifacts or os.path.exists(cand_path)) and cand_path not in analyst_files and cand not in analyst_files:
+                                        analyst_files.insert(0, cand_path)
+
+                                # Build prompt - add warning if this is a retry
+                                analyst_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}"
+                                if attempt > 0 and validation_errors:
+                                    analyst_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                        is_valid=False,
+                                        missing_artifacts=[],
+                                        existing_artifacts=[],
+                                        fallback_detected=False,
+                                        hallucination_warnings=validation_errors,
+                                        report_structure_valid=True,
+                                        report_structure_issues=[]
+                                    ), agent_class_name, '', task.description)}\n\n{analyst_prompt}"
+
+                                agent_res = agent_instance.run_task(
+                                    prompt=analyst_prompt,
+                                    uploaded_files=analyst_files,
+                                    plan=active_plan,
+                                    task_id=task.task_id,
+                                    max_tool_calls=current_tool_budget,
+                                    step_callback=step_callback,
+                                    cancellation_token=self.cancellation_token
+                                )
+
+                                task_out = agent_res.get("response") or agent_res.get("final_response") or ""
+
+                            else:
+                                # Fallback agent
+                                fallback_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}"
+                                if attempt > 0 and validation_errors:
+                                    fallback_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                        is_valid=False,
+                                        missing_artifacts=[],
+                                        existing_artifacts=[],
+                                        fallback_detected=False,
+                                        hallucination_warnings=validation_errors,
+                                        report_structure_valid=True,
+                                        report_structure_issues=[]
+                                    ), 'DataAnalystAgent', '', task.description)}\n\n{fallback_prompt}"
+
+                                fallback_res = self.data_analyst_agent.run_task(
+                                    prompt=fallback_prompt,
+                                    uploaded_files=files_list,
+                                    plan=active_plan,
+                                    task_id=task.task_id,
+                                    max_tool_calls=current_tool_budget,
+                                    step_callback=step_callback,
+                                    cancellation_token=self.cancellation_token
+                                )
+                                agent_res = fallback_res
+                                agent_class_name = "DataAnalystAgent (Fallback)"
+                                task_out = fallback_res.get("response", "")
+
+                            # ================================================================
+                            # ARTIFACT VALIDATION - Check if claimed artifacts actually exist
+                            # ================================================================
+                            task_type = getattr(task, "task_type", None)
+                            validation_result = validate_artifacts(
+                                agent_response=agent_res,
+                                output_dir=self.current_output_dir,
+                                agent_name=agent_class_name,
+                                task_type=task_type
                             )
 
-                            if is_hpt_task:
-                                # Validate presence of model comparison artifacts
-                                model_artifacts = ["model_comparison.csv", "best_model.pkl"]
-                                missing_model_artifacts = [
-                                    art for art in model_artifacts
-                                    if art not in self.generated_artifacts and not os.path.exists(os.path.join(self.current_output_dir, art))
-                                ]
+                            if validation_result.is_valid:
+                                # Validation passed!
+                                validation_passed = True
+                                task.status = "completed"
+                                task.result = task_out
 
-                                if missing_model_artifacts:
-                                    warn_msg = f"[Orchestrator Warning] Skipping Task #{task.task_id} ({task.title}): Hyperparameter Tuning requires prior model comparison artifacts ({', '.join(model_artifacts)}), but {', '.join(missing_model_artifacts)} were not found."
-                                    if HAS_LOGFIRE:
-                                        logfire.warn(warn_msg, task_id=task.task_id, missing=missing_model_artifacts)
-                                    print(warn_msg, file=sys.stderr)
+                                # Collect generated files
+                                for gf in agent_res.get("generated_files", []) or []:
+                                    if gf not in self.generated_artifacts:
+                                        self.generated_artifacts.append(gf)
+                                        if HAS_LOGFIRE:
+                                            logfire.info(f"New Artifact: {gf}", artifact_file=gf, producer_task=task.task_id, producer_agent=agent_class_name)
 
-                                    task.status = "skipped"
-                                    task.result = f"Skipped: Required model comparison artifacts ({', '.join(missing_model_artifacts)}) not found."
+                                self.completed_task_results.append({
+                                    "task_id": task.task_id,
+                                    "title": task.title,
+                                    "agent": agent_class_name,
+                                    "status": "completed",
+                                    "output": task_out,
+                                    "summary_data": agent_res.get("summary_data"),
+                                    "generated_files": agent_res.get("generated_files", []),
+                                    "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
+                                    "validation_retries": attempt
+                                })
+
+                                if HAS_LOGFIRE:
+                                    logfire.info(
+                                        f"Task #{task.task_id} Completed ({agent_class_name})",
+                                        task_id=task.task_id,
+                                        agent=agent_class_name,
+                                        status="completed",
+                                        tool_calls_made=agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
+                                        generated_files=agent_res.get("generated_files", []),
+                                        validation_retries=attempt
+                                    )
+
+                                if attempt > 0:
+                                    print(f"[Orchestrator] Task #{task.task_id} validation passed after {attempt} retry(s)")
+
+                            else:
+                                # Validation failed - log detailed warnings
+                                last_validation_errors = validation_result.hallucination_warnings
+                                print(f"[Orchestrator Validation] Task #{task.task_id} ({agent_class_name}) failed artifact validation (attempt {attempt + 1}/{max_retries + 1}):")
+                                for warn in validation_result.hallucination_warnings:
+                                    print(f"  - {warn}")
+
+                                if HAS_LOGFIRE:
+                                    logfire.warn(
+                                        "Artifact validation failed",
+                                        task_id=task.task_id,
+                                        agent=agent_class_name,
+                                        attempt=attempt + 1,
+                                        max_retries=max_retries,
+                                        missing_artifacts=validation_result.missing_artifacts,
+                                        fallback_detected=validation_result.fallback_detected,
+                                        report_structure_valid=validation_result.report_structure_valid,
+                                        report_structure_issues=validation_result.report_structure_issues
+                                    )
+
+                                attempt += 1
+
+                                if attempt <= max_retries:
+                                    # Will loop again with updated prompt and extra tool budget
+                                    # The validation_errors from this attempt will be passed to the next
+                                    continue
+                                else:
+                                    # Max retries exceeded - mark as validation_failed
+                                    print(f"[Orchestrator ERROR] Task #{task.task_id} failed artifact validation after {max_retries} retries. Marking as validation_failed and continuing workflow...")
+                                    print(f"  Last validation errors: {last_validation_errors}")
+
+                                    task_validation_failed = True
+                                    task.status = "validation_failed"
+                                    task.result = task_out
+
+                                    # Collect whatever files were generated
+                                    for gf in agent_res.get("generated_files", []) or []:
+                                        if gf not in self.generated_artifacts:
+                                            self.generated_artifacts.append(gf)
+
                                     self.completed_task_results.append({
                                         "task_id": task.task_id,
                                         "title": task.title,
                                         "agent": agent_class_name,
-                                        "status": "skipped",
-                                        "output": task.result,
-                                        "warning": warn_msg
+                                        "status": "validation_failed",
+                                        "output": task_out,
+                                        "summary_data": agent_res.get("summary_data"),
+                                        "generated_files": agent_res.get("generated_files", []),
+                                        "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
+                                        "validation_failed": True,
+                                        "validation_errors": validation_result.hallucination_warnings,
+                                        "validation_retries": max_retries
                                     })
-                                    return
 
-                                # Add comparison artifacts to ml_files
-                                for art in ["model_comparison.csv", "best_model.pkl", "ml_summary.json"]:
-                                    art_path = os.path.join(self.current_output_dir, art)
-                                    if os.path.exists(art_path) and art_path not in ml_files and art not in ml_files:
-                                        ml_files.append(art_path)
-
-                                data_context_note = f"\n[INPUT DATASET CONTEXT]: Load trained model from 'best_model.pkl' and baseline scores from 'model_comparison.csv'. Dataset is '{current_dataset_file or 'dataset.csv'}'."
-                            elif current_dataset_file:
-                                data_context_note = f"\n[INPUT DATASET CONTEXT]: Processed dataset is available as '{current_dataset_file}'. Load and train on this dataset directly (e.g. pd.read_csv('{current_dataset_file}')). Do NOT re-calculate raw duplicate/missing values."
-                            else:
-                                main_name = os.path.basename(files_list[0]) if files_list else "dataset.csv"
-                                data_context_note = f"\n[INPUT DATASET CONTEXT]: Main dataset is available as '{main_name}'. Note: No pre-cleaned dataset artifact was produced; proceed directly with this main dataset."
-
-                            agent_res = agent_instance.run_task(
-                                prompt=f"{query_text}\nTask: {task.title}\nDescription: {task.description}{data_context_note}",
-                                uploaded_files=ml_files,
-                                plan=active_plan,
-                                task_id=task.task_id,
-                                max_tool_calls=max_tool_calls_per_agent,
-                                step_callback=step_callback,
-                                cancellation_token=self.cancellation_token
-                            )
-
-                            task.status = "completed" if agent_res.get("status") != "failed" else "failed"
-                            task_out = agent_res.get("response") or agent_res.get("final_response") or ""
-                            task.result = task_out
-
-                            # Collect generated files
-                            for gf in agent_res.get("generated_files", []) or []:
-                                if gf not in self.generated_artifacts:
-                                    self.generated_artifacts.append(gf)
                                     if HAS_LOGFIRE:
-                                        logfire.info(f"New Artifact: {gf}", artifact_file=gf, producer_task=task.task_id, producer_agent=agent_class_name)
+                                        logfire.error(
+                                            "Artifact validation failed after max retries",
+                                            task_id=task.task_id,
+                                            agent=agent_class_name,
+                                            missing_artifacts=validation_result.missing_artifacts,
+                                            fallback_detected=validation_result.fallback_detected,
+                                            report_structure_valid=validation_result.report_structure_valid,
+                                            final_errors=last_validation_errors
+                                        )
 
-                            self.completed_task_results.append({
-                                "task_id": task.task_id,
-                                "title": task.title,
-                                "agent": agent_class_name,
-                                "status": task.status,
-                                "output": task_out,
-                                "summary_data": agent_res.get("summary_data"),
-                                "generated_files": agent_res.get("generated_files", []),
-                                "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0)
-                            })
-                            if HAS_LOGFIRE:
-                                logfire.info(
-                                    f"Task #{task.task_id} Completed ({agent_class_name})",
-                                    task_id=task.task_id,
-                                    agent=agent_class_name,
-                                    status=task.status,
-                                    tool_calls_made=agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
-                                    generated_files=agent_res.get("generated_files", [])
-                                )
+                                    # Exit the while loop - task has permanently failed validation
+                                    # We do NOT set validation_passed = True here; task_validation_failed handles exit
 
-                        elif isinstance(agent_instance, DataAnalystAgent):
-                            analyst_files = list(files_list)
-                            # Pass existing cleaned or feature engineered datasets if available
-                            for cand in ["feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"]:
-                                cand_path = os.path.join(self.current_output_dir, cand)
-                                if (cand in self.generated_artifacts or os.path.exists(cand_path)) and cand_path not in analyst_files and cand not in analyst_files:
-                                    analyst_files.insert(0, cand_path)
-
-                            agent_res = agent_instance.run_task(
-                                prompt=f"{query_text}\nTask: {task.title}\nDescription: {task.description}",
-                                uploaded_files=analyst_files,
-                                plan=active_plan,
-                                task_id=task.task_id,
-                                max_tool_calls=max_tool_calls_per_agent,
-                                step_callback=step_callback,
-                                cancellation_token=self.cancellation_token
-                            )
-
-                            task.status = "completed" if agent_res.get("status") != "failed" else "failed"
-                            task_out = agent_res.get("response") or agent_res.get("final_response") or ""
-                            task.result = task_out
-
-                            # Collect generated files (including cleaned_dataset.csv / feature_engineered_dataset.csv)
-                            for gf in agent_res.get("generated_files", []) or []:
-                                if gf not in self.generated_artifacts:
-                                    self.generated_artifacts.append(gf)
-                                    if HAS_LOGFIRE:
-                                        logfire.info(f"New Artifact: {gf}", artifact_file=gf, producer_task=task.task_id, producer_agent=agent_class_name)
-
-                            self.completed_task_results.append({
-                                "task_id": task.task_id,
-                                "title": task.title,
-                                "agent": agent_class_name,
-                                "status": task.status,
-                                "output": task_out,
-                                "summary_data": agent_res.get("summary_data"),
-                                "generated_files": agent_res.get("generated_files", []),
-                                "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0)
-                            })
-                            if HAS_LOGFIRE:
-                                logfire.info(
-                                    f"Task #{task.task_id} Completed ({agent_class_name})",
-                                    task_id=task.task_id,
-                                    agent=agent_class_name,
-                                    status=task.status,
-                                    tool_calls_made=agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
-                                    generated_files=agent_res.get("generated_files", [])
-                                )
-
-                        else:
-                            fallback_res = self.data_analyst_agent.run_task(
-                                prompt=f"{query_text}\nTask: {task.title}\nDescription: {task.description}",
-                                uploaded_files=files_list,
-                                plan=active_plan,
-                                task_id=task.task_id,
-                                max_tool_calls=max_tool_calls_per_agent,
-                                step_callback=step_callback,
-                                cancellation_token=self.cancellation_token
-                            )
-                            task.status = "completed"
-                            task.result = fallback_res.get("response", "")
-                            self.completed_task_results.append({
-                                "task_id": task.task_id,
-                                "title": task.title,
-                                "agent": "DataAnalystAgent (Fallback)",
-                                "status": "completed",
-                                "summary_data": fallback_res.get("summary_data"),
-                                "output": fallback_res.get("response", "")
-                            })
-                            if HAS_LOGFIRE:
-                                logfire.info(
-                                    f"Task #{task.task_id} Completed (Fallback)",
-                                    task_id=task.task_id,
-                                    status="completed"
-                                )
-
+                    # Execute the task (with artifact validation & retries),
+                    # nested under a per-task parent span so all LLM/tool spans
+                    # of this task appear as children in Logfire traces.
                     if HAS_LOGFIRE:
-                        with logfire.span(f"Task #{task.task_id}: {task.title}", task_id=task.task_id, assigned_agent=agent_class_name):
+                        with logfire.span(
+                            f"Task #{task.task_id}: {task.title}",
+                            task_id=task.task_id,
+                            assigned_agent=agent_class_name
+                        ):
                             _execute_task()
                     else:
                         _execute_task()
 
-                    # Check cancellation immediately after task execution
+                    # Check cancellation after task execution
                     self.cancellation_token.check_cancelled(
                         step_name=f"After Task #{task.task_id}: {task.title}",
                         task_id=task.task_id
@@ -676,6 +839,40 @@ class WorkflowOrchestrator:
                     else:
                         _do_reporter_synthesis()
 
+                    # Validate the synthesized final report
+                    if self.final_report:
+                        report_filename = "final_report.md"
+                        report_filepath = os.path.join(self.current_output_dir, report_filename)
+                        try:
+                            with open(report_filepath, "w", encoding="utf-8") as rf:
+                                rf.write(self.final_report)
+                        except Exception as write_err:
+                            print(f"[Orchestrator Warning] Failed to save {report_filepath}: {write_err}")
+
+                        # Validate the synthesized report
+                        task_type = "report_generation"
+                        synthesis_validation = validate_artifacts(
+                            agent_response={"final_report": self.final_report, "generated_files": [report_filename]},
+                            output_dir=self.current_output_dir,
+                            agent_name="ReporterAgent (Synthesis)",
+                            task_type=task_type
+                        )
+                        if not synthesis_validation.is_valid:
+                            print(f"[Orchestrator Validation] Synthesized final report failed validation:")
+                            for warn in synthesis_validation.hallucination_warnings:
+                                print(f"  - {warn}")
+                            # Add validation failure to task results for tracking
+                            self.completed_task_results.append({
+                                "task_id": 0,
+                                "title": "Final Report Synthesis (Auto)",
+                                "agent": "ReporterAgent (Synthesis)",
+                                "status": "validation_failed",
+                                "output": self.final_report,
+                                "validation_failed": True,
+                                "validation_errors": synthesis_validation.hallucination_warnings,
+                                "validation_retries": 0
+                            })
+
                 # Save report as markdown file in the run output directory
                 report_filename = "final_report.md"
                 report_filepath = os.path.join(self.current_output_dir, report_filename)
@@ -700,30 +897,61 @@ class WorkflowOrchestrator:
                     "output_dir": self.current_output_dir
                 })
 
+                # Determine overall workflow status based on task results
+                validation_failed_tasks = [tr for tr in self.completed_task_results if tr.get("validation_failed", False)]
+                completed_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "completed"]
+                skipped_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "skipped"]
+                failed_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "failed"]
+
+                has_validation_failures = len(validation_failed_tasks) > 0
+                has_fatal_failures = len(failed_tasks) > 0
+
+                if has_fatal_failures:
+                    workflow_status = "failed"
+                    workflow_message = f"Workflow failed: {len(failed_tasks)} task(s) failed with errors."
+                elif has_validation_failures:
+                    workflow_status = "completed_with_validation_failures"
+                    workflow_message = f"Workflow completed but {len(validation_failed_tasks)} task(s) failed artifact validation."
+                else:
+                    workflow_status = "completed"
+                    workflow_message = "Workflow execution completed successfully."
+
+                # Log validation failures for debugging
+                if has_validation_failures:
+                    print(f"[Orchestrator] Workflow {workflow_status}: {len(validation_failed_tasks)} task(s) had validation failures:")
+                    for tr in validation_failed_tasks:
+                        print(f"  - Task #{tr.get('task_id')}: {tr.get('title')} ({tr.get('agent')}) - {tr.get('validation_errors', [])}")
+
+                if HAS_LOGFIRE:
+                    logfire.info(
+                        f"Multi-Agent Plan Execution {workflow_status.replace('_', ' ').title()}",
+                        plan_id=active_plan.plan_id,
+                        tasks_completed=len(completed_tasks),
+                        tasks_failed=len(failed_tasks),
+                        tasks_skipped=len(skipped_tasks),
+                        tasks_validation_failed=len(validation_failed_tasks),
+                        artifacts_generated=self.generated_artifacts,
+                        report_length=len(self.final_report),
+                        output_dir=self.current_output_dir
+                    )
+
                 # Explicit workflow completed notification
                 _safe_callback("workflow_completed", {
-                    "status": "completed",
+                    "status": workflow_status,
                     "plan_id": active_plan.plan_id,
-                    "message": "Workflow execution completed successfully.",
-                    "tasks_completed": len(self.completed_task_results),
+                    "message": workflow_message,
+                    "tasks_completed": len(completed_tasks),
+                    "tasks_failed": len(failed_tasks),
+                    "tasks_skipped": len(skipped_tasks),
+                    "tasks_validation_failed": len(validation_failed_tasks),
                     "total_tasks": len(active_plan.tasks),
                     "artifacts": self.generated_artifacts,
                     "output_dir": self.current_output_dir,
                     "final_report": self.final_report
                 })
 
-                if HAS_LOGFIRE:
-                    logfire.info(
-                        "Multi-Agent Plan Execution Completed Successfully",
-                        plan_id=active_plan.plan_id,
-                        tasks_completed=len(self.completed_task_results),
-                        artifacts_generated=self.generated_artifacts,
-                        report_length=len(self.final_report),
-                        output_dir=self.current_output_dir
-                    )
-
                 return {
-                    "status": "completed",
+                    "status": workflow_status,
                     "plan": active_plan.to_dict(),
                     "task_results": self.completed_task_results,
                     "generated_artifacts": self.generated_artifacts,
@@ -828,7 +1056,7 @@ class WorkflowOrchestrator:
         user_query: str,
         files: Optional[List[str]] = None,
         dataset_context: Optional[str] = None,
-        max_tool_calls_per_agent: int = 7,
+        max_tool_calls_per_agent: int = 10,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> Dict[str, Any]:

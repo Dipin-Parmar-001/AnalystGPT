@@ -640,7 +640,7 @@ class PlannerAgent:
                     try:
                         delays = [10, 20, 30]
 
-                        for attempt, delay in enumerate(delays + [0]):
+                        for llm_attempt, delay in enumerate(delays + [0]):
                             try:
                                 retry_resp = self.client.chat.completions.create(
                                     model=self.model_name,
@@ -649,9 +649,9 @@ class PlannerAgent:
                                 )
                                 break
                             except Exception as err:
-                                if attempt < len(delays):
+                                if llm_attempt < len(delays):
                                     import time
-                                    print(f"[PlannerAgent Warning] LLM request failed (attempt {attempt + 1}), retrying in {delay}s... Error: {err}")
+                                    print(f"[PlannerAgent Warning] LLM request failed (attempt {llm_attempt + 1}), retrying in {delay}s... Error: {err}")
                                     time.sleep(delay)
                                     continue
                                 raise err
