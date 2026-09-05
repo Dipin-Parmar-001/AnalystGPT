@@ -254,6 +254,7 @@ class ReporterAgent:
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
         verified_metrics: Optional[Dict[str, Any]] = None,
+        max_correction_turns: int = 0,
     ) -> str:
         """
         Synthesizes structured task summaries and sandbox artifacts into the final executive markdown report.
@@ -446,7 +447,10 @@ class ReporterAgent:
                     "tool_call_id": tc_id,
                     "fn_name": fn_name,
                     "raw_args": fn_args_raw,
-                    "tool_call_num": tool_calls_count
+                    "tool_call_num": tool_calls_count,
+                    "tool_calls_used": tool_calls_count,
+                    "tool_calls_remaining": max(0, effective_max_calls - tool_calls_count),
+                    "max_tool_calls": effective_max_calls
                 })
 
                 exec_result = self.tool_manager.execute_tool_call(tool_call=tc)
@@ -467,7 +471,16 @@ class ReporterAgent:
                         tool=fn_name,
                         success=exec_result.get("success", True),
                         execution_time=exec_result.get("execution_time", 0.0),
-                        returned_files=exec_result.get("returned_files", [])
+                        returned_files=exec_result.get("returned_files", []),
+                        tool_call_num=tool_calls_count,
+                        tool_calls_remaining=max(0, effective_max_calls - tool_calls_count),
+                        max_tool_calls=effective_max_calls
+                    )
+                else:
+                    print(
+                        f"[ReporterAgent] Tool call {tool_calls_count}/{effective_max_calls} executed: {fn_name} "
+                        f"(remaining tool calls: {max(0, effective_max_calls - tool_calls_count)})",
+                        flush=True
                     )
 
                 _safe_callback("tool_completed", {
@@ -493,17 +506,29 @@ class ReporterAgent:
         # ==============================================================================
         # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
         # ==============================================================================
+        self.last_verification_result = None
         if final_report and verified_metrics:
             _safe_callback("verification_loop_started", {
                 "agent": self.agent_name,
                 "report_length": len(final_report)
             })
 
-            max_correction_turns = 2
+            turns = max(0, max_correction_turns)
             correction_turn = 0
             verification_res = verify_report_numbers(final_report, verified_metrics)
 
-            while not verification_res.is_valid and correction_turn < max_correction_turns:
+            # Expose the deterministic verification outcome so the orchestrator can
+            # combine it with artifact validation into ONE shared retry budget
+            # instead of retrying independently here.
+            self.last_verification_result = {
+                "is_valid": verification_res.is_valid,
+                "total_claims": verification_res.total_claims_count,
+                "verified_count": verification_res.verified_count,
+                "unverified_count": verification_res.unverified_count,
+                "unverified_claims": [c.raw_str for c in verification_res.unverified_claims],
+            }
+
+            while not verification_res.is_valid and correction_turn < turns:
                 correction_turn += 1
                 if cancellation_token:
                     cancellation_token.check_cancelled(step_name=f"{self.agent_name} verification correction turn {correction_turn}")
@@ -536,9 +561,18 @@ class ReporterAgent:
 
                 # Re-verify the revised report
                 verification_res = verify_report_numbers(final_report, verified_metrics)
+                self.last_verification_result = {
+                    "is_valid": verification_res.is_valid,
+                    "total_claims": verification_res.total_claims_count,
+                    "verified_count": verification_res.verified_count,
+                    "unverified_count": verification_res.unverified_count,
+                    "unverified_claims": [c.raw_str for c in verification_res.unverified_claims],
+                }
 
-            # If still unverified after max correction turns, attach fallback warning banner
-            if not verification_res.is_valid:
+            # If still unverified after max correction turns, attach fallback warning banner.
+            # When internal correction is disabled (turns == 0) leave the report as-is:
+            # the caller (orchestrator) owns the retry decision and the final banner.
+            if not verification_res.is_valid and turns > 0:
                 if HAS_LOGFIRE:
                     logfire.warn(
                         "ReporterAgent Verification Max Turns Exceeded, attaching warning banner",
@@ -585,6 +619,7 @@ class ReporterAgent:
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
         verified_metrics: Optional[Dict[str, Any]] = None,
+        max_correction_turns: int = 0,
     ) -> Dict[str, Any]:
         """
         Unified entry point to run the reporting task.
@@ -601,13 +636,19 @@ class ReporterAgent:
             step_callback=step_callback,
             cancellation_token=cancellation_token,
             verified_metrics=verified_metrics,
+            max_correction_turns=max_correction_turns,
         )
 
+        # Completion is grounded in the produced report artifact, not in the act
+        # of the LLM responding: a report must actually exist and exceed the
+        # minimum size. The orchestrator additionally persists final_report.md to
+        # disk and enforces existence/size/structure validation.
+        report_ok = bool(report_md) and len(report_md.strip()) >= 100
         return {
-            "status": "completed",
+            "status": "completed" if report_ok else "failed",
             "agent": self.agent_name,
             "final_report": report_md,
-            "summary": "Executive summary report generated successfully."
+            "summary": "Executive summary report generated successfully." if report_ok else "Report generation failed: empty or undersized report."
         }
 
 

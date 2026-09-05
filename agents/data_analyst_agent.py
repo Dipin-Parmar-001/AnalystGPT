@@ -29,7 +29,7 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
@@ -416,9 +416,11 @@ class DataAnalystAgent:
 
         tool_calls_count = 0
         executed_code_blocks: List[str] = []
+        successful_executions = 0
+        failed_executions = 0
         generated_files: List[str] = []
         final_response = ""
-        agent_status = "completed"
+        agent_status = "in_progress"
 
         # Agent turn loop bounded by tool calls
         for turn in range(effective_max_calls * 2):
@@ -455,14 +457,20 @@ class DataAnalystAgent:
 
             tool_calls = response_msg.tool_calls
 
-            # If no tool calls requested, check fallback for malformed or raw code in content
+            # Structural turn classification from the provider response:
+            # - tool_calls present  -> pass to the execution layer below
+            # - content only        -> non-execution response (markdown/JSON
+            #   summary or prose). It is NEVER executed as code; the loop ends
+            #   and task completion is decided by actual execution results.
+            # Only a provider-issued 'Malformed function call:' body is parsed
+            # for recoverable code.
             if not tool_calls:
-                fallback_code = extract_code_from_content(response_msg.content or "")
+                fallback_code = extract_action_code_from_content(response_msg.content or "")
                 if fallback_code and tool_calls_count < effective_max_calls:
                     if HAS_LOGFIRE:
-                        logfire.info("DataAnalystAgent detected code in assistant response via fallback parser", code_snippet=fallback_code[:200])
+                        logfire.info("DataAnalystAgent recovered malformed function call via fallback parser", code_snippet=fallback_code[:200])
                     else:
-                        print(f"[DataAnalystAgent Fallback] Extracted Python code from non-standard LLM response ({len(fallback_code)} chars). Executing in sandbox...")
+                        print(f"[DataAnalystAgent Fallback] Recovered malformed function call ({len(fallback_code)} chars). Executing in sandbox...")
                     synthetic_tc = create_synthetic_execute_tool_call(fallback_code, f"fallback_call_{turn + 1}_{tool_calls_count + 1}")
                     tool_calls = [synthetic_tc]
                 else:
@@ -502,7 +510,10 @@ class DataAnalystAgent:
                     "tool_call_id": tool_call_id,
                     "fn_name": fn_name,
                     "raw_args": raw_args,
-                    "tool_call_num": tool_calls_count + 1
+                    "tool_call_num": tool_calls_count + 1,
+                    "tool_calls_used": tool_calls_count,
+                    "tool_calls_remaining": max(0, effective_max_calls - tool_calls_count - 1),
+                    "max_tool_calls": effective_max_calls
                 })
 
                 tool_result = self.tool_manager.execute_tool_call(tool_call, files=uploaded_files)
@@ -517,6 +528,13 @@ class DataAnalystAgent:
                 memory_manager.append_tool_result(tool_call_id, fn_name, tool_result)
                 tool_calls_count += 1
 
+                # Execution results are recorded from the tool layer, not inferred
+                # from any LLM-generated text.
+                if tool_result.get("success", True):
+                    successful_executions += 1
+                else:
+                    failed_executions += 1
+
                 if HAS_LOGFIRE:
                     logfire.info(
                         f"DataAnalystAgent Tool Executed: {fn_name}",
@@ -524,7 +542,16 @@ class DataAnalystAgent:
                         tool=fn_name,
                         success=tool_result.get("success", True),
                         execution_time=tool_result.get("execution_time", 0.0),
-                        returned_files=tool_result.get("returned_files", [])
+                        returned_files=tool_result.get("returned_files", []),
+                        tool_call_num=tool_calls_count,
+                        tool_calls_remaining=max(0, effective_max_calls - tool_calls_count),
+                        max_tool_calls=effective_max_calls
+                    )
+                else:
+                    print(
+                        f"[DataAnalystAgent] Tool call {tool_calls_count}/{effective_max_calls} executed: {fn_name} "
+                        f"(remaining tool calls: {max(0, effective_max_calls - tool_calls_count)})",
+                        flush=True
                     )
 
                 _safe_callback("tool_completed", {
@@ -553,8 +580,15 @@ class DataAnalystAgent:
                     memory_manager.append_assistant({"role": "assistant", "content": final_response})
                 break
 
-        # Mark tasks completed or failed
-        task_status_final = "completed" if agent_status != "failed" else "failed"
+        # Task completion must be grounded in actual execution: at least one tool
+        # action passed to the execution layer and succeeded. The content of the
+        # LLM response alone (a markdown summary, a status field, or code that
+        # "would" create artifacts) never marks a task completed. A response with
+        # zero successful executions is a non-execution response -> failed, so
+        # the orchestrator's artifact validation triggers a retry.
+        if agent_status != "tool_limit_reached":
+            agent_status = "completed" if successful_executions > 0 else "no_execution"
+        task_status_final = "completed" if successful_executions > 0 else "failed"
         for t in assigned_tasks:
             t.status = task_status_final
             t.result = final_response

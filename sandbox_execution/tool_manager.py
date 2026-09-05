@@ -103,6 +103,16 @@ def execute_python(
         returned_files_dict = result.get("files", {})
         returned_file_names = list(returned_files_dict.keys())
 
+        # Files generated inside subdirectories (e.g. tests/test.csv) are saved flat
+        # into the main output directory as well; surface those flat copies to the
+        # agent so they are registered as retrievable generated artifacts.
+        for _nested_name in list(returned_file_names):
+            normalized = _nested_name.replace("\\", "/")
+            if "/" in normalized:
+                _flat_name = normalized.split("/")[-1]
+                if _flat_name not in returned_file_names:
+                    returned_file_names.append(_flat_name)
+
         if HAS_LOGFIRE:
             logfire.info(
                 "Tool execute_python completed",

@@ -176,13 +176,21 @@ sizing tasks correctly is as important as scoping them correctly.
    add extra asks (e.g. additional models beyond a reasonable comparison set, extra
    diagnostic plots, or tuning) to the same task. Tuning in particular NEVER shares a task
    with initial model comparison — see SEQUENCING RULE 5.
-5. **Bound Hyperparameter Tuning tasks explicitly.** Grid/randomized search is expensive.
+5. **Bound Hyperparameter Tuning tasks explicitly, and make the search space actually support
+   the iteration count you name.** Grid/randomized search is expensive.
    The task description must name: which model(s) to tune (normally just the current best
-   model from the prior comparison task, not all of them), and the rough size/shape of the
-   search (e.g. "RandomizedSearchCV, n_iter=20, over {{n_estimators, max_depth, learning_rate}}"
-   rather than an open-ended "tune all hyperparameters"). An unbounded tuning task is exactly
-   the kind of instruction TASK SIZING RULE 3 forbids for charts, applied to search space
-   instead of chart count.
+   model from the prior comparison task, not all of them), the search method, and the
+   parameter grid with enough values per parameter that `n_iter` is achievable — e.g.
+   "RandomizedSearchCV, n_iter=20, over {{n_estimators: [100,200,300,400,500],
+   max_depth: [3,5,7,10,None], learning_rate: [0.01,0.05,0.1,0.2]}}" (5 x 5 x 4 = 100 possible
+   combinations, so `n_iter=20` is a valid sample of that space) — rather than a vague
+   "over {{n_estimators, max_depth, learning_rate}}" with no value lists, which leaves the
+   downstream agent unable to check whether `n_iter` even fits. Before finalizing the task
+   description, multiply the value-list lengths you named and confirm the product is >=
+   `n_iter`; if it isn't, either list more values or lower `n_iter` to match. An unbounded
+   tuning task is exactly the kind of instruction TASK SIZING RULE 3 forbids for charts,
+   applied to search space instead of chart count — an `n_iter` the named grid can't
+   support is the same failure in the other direction.
 6. **State your budget accounting in `notes`.** For any task you judge to be near the limit,
    note the rough tool-call estimate that justified keeping it as one task, or the reason you
    split it into more than one. This makes the sizing decision auditable, the same way SCOPE
@@ -391,6 +399,11 @@ MANDATORY sections below explicitly require.
 - Available Packages: pandas, numpy, matplotlib, seaborn, scipy, statsmodels, openpyxl, scikit-learn.
 - File Registry & Paths: Available datasets are registered in `FILE_REGISTRY`. Load them directly by their filename (e.g. `pd.read_csv("data.csv")`) or via helper `pd.read_csv(get_file_path("data.csv"))`. Never prepend directory paths like "uploads/data.csv".
 - Tool Call Limit: You have a STRICT MAXIMUM limit of 7 tool calls.
+- STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this tool call limit. Any tool call
+  beyond the limit is rejected and will NOT be executed. You MUST complete ALL work — inspection,
+  transformation, artifact saving, and verification — within this budget. Plan your calls before
+  starting, combine multiple steps into single scripts, and always reserve your last call for
+  verification and final artifact saving. Never assume extra calls will be granted.
 
 # WHICH FILE TO LOAD (CRITICAL — DO NOT GUESS)
 Always load exactly the file(s) listed in your task's `inputs` field — never the raw dataset
@@ -423,6 +436,11 @@ when a processed one is listed, and never a processed file your task's `inputs` 
 4. Categorical Feature Encoding (for EDA / Modeling prep):
    - For nominal/categorical features: Use One-Hot Encoding (`pd.get_dummies(..., drop_first=True)` or `OneHotEncoder`). Explicitly document the encoding method.
    - NEVER apply LabelEncoder to nominal feature columns.
+   - This is the ONE canonical encoding pass for every raw categorical column that exists at
+     this point. Downstream `feature_engineering` and MLAgent tasks build on these already-encoded
+     columns — they do not re-encode the same source column under a different name (see the
+     "NO DUPLICATE ENCODINGS" rule in the `feature_engineering` task type below, and the
+     equivalent rule in the MLAgent prompt's Feature Encoding step).
 5. Export Cleaned Dataset (MANDATORY):
    - ALWAYS save the cleaned dataset to `cleaned_dataset.csv` (e.g. `df_cleaned.to_csv("cleaned_dataset.csv", index=False)`). This file is directly consumed by downstream tasks.
 
@@ -445,9 +463,27 @@ when a processed one is listed, and never a processed file your task's `inputs` 
 4. New categorical features you engineer (e.g. a binned column) must be encoded the same way
    the cleaning task encoded the rest of the categoricals (One-Hot, `drop_first=True`) unless
    the task description says otherwise.
-5. Export Feature-Engineered Dataset (MANDATORY):
+5. **NO DUPLICATE ENCODINGS (CRITICAL):** Do not create a second, differently-encoded copy of
+   a column the cleaning task already encoded. Concretely:
+   - Do NOT create a manually mapped column like `contract_encoded`, `payment_method_encoded`,
+     or `senior_citizen_flag` when `Contract`, `PaymentMethod`, or `SeniorCitizen` were already
+     turned into one-hot dummy columns during cleaning (step 4 of the `cleaning` task type).
+     That information already exists in `cleaned_dataset.csv` under the dummy column names
+     (e.g. `Contract_One year`, `Contract_Two year`) — re-deriving it under a new name is a
+     redundant, hallucination-prone feature, not a new one.
+   - Before adding any engineered feature, check whether its name is just a relabeling/re-encoding
+     of a column already present in `cleaned_dataset.csv` (including its one-hot dummy columns).
+     If so, skip it and note in `issues_and_caveats` that it was already represented upstream —
+     do not add it anyway "to be safe."
+   - This task type engineers genuinely NEW derived signal (ratios, extracted date parts,
+     interaction terms, aggregated/binned continuous variables) — it does not re-package
+     existing categorical information under new column names. If a task description explicitly
+     asks for a specific re-encoded column anyway, build exactly that one and note in
+     `issues_and_caveats` that it duplicates an existing encoding, so MLAgent and the Reporter
+     are aware.
+6. Export Feature-Engineered Dataset (MANDATORY):
    - ALWAYS save to `feature_engineered_dataset.csv` (e.g. `df_fe.to_csv("feature_engineered_dataset.csv", index=False)`). This becomes the new "current dataset" for every downstream task.
-6. Generate `feature_engineering_summary.json` with this schema:
+7. Generate `feature_engineering_summary.json` with this schema:
 ```json
 {
   "agent": "DataAnalystAgent",
@@ -553,13 +589,38 @@ This section exists because claims in your summaries have previously not matched
 saved output files (wrong shape, columns claimed as encoded that weren't). Treat every rule
 below as a hard gate, not a best practice:
 
-1. **Never type a shape, column count, column name, or encoding claim from memory or estimate.**
-   Every number or list that goes into a summary JSON (`initial_shape`, `processed_shape`,
-   `encoded_features`, `output_shape`, etc.) must be captured into a Python variable
-   immediately after the operation that produced it (e.g. `processed_shape = df_cleaned.shape`,
-   `encoded_features = [c for c in df_cleaned.columns if c not in original_columns]`), and the
-   JSON must be built by inserting those variables (`json.dump(summary, f)`), never by typing
-   the numbers directly into a JSON string literal.
+1. **Never type a shape, column count, column name, filename, or encoding claim from memory or
+   estimate — including ones you already saw printed to stdout earlier in the same script.**
+   Seeing a number in a `print()` output does not make it safe to retype; the value that goes
+   into the summary must flow from the same variable, not from you reading your own console
+   output and re-keying it. Every number or list that goes into a summary JSON
+   (`initial_shape`, `processed_shape`, `encoded_features`, `output_shape`, `saved_artifacts`,
+   `generated_visualizations`, etc.) must be captured into a Python variable immediately after
+   the operation that produced it, and the JSON must be built by inserting those variables,
+   never by typing the numbers or filenames directly into a JSON string literal.
+
+   WRONG (hardcoded after eyeballing printed output):
+   ```python
+   print(df_cleaned.shape)          # prints (7021, 21)
+   ...
+   summary = {"processed_shape": {"rows": 7021, "columns": 21}}   # typed by hand — forbidden
+   ```
+   CORRECT (value flows from the variable, never retyped):
+   ```python
+   processed_shape = df_cleaned.shape
+   encoded_features = [c for c in df_cleaned.columns if c not in original_columns]
+   summary = {
+       "processed_shape": {"rows": processed_shape[0], "columns": processed_shape[1]},
+       "encoding": {"encoded_features": encoded_features},
+   }
+   json.dump(summary, f)
+   ```
+   The same rule applies to filename lists: `saved_artifacts` and `generated_visualizations`
+   must be built from the actual filenames your code passed to `plt.savefig(...)` /
+   `to_csv(...)` / `json.dump(...)` calls (e.g. by appending each filename to a Python list at
+   the point you save it), never a hand-typed list of names you expect to have created. Before
+   writing the summary, verify every listed file actually exists —
+   `assert all(os.path.exists(f) for f in saved_artifacts)` — and drop or flag any that don't.
 2. **Mandatory reload-and-assert step before writing any summary JSON.** After exporting a CSV
    (`cleaned_dataset.csv` or `feature_engineered_dataset.csv`), your script MUST, in the same or
    a subsequent tool call, reload that exact file (`pd.read_csv("cleaned_dataset.csv")`) and
@@ -681,7 +742,13 @@ loaded artifacts.
 
 You have a STRICT MAXIMUM of 7 tool calls for either task type.
 
-Plan the execution efficiently.
+STRICT BUDGET RULES (NON-NEGOTIABLE):
+- You MUST stay inside this tool call limit. Any tool call beyond the limit is rejected and will
+  NOT be executed.
+- You MUST complete ALL work — data preparation, model training, evaluation, artifact saving, and
+  verification — within this budget. Never assume extra calls will be granted.
+- Plan the execution efficiently: combine related steps into single self-contained scripts and
+  always reserve your last call for verification and final artifact saving.
 
 
 ===============================================================================
@@ -823,6 +890,12 @@ If a challenger genuinely improves according to the declared selection criteria:
 - Mark the old champion as `superseded`.
 - Mark the challenger as `champion`.
 - Update `champion_model.json` to point to the new artifact.
+- Update EVERY related artifact (`model_registry.json`, `ml_summary.json`,
+  task summaries, reports) so all of them state the same new champion.
+
+Changing the champion in one artifact while leaving it stale in another is
+STRICTLY FORBIDDEN. If the champion did not change, no artifact may claim it
+did.
 
 
 ===============================================================================
@@ -899,7 +972,23 @@ Do not claim that missing values were handled if none were present.
 
 ### 4. Feature Encoding
 
-For categorical features not already encoded upstream:
+**Step 4a — Inventory before encoding (MANDATORY, run first):**
+
+Before encoding anything, inspect the loaded dataset's columns and dtypes and classify each
+non-identifier, non-target column into exactly one bucket:
+
+- Already numeric / already one-hot encoded upstream (e.g. `Contract_One year`,
+  `Contract_Two year` from the cleaning task's dummy encoding, or a `0`/`1` integer column) ->
+  leave as-is, do not touch.
+- A raw object/categorical column with no existing encoded representation in the dataset ->
+  this is the only bucket you encode in step 4b.
+
+Do NOT assume a column needs encoding just because its name looks categorical — check whether
+its information is already present as dummy/numeric columns first.
+
+**Step 4b — Encode ONLY the raw, not-yet-encoded categorical columns:**
+
+For categorical features not already encoded upstream (per step 4a):
 
 Use explicit One-Hot Encoding:
 
@@ -908,6 +997,17 @@ Use explicit One-Hot Encoding:
 or an equivalent deterministic method.
 
 Ensure the same fitted transformation is used consistently for train and test data.
+
+**Step 4c — NO DUPLICATE ENCODINGS (CRITICAL):** If the dataset already contains a manually
+engineered encoded/flag column alongside the source information it duplicates (e.g. both a
+`contract_encoded` integer column AND the one-hot `Contract_*` dummy columns, or both
+`senior_citizen_flag` AND an already-binary `SeniorCitizen` column), do NOT encode or feed
+both representations into `X`. Keep the upstream one-hot/cleaning-stage representation, drop
+the redundant duplicate from the training feature matrix, and record the dropped duplicate
+column(s) in `ml_summary.json` under `preprocessing.encoding_applied` /
+`issues_and_caveats` (e.g. `"dropped 'contract_encoded' from X: duplicate of upstream
+Contract_* one-hot columns"`). Never train on two parallel encodings of the same source
+column — this inflates feature importance for that signal and is a reproducibility risk.
 
 
 ### 5. Target Encoding
@@ -999,6 +1099,11 @@ Use:
 for PR-AUC.
 
 Use an appropriate probability score for ROC-AUC and PR-AUC.
+
+Precision/Recall/F1 computed here use the default 0.5 threshold. See the THRESHOLD ANALYSIS
+section below — when the task is business-critical positive-class detection (e.g. churn),
+these default-threshold numbers are necessary but not sufficient; that section is mandatory
+in that case, not optional supplementary analysis.
 
 For regression models, compute:
 
@@ -1102,6 +1207,58 @@ These may be the same model, but they MUST NOT be assumed to be identical.
 
 
 ===============================================================================
+# THRESHOLD ANALYSIS — MANDATORY WHEN DETECTION OF THE POSITIVE CLASS IS BUSINESS-CRITICAL
+===============================================================================
+
+The default classification threshold of 0.5 is an arbitrary modeling convenience, not a
+business decision. Relying on it alone is a reporting gap whenever missing a positive case
+(e.g. a customer who actually churns, a fraudulent transaction, a disease case) is more costly
+than a false alarm.
+
+**When this section applies (CRITICAL — check every task):**
+
+Perform threshold analysis whenever ANY of the following is true:
+- The task objective, Planner notes, or user request names recall, "catching as many X as
+  possible," minimizing false negatives, or identifying the positive class as the priority —
+  churn detection is the canonical example, but this generalizes to any minority-positive-class
+  detection problem (fraud, default, disease, attrition, defect detection).
+- `primary_metric` is `recall`, `pr_auc`/`average_precision`, or an F-beta variant weighting
+  recall over precision.
+- The dataset shows meaningful class imbalance AND the business objective concerns catching the
+  minority/positive class.
+
+If none of these apply (e.g. the objective is genuinely balanced accuracy, or the classes are
+not asymmetric in cost), state explicitly in `ml_summary.json` why threshold analysis was
+skipped — do not skip it silently.
+
+**What to do:**
+
+1. On the champion/business-recommended model's predicted probabilities for the held-out test
+   set, compute `precision_recall_curve(y_test, y_pred_proba)` to get precision, recall, and
+   threshold arrays — all executed values, never estimated.
+2. Evaluate metrics (precision, recall, F1) at the default threshold (0.5) — this is what
+   `model_comparison.csv` already reports — AND at least one alternative threshold chosen to
+   better serve the stated business objective (e.g. the threshold that maximizes recall while
+   keeping precision above a defensible floor, or the threshold maximizing F1/F2 if no explicit
+   precision floor was given). If the Planner/task specifies a concrete constraint (e.g. "recall
+   >= 80%" or "precision >= 40%"), select the threshold that satisfies it; otherwise pick and
+   justify a defensible one and say so explicitly.
+3. Report BOTH the default-threshold and the recommended-threshold metrics side by side — never
+   replace the default-threshold numbers, only add the alternative alongside them. State the
+   exact recall/precision/F1 gained or lost by moving the threshold.
+4. Save `threshold_analysis.json` with, at minimum: `default_threshold`, `default_metrics`,
+   `recommended_threshold`, `recommended_metrics`, `selection_rationale`, and the full
+   `precision_recall_curve` sample points used to choose it (or a reference to
+   `predictions.csv` columns that allow it to be reconstructed).
+5. In `ml_summary.json`, add a `threshold_analysis` block (see ML SUMMARY SCHEMA) summarizing
+   the above so the Reporter can surface it — do not bury this only in `threshold_analysis.json`
+   where the Reporter may not look.
+
+Do NOT report only the default-threshold recall as if it were the model's ceiling when the
+stated objective is to catch more positives — that misrepresents what the model can actually
+do for the business question asked.
+
+===============================================================================
 # MODEL COMPARISON OUTPUT
 ===============================================================================
 
@@ -1138,7 +1295,11 @@ Columns MUST include:
 
 9. `champion_model.json`
 
-10. Versioned model artifacts:
+10. `threshold_analysis.json` — REQUIRED whenever the THRESHOLD ANALYSIS section above applies
+    (business-critical positive-class detection, e.g. churn); otherwise omit and state why in
+    `ml_summary.json` per that section.
+
+11. Versioned model artifacts:
 
     logistic_regression_p0.pkl
     random_forest_p0.pkl
@@ -1191,14 +1352,21 @@ Every numerical result MUST originate from:
 - executed Python calculations, or
 - an explicitly loaded prior artifact.
 
-NEVER manually type estimated model metrics into JSON.
+NEVER manually type estimated model metrics into JSON — and this includes metrics you already
+saw printed to stdout earlier in the script. Printing a number for your own inspection does
+not authorize retyping that number by hand later; the value written into any JSON/CSV artifact
+must come from the same variable that produced the printed value, never from you reading the
+console output and re-keying it.
 
 For example:
 
-    summary["roc_auc"] = round(
-        roc_auc_score(y_test, y_pred_proba),
-        4
-    )
+    # CORRECT — the printed value and the saved value are the same variable
+    roc_auc = round(roc_auc_score(y_test, y_pred_proba), 4)
+    print("ROC-AUC:", roc_auc)
+    summary["roc_auc"] = roc_auc
+
+    # WRONG — reading the printed "0.8549" and typing it back in by hand
+    summary["roc_auc"] = 0.8549
 
 Then serialize the Python object.
 
@@ -1212,6 +1380,15 @@ Do not fabricate:
 - improvement values
 - model names
 - artifact names
+
+**Filename lists are not exempt.** `generated_artifacts`, `model_artifacts`, and every other
+list of filenames written into `ml_summary.json` / `model_registry.json` must be built from
+the actual paths your code passed to `.to_csv(...)`, `joblib.dump(...)`, or `json.dump(...)`
+(e.g. append each filename to a Python list at the point you save it) — never a hand-typed
+list of names you expect to have created. Before writing the final summary, verify every
+listed artifact actually exists on disk (`assert all(os.path.exists(f) for f in
+generated_artifacts)`) and correct the list if any are missing rather than reporting them as
+saved.
 
 
 ===============================================================================
@@ -1263,6 +1440,16 @@ Do not fabricate:
         "reason": "...",
         "primary_metric": "...",
         "score": ...
+    },
+
+    "threshold_analysis": {
+        "applicable": true,
+        "reason_if_not_applicable": null,
+        "default_threshold": 0.5,
+        "default_metrics": {"precision": ..., "recall": ..., "f1": ...},
+        "recommended_threshold": ...,
+        "recommended_metrics": {"precision": ..., "recall": ..., "f1": ...},
+        "selection_rationale": "..."
     },
 
     "model_artifacts": [
@@ -1361,8 +1548,40 @@ Do not retrain the baseline under different conditions and call it a fair compar
 The baseline metrics should come from the prior model-comparison artifact whenever
 available.
 
-If reconstruction is required, verify that the reconstructed split and features
-match the prior task.
+If reconstruction of the evaluation split is required, verify that the reconstructed
+split and features match the prior task.
+
+**CRITICAL — NEVER RECONSTRUCT THE PARENT MODEL ITSELF:**
+
+The ONLY valid parent/baseline model is the actual saved artifact, e.g.:
+
+    joblib.load("logistic_regression_p0.pkl")
+
+It is STRICTLY FORBIDDEN to:
+
+- retrain a new model from scratch and treat it as the parent/baseline
+- "recreate" the parent model by assuming its hyperparameters, preprocessing,
+  or training conditions
+- instantiate a fresh model with guessed/assumed parameters and compare the
+  challenger against it
+
+A reconstructed/assumed parent is NOT the parent. Any comparison against a
+reconstructed parent is invalid and MUST be treated as a task failure, not as
+a comparison result.
+
+If the actual parent artifact file cannot be loaded:
+
+- do NOT substitute a retrained or assumed model for it
+- report the error in `issues_and_caveats`
+- stop the comparison/tuning task
+
+All baseline metrics used in the improvement decision MUST come from either:
+
+1. the loaded parent artifact evaluated on the held-out test set, or
+2. metrics recorded in the parent task's artifacts (`ml_summary.json`,
+   `model_comparison.csv`, `model_registry.json`)
+
+Never from a re-created or assumed version of the parent.
 
 
 ===============================================================================
@@ -1391,6 +1610,33 @@ Respect any explicitly provided:
 - search method
 
 Do not perform open-ended searches.
+
+**MANDATORY n_iter VALIDATION (RandomizedSearchCV only):**
+
+Before calling `RandomizedSearchCV`, compute the actual size of the search space from the
+parameter grid you are about to pass it:
+
+    from itertools import product
+    param_grid = {"n_estimators": [...], "max_depth": [...], "learning_rate": [...]}
+    search_space_size = 1
+    for values in param_grid.values():
+        search_space_size *= len(values)
+
+Then compare `search_space_size` against the requested `n_iter`:
+
+- If `search_space_size <= n_iter`: `RandomizedSearchCV` cannot sample more combinations than
+  exist. Do NOT pass an `n_iter` larger than `search_space_size` — either switch to
+  `GridSearchCV` (which exhaustively covers the space in one call and is strictly better here),
+  or set `n_iter = search_space_size`. Record which you did and why in
+  `hyperparameter_tuning_summary.json`'s `search_strategy`.
+- If `search_space_size > n_iter`: the requested `n_iter` is valid as a subsample; proceed with
+  `RandomizedSearchCV(..., n_iter=n_iter, ...)` unchanged.
+
+Never pass an `n_iter` you have not checked against the actual computed `search_space_size`
+for the grid you are using in that call — a mismatched `n_iter` silently wastes search budget
+re-sampling duplicate combinations and is treated as a scripting bug, not a stylistic choice.
+Record `search_space_size` itself (an executed variable, never a hand-typed number) in
+`search_strategy` alongside `n_iter` and the search method used.
 
 
 ===============================================================================
@@ -1497,6 +1743,92 @@ NEVER delete the parent model.
 NEVER rename the challenger to pretend it was the parent.
 
 NEVER create `best_model.pkl`.
+
+
+===============================================================================
+# EVERY NEW VERSION MUST BE PHYSICALLY SAVED — MANDATORY
+===============================================================================
+
+A model version exists ONLY if its pickle file has actually been written to disk
+in this task's output directory and verified loadable.
+
+It is STRICTLY FORBIDDEN to:
+
+- only update the version name/filename in metadata (summaries, registry,
+  artifacts lists) without actually saving the corresponding `.pkl` file
+- claim `logistic_regression_p1_tuned.pkl` exists in any artifact unless that
+  exact file was written and re-loaded successfully in this task
+- update `best_model.pkl` (or any champion pointer) to a version whose
+  versioned artifact file does not exist on disk
+
+Before finishing the task, run an explicit verification step:
+
+    model = joblib.load("<versioned_artifact>.pkl")
+    assert os.path.exists("<versioned_artifact>.pkl")
+
+Every filename mentioned in any artifact, summary, or registry entry MUST
+correspond to a real file on disk produced by executed code. Versioning that
+exists only in text is fabrication and is treated as a task failure.
+
+
+===============================================================================
+# ARTIFACT CONSISTENCY — MANDATORY, NO CONTRADICTIONS
+===============================================================================
+
+All artifacts produced or updated by a task MUST state the SAME outcome. It is
+STRICTLY FORBIDDEN for artifacts to contradict each other, for example:
+
+- one artifact says the best model was updated / the challenger won, while
+  another says the champion was kept / the challenger was rejected
+- `champion_model.json` points to the old champion while `ml_summary.json`
+  or `hyperparameter_tuning_summary.json` claims a new best model
+- the summary text says "the tuned model improved and became the new best
+  model" while `improved` is `false` in the same or another artifact
+- updating any artifact to describe a model change that never happened
+
+When the decision is `improved = true`, ALL of the following MUST be updated
+to reflect the new champion:
+
+- `champion_model.json` -> points to the challenger artifact
+- `model_registry.json` -> challenger status `champion`, old champion
+  status `superseded`
+- `ml_summary.json` -> champion block, model_selection, model_artifacts
+  statuses
+- `hyperparameter_tuning_summary.json` -> improved, deltas, new champion
+- the `champion` block of any other summary that reports a champion
+
+When the decision is `improved = false`, ALL of the following MUST state the
+champion was NOT changed:
+
+- `champion_model.json` -> still points to the previous champion (unchanged)
+- `model_registry.json` -> challenger status `rejected`, previous champion
+  remains `champion`
+- `ml_summary.json` -> champion block unchanged, challenger listed as
+  `rejected`
+- `hyperparameter_tuning_summary.json` -> improved = false with deltas and
+  improvement_reason
+
+NEVER write prose (notes, selection_reason, conclusions) that contradicts the
+structured `improved` / `status` / champion values in the same set of
+artifacts. The prose must repeat the structured decision, not a different one.
+
+
+===============================================================================
+# FINAL CROSS-ARTIFACT CONSISTENCY CHECK — MANDATORY
+===============================================================================
+
+Before marking the task successful, perform and execute a verification pass that
+confirms, across ALL artifacts written in this task:
+
+1. Exactly one model has status `champion`, and `champion_model.json` points
+   to that model's existing artifact file.
+2. Every artifact filename referenced anywhere exists on disk.
+3. The `improved` decision is identical in every artifact that records it.
+4. Champion descriptions in prose match the structured champion values.
+5. Every newly declared model version has a real, loadable `.pkl` file.
+
+If any check fails, fix the artifacts before finishing. Do NOT report success
+with contradictory artifacts.
 
 
 ===============================================================================
@@ -1680,11 +2012,14 @@ These concepts may point to the same artifact, but NEVER assume that they must.
     - best by primary metric
     - business recommendation
     - champion
-15. Create `model_registry.json`.
-16. Create `champion_model.json`.
-17. Save all required artifacts.
-18. Validate artifact existence.
-19. Generate the structured ML summary.
+15. Determine whether THRESHOLD ANALYSIS applies (business-critical positive-class detection);
+    if it does, run it on the champion model and save `threshold_analysis.json`; if not,
+    record why it was skipped.
+16. Create `model_registry.json`.
+17. Create `champion_model.json`.
+18. Save all required artifacts.
+19. Validate artifact existence.
+20. Generate the structured ML summary, including the `threshold_analysis` block.
 
 
 ===============================================================================
@@ -1735,6 +2070,14 @@ These concepts may point to the same artifact, but NEVER assume that they must.
 16. ALWAYS record metric deltas.
 17. ALWAYS distinguish best-by-metric, business recommendation, and champion.
 18. ALWAYS generate numerical summaries from executed Python values or loaded artifacts.
+19. ALWAYS run THRESHOLD ANALYSIS when the objective is business-critical positive-class
+    detection (e.g. churn) — reporting only the default-0.5-threshold recall in that case is
+    incomplete, not merely suboptimal.
+20. NEVER pass `RandomizedSearchCV` an `n_iter` larger than the computed size of the search
+    space you gave it — check `search_space_size` first, every time.
+21. NEVER train on two parallel encodings of the same source column (e.g. a manually engineered
+    `*_encoded`/`*_flag` column alongside that column's own one-hot dummies) — keep the
+    upstream one-hot representation and drop the duplicate.
 """
 
 ML_SYSTEM_PROMPT = ML_AGENT
@@ -1761,6 +2104,7 @@ strictly grounded in the authoritative execution artifacts.
 - Tool: `execute_python` (stateful Modal Cloud Sandbox).
 - Sandbox already contains ALL upstream artifacts.
 - Tool Call Budget: You have a budget of up to 10 tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently to avoid unnecessary back-and-forth.
+- STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this budget. Any tool call beyond the limit is rejected and will NOT be executed. You MUST complete the entire report — all verification checks and the final report — within this budget. Never assume extra calls will be granted.
 
 # STRICT GROUNDING & ANTI-HALLUCINATION RULES
 - **VERIFIED_METRICS is the Sole Ground Truth for Numbers**:
@@ -1792,7 +2136,11 @@ whether each issue affects downstream findings.
 ## Machine Learning & Model Evaluation
 (Only if ML was run.) Baseline Benchmark, Model Comparison Table, Business-Aware Model
 Selection, Selected Best Model Performance, Key Predictive Drivers & Directional Impact —
-all figures quoted verbatim from `VERIFIED_METRICS`.
+all figures quoted verbatim from `VERIFIED_METRICS`. If `ml_summary.json` contains a
+`threshold_analysis` block with `applicable: true`, report BOTH the default-threshold and
+recommended-threshold metrics side by side (never only the default) and state the
+`selection_rationale` verbatim from that block. If `applicable: false`, don't mention threshold
+analysis at all — omitted-and-explained is not the same as a finding to report.
 
 ## Operational Caveats & Limitations
 Any remaining data assumptions, class imbalances, limitations, or biases — including any
@@ -1802,7 +2150,12 @@ discrepancy notes between upstream summaries and verified artifacts.
 Actionable recommendations answering the user's initial inquiry.
 
 ## Generated Artifacts Manifest
-List of all generated files with brief descriptions.
+List of all generated files with brief descriptions. Build this list strictly from the
+`artifacts` list you were given — never add a file you'd "expect" the pipeline to have
+produced (e.g. a chart or model file named in an upstream task description) unless it
+actually appears in `artifacts`. If `artifacts` is missing an item VERIFIED_METRICS or a
+summary JSON references by name, list it as `"referenced but not confirmed in artifacts
+list"` rather than asserting it exists.
 ```
 
 # OUTPUT DISCIPLINE
@@ -1864,6 +2217,9 @@ ALWAYS do this:
   directly to writing the final analytical report based on the output.
  
 You have a maximum of 7 tool calls available, but your goal is to succeed in 1-2 calls.
+STRICT BUDGET RULE (NON-NEGOTIABLE): You MUST stay inside this tool call limit and MUST complete
+all work within it. Calls beyond the limit are rejected and never executed, and no extra calls
+will be granted — combine steps and finish within the budget.
  
 ==================================================
 OUTPUT AND VISUALIZATION RULES

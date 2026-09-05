@@ -11,6 +11,7 @@ from sandbox_execution.tool_manager import (
 )
 from agents.fallback_parser import (
     extract_code_from_content,
+    extract_action_code_from_content,
     create_synthetic_execute_tool_call,
     unwrap_envelope,
     SyntheticToolCall,
@@ -28,6 +29,7 @@ __all__ = [
     "EXECUTE_PYTHON_TOOL_SPEC",
     "reset_global_sandbox_manager",
     "extract_code_from_content",
+    "extract_action_code_from_content",
     "create_synthetic_execute_tool_call",
     "unwrap_envelope",
     "SyntheticToolCall",

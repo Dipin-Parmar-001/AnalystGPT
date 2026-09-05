@@ -364,6 +364,20 @@ def save_returned_files(
                 f.write(content)
             saved_paths.append(local_path)
 
+            # Files created inside subdirectories (e.g. tests/test.csv) are also
+            # saved flat into the main output directory so every artifact is
+            # retrievable from one location.
+            if os.sep in filename or "/" in filename:
+                flat_name = filename.replace("\\", "/").split("/")[-1]
+                flat_path = os.path.join(effective_target_dir, flat_name)
+                if os.path.abspath(flat_path) != os.path.abspath(local_path):
+                    try:
+                        with open(flat_path, "wb") as f:
+                            f.write(content)
+                        saved_paths.append(flat_path)
+                    except Exception as err:
+                        print(f"[Sandbox File Warning] Error saving flat copy of {filename}: {err}", flush=True)
+
     return saved_paths
 
 

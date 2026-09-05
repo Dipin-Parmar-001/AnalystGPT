@@ -52,7 +52,7 @@ export default function App() {
   const [events, setEvents] = useState([]);
   const [artifacts, setArtifacts] = useState([]);
   const [finalReport, setFinalReport] = useState('');
-  const [maxToolCalls, setMaxToolCalls] = useState(7);
+  const [maxToolCalls, setMaxToolCalls] = useState(10);
 
   // Termination Confirmation Modal
   const [terminateModalOpen, setTerminateModalOpen] = useState(false);

@@ -27,7 +27,7 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
@@ -405,10 +405,11 @@ class MLAgent:
 
         tool_calls_count = 0
         executed_codes: List[str] = []
+        successful_executions = 0
+        failed_executions = 0
         generated_files: List[str] = []
         turn = 0
         final_text = ""
-        completed_success = False
 
         _safe_callback("task_started", {
             "agent": self.agent_name,
@@ -435,18 +436,20 @@ class MLAgent:
                 _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
 
             if not tool_calls:
-                # Check for fallback code in thought/content (e.g. 'Malformed function call:' or markdown python block)
-                fallback_code = extract_code_from_content(thought)
+                # Structural turn classification: only a provider-issued
+                # 'Malformed function call:' body is recovered as code. A plain
+                # content response (markdown summary, JSON, prose) is a
+                # non-execution turn and is never executed as Python.
+                fallback_code = extract_action_code_from_content(thought)
                 if fallback_code and tool_calls_count < effective_max_calls:
                     if HAS_LOGFIRE:
-                        logfire.info("MLAgent detected code in assistant response via fallback parser", code_snippet=fallback_code[:200])
+                        logfire.info("MLAgent recovered malformed function call via fallback parser", code_snippet=fallback_code[:200])
                     else:
-                        print(f"[MLAgent Fallback] Extracted Python code from non-standard LLM response ({len(fallback_code)} chars). Executing in sandbox...")
+                        print(f"[MLAgent Fallback] Recovered malformed function call ({len(fallback_code)} chars). Executing in sandbox...")
                     synthetic_tc = create_synthetic_execute_tool_call(fallback_code, f"fallback_call_{turn}_{tool_calls_count + 1}")
                     tool_calls = [synthetic_tc]
                 else:
                     final_text = thought
-                    completed_success = True
                     memory_manager.append_assistant_response(assistant_msg)
                     break
 
@@ -476,7 +479,11 @@ class MLAgent:
                     "turn": turn,
                     "tool_call_id": tc_id,
                     "fn_name": fn_name,
-                    "raw_args": fn_args_raw
+                    "raw_args": fn_args_raw,
+                    "tool_call_num": tool_calls_count,
+                    "tool_calls_used": tool_calls_count,
+                    "tool_calls_remaining": max(0, effective_max_calls - tool_calls_count),
+                    "max_tool_calls": effective_max_calls
                 })
 
                 exec_result = self.tool_manager.execute_tool_call(
@@ -504,6 +511,13 @@ class MLAgent:
                     tool_result=exec_result
                 )
 
+                # Execution results are recorded from the tool layer, not inferred
+                # from any LLM-generated text.
+                if exec_result.get("success", True):
+                    successful_executions += 1
+                else:
+                    failed_executions += 1
+
                 if HAS_LOGFIRE:
                     logfire.info(
                         f"MLAgent Tool Executed: {fn_name}",
@@ -511,7 +525,16 @@ class MLAgent:
                         tool=fn_name,
                         success=exec_result.get("success", True),
                         execution_time=exec_result.get("execution_time", 0.0),
-                        returned_files=exec_result.get("returned_files", [])
+                        returned_files=exec_result.get("returned_files", []),
+                        tool_call_num=tool_calls_count,
+                        tool_calls_remaining=max(0, effective_max_calls - tool_calls_count),
+                        max_tool_calls=effective_max_calls
+                    )
+                else:
+                    print(
+                        f"[MLAgent] Tool call {tool_calls_count}/{effective_max_calls} executed: {fn_name} "
+                        f"(remaining tool calls: {max(0, effective_max_calls - tool_calls_count)})",
+                        flush=True
                     )
 
                 _safe_callback("tool_completed", {
@@ -522,7 +545,7 @@ class MLAgent:
                     "result": exec_result
                 })
 
-        if not completed_success and tool_calls_count >= effective_max_calls:
+        if not final_text and tool_calls_count >= effective_max_calls:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} final warning response", task_id=task_id if isinstance(task_id, int) else None)
             memory_manager.messages.append({
@@ -534,7 +557,13 @@ class MLAgent:
             final_text = assistant_msg.content or ""
             memory_manager.append_assistant_response(assistant_msg)
 
-        final_status = "completed" if completed_success or final_text else "failed"
+        # Task completion must be grounded in actual execution: at least one tool
+        # action passed to the execution layer and succeeded. The content of the
+        # LLM response alone (a markdown summary, a status field, or code that
+        # "would" create artifacts) never marks a task completed. A response with
+        # zero successful executions is a non-execution response -> failed, so
+        # the orchestrator's artifact validation triggers a retry.
+        final_status = "completed" if successful_executions > 0 else "failed"
         for t in assigned_tasks:
             t.status = final_status
             t.result = final_text

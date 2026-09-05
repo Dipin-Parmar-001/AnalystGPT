@@ -19,7 +19,7 @@ if sys.stderr.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 
@@ -323,7 +323,7 @@ class DataAnalystAgent:
 
                     tool_calls = response_msg.tool_calls
                     if not tool_calls:
-                        fallback_code = extract_code_from_content(response_msg.content or "")
+                        fallback_code = extract_action_code_from_content(response_msg.content or "")
                         if fallback_code:
                             if HAS_LOGFIRE:
                                 logfire.info("Agent detected code in assistant response via fallback parser", code_snippet=fallback_code[:200])

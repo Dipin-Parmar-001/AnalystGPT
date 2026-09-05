@@ -404,14 +404,18 @@ class WorkflowOrchestrator:
                         nonlocal agent_class_name
 
                         # ================================================================
-                        # TASK EXECUTION WITH ARTIFACT VALIDATION & RETRY LOGIC
+                        # TASK EXECUTION WITH COMBINED VALIDATION & SHARED RETRY LOGIC
                         # ================================================================
-                        # We use a while loop with a hard-coded max retry count (2) to prevent
-                        # infinite loops. On validation failure, task status is set back to
-                        # "pending" and re-executed with hallucination warning + extra tool budget.
-                        # After max retries, we mark validation_failed and continue workflow.
+                        # We use a while loop with a shared max retry count (2) to prevent
+                        # infinite loops. For ReporterAgent tasks, BOTH checks — artifact
+                        # validation and the deterministic numeric post-verification — are
+                        # evaluated on the same attempt, then ONE combined retry budget is
+                        # spent (never 2 retries per check). On any failure, task status is
+                        # set back to "pending" and re-executed with the relevant errors +
+                        # extra tool budget. After max combined retries, we mark
+                        # validation_failed and continue workflow.
                         #
-                        # Validation errors from the immediately previous attempt are stored in
+                        # Errors from the immediately previous attempt are stored in
                         # last_validation_errors and passed to the next retry. This ensures the
                         # agent receives specific feedback about what failed, rather than relying
                         # on completed_task_results which is only updated after all retries.
@@ -483,6 +487,7 @@ class WorkflowOrchestrator:
                                     cancellation_token=self.cancellation_token,
                                     verified_metrics=verified_metrics,
                                     max_tool_calls=current_tool_budget,
+                                    max_correction_turns=0,  # retries owned by the combined orchestrator loop below
                                 )
                                 self.final_report = agent_res.get("final_report", "")
                                 task_out = self.final_report
@@ -647,8 +652,14 @@ class WorkflowOrchestrator:
                                 task_out = fallback_res.get("response", "")
 
                             # ================================================================
-                            # ARTIFACT VALIDATION - Check if claimed artifacts actually exist
+                            # COMBINED VALIDATION: ARTIFACT VALIDATION + REPORTER POST-VERIFICATION
                             # ================================================================
+                            # Both checks are evaluated on the SAME attempt, then ONE shared
+                            # retry budget (max_retries, from max_validation_retries) is spent:
+                            #   - both fail   -> retry driven by artifact-validation errors
+                            #   - only artifact validation fails -> retry per artifact validation
+                            #   - only post-verification fails   -> retry per post-verification
+                            # There is no separate retry budget for either check.
                             task_type = getattr(task, "task_type", None)
                             validation_result = validate_artifacts(
                                 agent_response=agent_res,
@@ -657,7 +668,19 @@ class WorkflowOrchestrator:
                                 task_type=task_type
                             )
 
-                            if validation_result.is_valid:
+                            post_verification_failed = False
+                            post_verification_errors: list = []
+                            if isinstance(agent_instance, ReporterAgent):
+                                pv = getattr(agent_instance, "last_verification_result", None)
+                                if pv is not None and not pv.get("is_valid", True):
+                                    post_verification_failed = True
+                                    unverified = pv.get("unverified_claims") or []
+                                    post_verification_errors = (
+                                        [f"Unverified numeric claim in report (must match VERIFIED_METRICS verbatim): '{c}'" for c in unverified[:10]]
+                                        or [f"Post-verification failed: {pv.get('unverified_count', 'unknown')} unverified numeric claims in the report."]
+                                    )
+
+                            if validation_result.is_valid and not post_verification_failed:
                                 # Validation passed!
                                 validation_passed = True
                                 task.status = "completed"
@@ -697,19 +720,29 @@ class WorkflowOrchestrator:
                                     print(f"[Orchestrator] Task #{task.task_id} validation passed after {attempt} retry(s)")
 
                             else:
-                                # Validation failed - log detailed warnings
-                                last_validation_errors = validation_result.hallucination_warnings
-                                print(f"[Orchestrator Validation] Task #{task.task_id} ({agent_class_name}) failed artifact validation (attempt {attempt + 1}/{max_retries + 1}):")
-                                for warn in validation_result.hallucination_warnings:
+                                # At least one check failed on this attempt.
+                                # Error-source priority: artifact validation wins when both fail.
+                                if not validation_result.is_valid:
+                                    failure_kind = "artifact_validation"
+                                    last_validation_errors = validation_result.hallucination_warnings
+                                else:
+                                    failure_kind = "post_verification"
+                                    last_validation_errors = post_verification_errors
+
+                                print(f"[Orchestrator Validation] Task #{task.task_id} ({agent_class_name}) failed {failure_kind} (attempt {attempt + 1}/{max_retries + 1}):")
+                                for warn in last_validation_errors:
                                     print(f"  - {warn}")
 
                                 if HAS_LOGFIRE:
                                     logfire.warn(
-                                        "Artifact validation failed",
+                                        "Combined validation failed",
                                         task_id=task.task_id,
                                         agent=agent_class_name,
+                                        failure_kind=failure_kind,
                                         attempt=attempt + 1,
                                         max_retries=max_retries,
+                                        artifact_validation_valid=validation_result.is_valid,
+                                        post_verification_valid=not post_verification_failed,
                                         missing_artifacts=validation_result.missing_artifacts,
                                         fallback_detected=validation_result.fallback_detected,
                                         report_structure_valid=validation_result.report_structure_valid,
@@ -720,13 +753,29 @@ class WorkflowOrchestrator:
 
                                 if attempt <= max_retries:
                                     # Will loop again with updated prompt and extra tool budget
-                                    # The validation_errors from this attempt will be passed to the next
+                                    # The errors chosen above will be passed to the next attempt
                                     continue
                                 else:
-                                    # Max retries exceeded - mark as validation_failed
-                                    print(f"[Orchestrator ERROR] Task #{task.task_id} failed artifact validation after {max_retries} retries. Marking as validation_failed and continuing workflow...")
+                                    # Max combined retries exceeded - mark as validation_failed
+                                    print(f"[Orchestrator ERROR] Task #{task.task_id} failed validation ({failure_kind}) after {max_retries} combined retries. Marking as validation_failed and continuing workflow...")
                                     print(f"  Last validation errors: {last_validation_errors}")
 
+                                    # If the reporter's numeric post-verification is still failing,
+                                    # append the warning banner to the final persisted report.
+                                    if isinstance(agent_instance, ReporterAgent) and post_verification_failed:
+                                        unverified = (getattr(agent_instance, "last_verification_result", None) or {}).get("unverified_claims") or []
+                                        if unverified:
+                                            banner = ("\n\n> **Verification Notice:** The following numeric claims could not be "
+                                                      "verified against the ground-truth verified metrics: "
+                                                      + "; ".join(f"'{c}'" for c in unverified[:10]) + "\n")
+                                            self.final_report = (self.final_report or "") + banner
+                                            task_out = self.final_report
+                                            report_filepath = os.path.join(self.current_output_dir, "final_report.md")
+                                            try:
+                                                with open(report_filepath, "w", encoding="utf-8") as rf:
+                                                    rf.write(self.final_report)
+                                            except Exception as write_err:
+                                                print(f"[Orchestrator Warning] Failed to update {report_filepath}: {write_err}")
                                     task_validation_failed = True
                                     task.status = "validation_failed"
                                     task.result = task_out
@@ -819,6 +868,7 @@ class WorkflowOrchestrator:
                                 step_callback=step_callback,
                                 cancellation_token=self.cancellation_token,
                                 verified_metrics=verified_metrics,
+                                max_correction_turns=2,  # standalone synthesis path: no orchestrator retry loop here
                             )
                         except WorkflowCancelledException:
                             raise
