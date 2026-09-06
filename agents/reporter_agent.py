@@ -27,7 +27,7 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC, build_verified_metrics
-from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT
+from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT, REPORT_REPAIR_PROMPT
 from agents.memory_manager import MessageHistoryManager, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan
 from agents.cancellation import CancellationToken, WorkflowCancelledException
@@ -551,6 +551,7 @@ class ReporterAgent:
                 "verified_count": verification_res.verified_count,
                 "unverified_count": verification_res.unverified_count,
                 "unverified_claims": [c.raw_str for c in verification_res.unverified_claims],
+                "provenance_map": verification_res.provenance_map,
             }
 
             while not verification_res.is_valid and correction_turn < turns:
@@ -592,6 +593,7 @@ class ReporterAgent:
                     "verified_count": verification_res.verified_count,
                     "unverified_count": verification_res.unverified_count,
                     "unverified_claims": [c.raw_str for c in verification_res.unverified_claims],
+                    "provenance_map": verification_res.provenance_map,
                 }
 
             # If still unverified after max correction turns, attach fallback warning banner.
@@ -648,6 +650,179 @@ class ReporterAgent:
         })
 
         return final_report
+
+    def _report_output_dir(self) -> str:
+        """Resolves the absolute output dir where final_report.md is delivered."""
+        raw_output_dir = getattr(self.tool_manager, "output_dir", "outputs")
+        workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if raw_output_dir and os.path.isabs(raw_output_dir):
+            return raw_output_dir
+        return os.path.join(workspace_root, raw_output_dir or "outputs")
+
+    def repair_report(
+        self,
+        current_report: str,
+        findings: List[Dict[str, Any]],
+        verified_metrics: Optional[Dict[str, Any]] = None,
+        profile_block: str = "",
+        max_tool_calls: int = 5,
+        cancellation_token: Optional[CancellationToken] = None,
+    ) -> str:
+        """
+        Post-report repair pass: given the current report and the COMBINED findings
+        from all verification methods (numeric verifier, consistency checker, LLM
+        judge), produces a corrected report. The repair runs as a compact agent
+        loop with its own dedicated tool budget (5 execute_python calls) so it can
+        re-inspect run artifacts when a finding cannot be resolved from the
+        supplied ground truth alone. This budget is separate from and does NOT
+        consume the reporter's original task budget.
+        """
+        if not current_report or not findings:
+            return current_report or ""
+
+        if cancellation_token:
+            cancellation_token.check_cancelled(step_name="ReporterAgent report repair")
+
+        findings_block = "\n".join(
+            f"- [{f.get('severity', 'minor').upper()}] ({f.get('code', 'finding')}): {f.get('message', '')}"
+            for f in findings[:25]
+        )
+        verified_metrics_block = json.dumps(verified_metrics or {}, indent=2, default=str)
+
+        repair_prompt = REPORT_REPAIR_PROMPT.format(
+            findings_block=findings_block,
+            current_report=current_report,
+            profile_block=profile_block or "(not available)",
+            verified_metrics_block=verified_metrics_block,
+        )
+
+        memory_manager = MessageHistoryManager(
+            system_prompt=REPORTER_SYSTEM_PROMPT,
+            keep_last_tool_pairs=self.keep_last_tool_pairs,
+            stdout_stderr_token_limit=self.stdout_stderr_token_limit,
+            max_tokens_before_compact=self.max_tokens_before_compact
+        )
+        memory_manager.messages.append({
+            "role": "user",
+            "content": repair_prompt + (
+                f"\n\nREMINDER: you have a strict budget of {max_tool_calls} tool calls. "
+                "After at most that many verification calls (or none, if not needed), output the "
+                "COMPLETE corrected markdown report as your final chat response."
+            ),
+        })
+
+        corrected = ""
+        tool_calls_count = 0
+        turn = 0
+
+        while tool_calls_count < max_tool_calls:
+            turn += 1
+            if cancellation_token:
+                cancellation_token.check_cancelled(step_name=f"ReporterAgent repair turn {turn}")
+
+            assistant_msg = self._call_llm(memory_manager.messages, tools=self.tool_manager.get_tool_specs())
+            thought = assistant_msg.content or ""
+            tool_calls = assistant_msg.tool_calls or []
+
+            msg_dict: Dict[str, Any] = {"role": "assistant"}
+            if assistant_msg.content:
+                msg_dict["content"] = assistant_msg.content
+            if tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "id": getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else f"call_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", ""),
+                            "arguments": tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+                        }
+                    }
+                    for i, tc in enumerate(tool_calls)
+                ]
+            memory_manager.append_assistant(msg_dict)
+
+            if not tool_calls:
+                corrected = thought
+                break
+
+            for tc in tool_calls:
+                if cancellation_token:
+                    cancellation_token.check_cancelled(step_name="ReporterAgent repair tool call")
+
+                fn_name = tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", "")
+                tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else f"call_{tool_calls_count + 1}")
+
+                if tool_calls_count >= max_tool_calls:
+                    memory_manager.append_tool_result(
+                        tool_call_id=tc_id,
+                        name=fn_name or "tool",
+                        tool_result={"status": "tool_limit_reached", "message": f"Repair tool budget of {max_tool_calls} exhausted. Output the corrected report now."}
+                    )
+                    continue
+
+                tool_calls_count += 1
+                exec_result = self.tool_manager.execute_tool_call(tool_call=tc)
+                memory_manager.append_tool_result(tool_call_id=tc_id, name=fn_name, tool_result=exec_result)
+
+                if HAS_LOGFIRE:
+                    logfire.info(
+                        f"ReporterAgent Repair Tool Executed: {fn_name}",
+                        agent="ReporterAgent",
+                        tool=fn_name,
+                        tool_call_num=tool_calls_count,
+                        repair_budget=max_tool_calls
+                    )
+
+        # Budget exhausted without a final text answer -> one last tool-free call
+        if not corrected:
+            if cancellation_token:
+                cancellation_token.check_cancelled(step_name="ReporterAgent repair final synthesis")
+            memory_manager.messages.append({
+                "role": "user",
+                "content": f"[SYSTEM] Repair tool budget of {max_tool_calls} is exhausted. "
+                           "Do NOT make any more tool calls. If you already wrote final_report.md, "
+                           "confirm it briefly. Otherwise output the COMPLETE corrected markdown report "
+                           "as chat text now — it is the last resort fallback."
+            })
+            assistant_msg = self._call_llm(memory_manager.messages, tools=[])
+            corrected = assistant_msg.content or ""
+            memory_manager.append_assistant({"role": "assistant", "content": corrected})
+
+        # ======================================================================
+        # RETRIEVE THE DELIVERABLE: same contract as generate_report — the
+        # corrected report is the `final_report.md` file written via
+        # execute_python; the chat response is only a fallback.
+        # ======================================================================
+        try:
+            artifact_path = os.path.join(self._report_output_dir(), "final_report.md")
+            if os.path.exists(artifact_path):
+                with open(artifact_path, "r", encoding="utf-8") as rf:
+                    file_report = rf.read()
+                if file_report and file_report.strip() and len(file_report.strip()) >= len((corrected or "").strip()):
+                    corrected = file_report
+                    if HAS_LOGFIRE:
+                        logfire.info("ReporterAgent repair retrieved corrected report from artifact", path=artifact_path, length=len(file_report))
+        except Exception as read_err:
+            print(f"[ReporterAgent Warning] Could not read repaired final_report.md: {read_err}. Using chat response.")
+
+        # Strip accidental markdown fences around the whole report
+        fence = re.match(r"^\s*```(?:markdown|md)?\s*\n(.*)\n\s*```\s*$", corrected or "", re.DOTALL)
+        if fence:
+            corrected = fence.group(1)
+
+        # Guard: a degenerate/empty response must never replace the report.
+        if not corrected.strip() or len(corrected.strip()) < len(current_report.strip()) * 0.4:
+            print(f"[ReporterAgent Warning] repair response too short ({len(corrected)} chars); keeping current report")
+            return current_report
+
+        if HAS_LOGFIRE:
+            logfire.info(
+                "ReporterAgent report repair completed",
+                corrected_length=len(corrected),
+                repair_tool_calls_used=tool_calls_count
+            )
+
+        return corrected
 
     def run_task(
         self,

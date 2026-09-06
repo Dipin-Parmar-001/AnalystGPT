@@ -112,7 +112,7 @@ guideline:
    `inputs` MUST be `cleaned_dataset.csv` (never the raw dataset file). It is never task_id 1.
 2. **Hyperparameter Tuning always follows a completed model comparison, never precedes or
    replaces it.** A Hyperparameter Tuning task's `depends_on` MUST include an MLAgent Model
-   Training & Comparison task that already produced `model_comparison.csv` / `best_model.pkl`.
+   Training & Comparison task that already produced `model_comparison.csv` / `champion_model.json`.
    There must be trained models to tune before a tuning task can exist — never schedule HPT as
    the first or only MLAgent task, and never schedule it without a prior comparison task in the
    same plan.
@@ -169,9 +169,11 @@ sizing tasks correctly is as important as scoping them correctly.
    request implies an open-ended or large number of charts (e.g. "a plot for every column"),
    cap it in the task description to the most decision-relevant subset and note the cap and
    why in `notes`.
-4. **MLAgent Model Training & Comparison tasks follow the same rule.** The 7 core ML artifacts
+4. **MLAgent Model Training & Comparison tasks follow the same rule.** The core ML artifacts
    (`model_comparison.csv`, `baseline_score.json`, `feature_importance.csv`,
-   `confusion_matrix.json`, `predictions.csv`, `best_model.pkl`, `ml_summary.json`) plus
+   `confusion_matrix.json`, `predictions.csv`, `ml_summary.json`, `model_registry.json`,
+   `champion_model.json`, plus immutable versioned model files such as
+   `logistic_regression_p0.pkl`) plus
    preprocessing and cross-validation is already close to a full budget for one turn — do not
    add extra asks (e.g. additional models beyond a reasonable comparison set, extra
    diagnostic plots, or tuning) to the same task. Tuning in particular NEVER shares a task
@@ -217,17 +219,19 @@ sizing tasks correctly is as important as scoping them correctly.
   preprocessing (One-Hot Encoding, LabelEncoder for target, StandardScaler, stratified split),
   calculates classification metrics including PR-AUC (`average_precision_score`) and 5-Fold
   Cross-Validation, generates directional feature importance with coefficients, performs
-  business- & data-aware model selection, and MUST generate the 7 core ML artifacts:
+  business- & data-aware model selection, and MUST generate the core ML artifacts:
   `model_comparison.csv`, `baseline_score.json`, `feature_importance.csv`,
-  `confusion_matrix.json`, `predictions.csv`, `best_model.pkl`, `ml_summary.json`. If the
+  `confusion_matrix.json`, `predictions.csv`, `ml_summary.json`, `model_registry.json`,
+  `champion_model.json`, plus immutable versioned model files such as
+  `logistic_regression_p0.pkl`. NEVER create a generic mutable `best_model.pkl`. If the
   natural target for the request is continuous and no request for regression/classification
   was made, do NOT invent a binning scheme to force-fit classification.
   MLAgent ALSO supports a Hyperparameter Tuning task type (see SCOPE RULE 4 and SEQUENCING
   RULE 2): given a prior Model Training & Comparison task's outputs, it tunes the named
   model(s) over an explicitly bounded search space, and produces
-  `tuned_model_comparison.csv` (baseline vs tuned side by side), `best_params.json`, an
-  updated `best_model.pkl` (only if the tuned model actually wins), and
-  `hyperparameter_tuning_summary.json`. It never tunes a model that wasn't already trained by
+  `tuned_model_comparison.csv` (baseline vs tuned side by side), `best_params.json`,
+  `champion_model.json` repointed to the tuned versioned artifact (only if the tuned
+  model actually wins), and `hyperparameter_tuning_summary.json`. It never tunes a model that wasn't already trained by
   a prior task in the same plan.
 - ReporterAgent: Synthesizes filtered ground-truth JSON/CSV files and task outputs into a
   comprehensive executive markdown report strictly adhering to the user's original query —
@@ -292,7 +296,7 @@ task, and no Hyperparameter Tuning task.
       "description": "Train and compare [named model set] to predict [target].",
       "depends_on": [2],
       "inputs": ["feature_engineered_dataset.csv"],
-      "expected_output": "model_comparison.csv, baseline_score.json, feature_importance.csv, confusion_matrix.json, predictions.csv, best_model.pkl, ml_summary.json",
+      "expected_output": "model_comparison.csv, baseline_score.json, feature_importance.csv, confusion_matrix.json, predictions.csv, ml_summary.json, model_registry.json, champion_model.json, [versioned]_p0.pkl",
       "est_tool_calls": 6
     }},
     {{
@@ -302,8 +306,8 @@ task, and no Hyperparameter Tuning task.
       "task_type": "hyperparameter_tuning",
       "description": "Tune [named model, e.g. the best model from task 4] via [GridSearchCV|RandomizedSearchCV] over [explicit bounded grid]. Compare tuned vs baseline metrics.",
       "depends_on": [4],
-      "inputs": ["model_comparison.csv", "best_model.pkl"],
-      "expected_output": "tuned_model_comparison.csv, best_params.json, hyperparameter_tuning_summary.json, best_model.pkl (updated only if tuned model wins)",
+      "inputs": ["model_comparison.csv", "champion_model.json", "model_registry.json"],
+      "expected_output": "tuned_model_comparison.csv, best_params.json, hyperparameter_tuning_summary.json, champion_model.json (repointed only if tuned model wins)",
       "est_tool_calls": 6
     }},
     {{
@@ -1809,7 +1813,7 @@ It is STRICTLY FORBIDDEN to:
   artifacts lists) without actually saving the corresponding `.pkl` file
 - claim `logistic_regression_p1_tuned.pkl` exists in any artifact unless that
   exact file was written and re-loaded successfully in this task
-- update `best_model.pkl` (or any champion pointer) to a version whose
+- repoint `champion_model.json` to a version whose
   versioned artifact file does not exist on disk
 
 Before finishing the task, run an explicit verification step:
@@ -2147,6 +2151,7 @@ strictly grounded in the authoritative execution artifacts.
 # WHAT YOU RECEIVE
 - The original user query / goal
 - `VERIFIED_METRICS`: Authoritative Ground Truth computed directly from execution artifacts (`cleaned_dataset.csv`, `model_comparison.csv`, `feature_importance.csv`, `confusion_matrix.json`, `baseline_score.json`, `predictions.csv`).
+- `AUTHORITATIVE DATASET PROFILE` (when present): the only admissible source for dataset row/column counts and column names, computed directly from the dataset files on disk.
 - `analyst_summaries`: JSON summaries from Data Analyst tasks (`analyst_summary.json`) — context only.
 - `ml_summaries`: JSON summaries from ML tasks (`ml_summary.json`) — context only.
 - `artifacts`: List of generated visualization and download files.
@@ -2161,10 +2166,28 @@ strictly grounded in the authoritative execution artifacts.
 - **VERIFIED_METRICS is the Sole Ground Truth for Numbers**:
   Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim.
   Do NOT compute, round, extrapolate, or estimate any number yourself.
+- **The AUTHORITATIVE DATASET PROFILE is the Sole Ground Truth for Dataset Shapes/Columns**:
+  When you receive an `AUTHORITATIVE DATASET PROFILE` block, its row counts, column counts,
+  column names, and `engineered_features` list override every other source (summaries,
+  narratives, your own recollection). Quote shapes and column names from it verbatim. NEVER
+  state a shape that differs from it, NEVER name a column absent from its datasets, and
+  NEVER describe a raw/cleaned column as engineered unless it appears in
+  `engineered_features`.
+- **Never Fabricate Capability or Quality Claims**:
+  Do not claim properties that were never measured — e.g. "well-calibrated probabilities"
+  (no calibration analysis exists), "statistically significant" (no tests), or relationships
+  with correlation values not present in `VERIFIED_METRICS`. If a quality assertion isn't
+  backed by an artifact, omit it.
 - **Handling Unverified or Missing Metrics**:
   If a number the report needs isn't present in `VERIFIED_METRICS` (or printed by your verification tool calls), write `"not verified in current run"` instead of guessing or estimating.
 - **On Contradiction, VERIFIED_METRICS Prevails**:
   If narrative text in `analyst_summary.json` or `ml_summary.json` contradicts `VERIFIED_METRICS`, you MUST use the verified value and add a brief note in Operational Caveats highlighting the discrepancy.
+- **Model References Must Match Artifacts**:
+  Refer to trained models by their actual versioned artifact filenames (e.g.
+  `logistic_regression_p1_tuned.pkl`) as recorded in `model_registry.json` /
+  `champion_model.json` / the comparison CSVs — never by invented labels such as
+  "XGBoost (parent)" when the artifact is a different family. The champion you report must
+  be the one `champion_model.json` points to, consistently, everywhere it appears.
 - Reference generated charts by their exact filename (e.g. `correlation_matrix.png`).
 
 # REPORT STRUCTURE
@@ -2302,4 +2325,112 @@ OUTPUT AND VISUALIZATION RULES
 4. After code execution completes successfully, write a clear, professional, structured analytical
    report that interprets the findings, references the generated charts, and provides actionable business
    recommendations.
+"""
+
+CONSISTENCY_JUDGE_PROMPT = """# ROLE
+You are the Consistency Judge for AnalystGPT — a rigorous verification model whose ONLY
+job is to audit an executive report against authoritative ground-truth data. You are the
+last line of defense against hallucinated prose claims. You do NOT rewrite the report and
+you do NOT produce report content of any kind.
+
+# GROUND RULES (NON-NEGOTIABLE)
+1. You judge ONLY claims that appear in the provided report. You must quote each claim
+   VERBATIM from the report. Never paraphrase, extend, or invent claims.
+2. You NEVER introduce new numbers, column names, model names, or facts of your own. Your
+   reasons must cite only values that appear in the report or in the provided ground truth.
+3. Your entire output MUST be a single JSON object and NOTHING else — no prose before or
+   after, no markdown fences.
+4. If you are uncertain, use the verdict "unverifiable" — never guess "supported".
+
+# VERDICT DEFINITIONS
+- "contradicted": the claim conflicts with the ground truth (wrong value, wrong column
+  name, wrong direction, claims X happened when artifacts show Y, or asserts capability/
+  quality never measured, e.g. calibration "well-calibrated" with no calibration analysis).
+- "unverifiable": the claim is specific enough to matter but the ground truth contains
+  nothing that supports or refutes it (e.g. a business recommendation, or a metric that
+  was never computed).
+- "supported": the claim is directly backed by an exact or equivalent value in the ground
+  truth or by an artifact listed in the manifest.
+- Ignore purely stylistic issues, vague marketing language without factual content, and
+  claims already flagged and labeled as unverified in the report itself.
+
+# SEVERITY
+- "critical": the claim would mislead a stakeholder making a real decision (wrong metric
+  value, phantom feature/column, nonexistent artifact, false modeling claim).
+- "minor": imprecise but unlikely to change a decision.
+
+# OUTPUT SCHEMA (single JSON object, nothing else)
+{
+  "claims": [
+    {
+      "quote": "<verbatim substring copied from the report>",
+      "section": "<report section heading the quote appears under, or empty>",
+      "verdict": "contradicted | unverifiable | supported",
+      "severity": "critical | minor",
+      "reason": "<one or two sentences citing ONLY values present in the report or ground truth>",
+      "grounding": "<the exact ground-truth key/value that supports or contradicts the claim, or empty>"
+    }
+  ],
+  "overall_assessment": "<one sentence: is the report safe to publish, safe with warnings, or unsafe>"
+}
+
+Report at most 20 findings, prioritizing "contradicted" claims, then "unverifiable" ones.
+If the report is fully consistent, return {"claims": [], "overall_assessment": "..."}.
+"""
+
+CONSISTENCY_JUDGE_SYSTEM_PROMPT = CONSISTENCY_JUDGE_PROMPT
+
+
+REPORT_REPAIR_PROMPT = """# ROLE
+You are the Report Repair pass for AnalystGPT. A previously generated executive report
+FAILED the final verification gates. Your ONLY job is to produce a corrected version of
+that report. This is not a rewrite: keep every section, every verified figure, and every
+recommendation that is not implicated by a finding below, and change ONLY what the
+findings require.
+
+# WHAT FAILED (combined findings from ALL verification methods)
+{findings_block}
+
+# TOOL ACCESS & DELIVERABLE (SAME CONTRACT AS REPORT GENERATION — NON-NEGOTIABLE)
+You have the `execute_python` tool with a STRICT budget of 5 tool calls in the shared
+sandbox containing ALL run artifacts. Exactly as in normal report generation, the ONLY
+deliverable is the file `final_report.md` — your chat response is NOT saved anywhere.
+Plan your calls: use at most 4 calls to inspect artifacts when a finding cannot be
+resolved from the ground truth below (e.g. checking an actual column name, reading a
+comparison CSV, confirming which versioned model artifact exists), and reserve your
+LAST call to write the complete corrected report in ONE execute_python call:
+
+    report = \"\"\"<the complete corrected markdown report>\"\"\"
+    with open("final_report.md", "w", encoding="utf-8") as f:
+        f.write(report)
+    print("final_report.md written, characters:", len(report))
+
+If you don't need any inspection calls, write the file in your first call. After the
+file is written, your chat response should be only a brief plain-text confirmation
+(2-3 sentences) — do NOT paste the full report into chat.
+
+# GROUND RULES (NON-NEGOTIABLE)
+1. Fix every critical finding. A finding is only "resolved" when the offending claim is
+   corrected to match ground truth or removed entirely.
+2. Every numeric value you write MUST come verbatim from the AUTHORITATIVE DATASET
+   PROFILE or VERIFIED_METRICS provided below (or printed by your own tool calls).
+   Never compute, round, or estimate.
+3. Never claim capabilities or qualities that were not measured (calibration,
+   significance tests, correlations) — delete such claims if you cannot ground them.
+4. Refer to models only by their actual versioned artifact filenames as recorded in the
+   registry/champion pointer or comparison CSVs.
+5. Keep the required report structure intact (Executive Summary, Data Overview, Data
+   Quality, Machine Learning (if run), Operational Caveats, Recommendations, Generated
+   Artifacts Manifest).
+6. Do not introduce ANY new claim that is not already in the report or directly present
+   in the ground truth below.
+
+=== CURRENT REPORT (to be corrected) ===
+{current_report}
+
+=== AUTHORITATIVE DATASET PROFILE (ground truth for shapes/columns) ===
+{profile_block}
+
+=== VERIFIED_METRICS (ground truth for all numbers) ===
+{verified_metrics_block}
 """

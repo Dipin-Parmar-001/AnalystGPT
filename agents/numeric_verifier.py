@@ -30,6 +30,8 @@ class NumericClaim:
     is_percentage: bool
     context: str
     line_number: int
+    section: str = ""            # report section the claim appears in
+    provenance: Optional[str] = None  # VERIFIED_METRICS path that grounded this claim
 
 
 @dataclass
@@ -41,6 +43,8 @@ class VerificationResult:
     verified_claims: List[NumericClaim] = field(default_factory=list)
     unverified_claims: List[NumericClaim] = field(default_factory=list)
     correction_prompt: str = ""
+    # claim.raw_str -> provenance path(s) in VERIFIED_METRICS, for auditability
+    provenance_map: Dict[str, List[str]] = field(default_factory=dict)
 
 
 # Ignore patterns for headers, list bullets, years, standard phrases
@@ -50,6 +54,13 @@ RE_STEP_OR_TASK = re.compile(r"\b(?:step|task|phase|section|figure|table|chart|p
 RE_TOP_N = re.compile(r"\b(?:top|bottom|first|last|next|prior)\s+\d+\b", re.IGNORECASE)
 RE_YEAR = re.compile(r"\b(?:19\d\d|20[0-3]\d)\b")
 RE_FILE_EXT_DIGIT = re.compile(r"\b[\w\-]+_task_\d+\b|\b[\w\-]+\.\w+\b", re.IGNORECASE)
+# Benign prose numbers that are not data claims: bucket/range boundaries
+# ("0-12 months", "13-24"), train/test split notation ("80/20"), and file sizes
+# ("1.35 MB"). Masking these keeps the gate focused on substantive metrics.
+RE_NUMERIC_RANGE = re.compile(r"\b\d+\s*[-\u2013\u2014]\s*\d+\b")
+RE_SPLIT_FRACTION = re.compile(r"\b\d+\s*/\s*\d+\b")
+RE_FILE_SIZE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:MB|KB|GB|TB|bytes?)\b", re.IGNORECASE)
+RE_PLUS_SUFFIX = re.compile(r"\b\d+\+")
 
 
 def _safe_float_parse(s: str) -> Optional[float]:
@@ -76,6 +87,7 @@ def extract_numeric_claims(markdown_text: str) -> List[NumericClaim]:
         return claims
 
     in_code_block = False
+    current_section = ""
     lines = markdown_text.splitlines()
 
     for line_idx, line in enumerate(lines, start=1):
@@ -87,6 +99,11 @@ def extract_numeric_claims(markdown_text: str) -> List[NumericClaim]:
             continue
         if in_code_block or not stripped:
             continue
+
+        # Track the current ## section so each claim can be attributed
+        header_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if header_match:
+            current_section = header_match.group(2).strip()
 
         # Skip pure header lines where numbers might just be section numbers
         if stripped.startswith("#"):
@@ -107,6 +124,14 @@ def extract_numeric_claims(markdown_text: str) -> List[NumericClaim]:
         working_line = RE_TOP_N.sub(" [TOP_N] ", working_line)
         # 3. File names: "analyst_summary_task_1.json", "chart1.png"
         working_line = re.sub(r"\b[\w\-]+_task_\d+\b|\b[A-Za-z0-9_\-]+\.[A-Za-z]{2,5}\b", " [FILE] ", working_line)
+        # 4. Bucket/range boundaries: "0-12 months", "13-24"
+        working_line = RE_NUMERIC_RANGE.sub(" [RANGE] ", working_line)
+        # 5. Split notation: "80/20"
+        working_line = RE_SPLIT_FRACTION.sub(" [SPLIT] ", working_line)
+        # 6. File sizes: "1.35 MB"
+        working_line = RE_FILE_SIZE.sub(" [SIZE] ", working_line)
+        # 7. Open-ended thresholds: "49+"
+        working_line = RE_PLUS_SUFFIX.sub(" [THRESHOLD_PLUS] ", working_line)
 
         # Regex to capture numeric tokens: percentages, floats, comma-ints, standalone ints
         # Matches patterns like 0.851, 1,397.47, 26.54%, 7043, 199, -0.45, etc.
@@ -139,7 +164,8 @@ def extract_numeric_claims(markdown_text: str) -> List[NumericClaim]:
                 num_val=val,
                 is_percentage=is_pct,
                 context=context_snippet,
-                line_number=line_idx
+                line_number=line_idx,
+                section=current_section,
             ))
 
     return claims
@@ -181,6 +207,49 @@ def _collect_numbers_from_structure(data: Any, num_pool: Set[float], str_pool: S
             _collect_numbers_from_structure(item, num_pool, str_pool)
 
 
+def _flatten_metrics(data: Any, path: str = "", out: Optional[List[Tuple[str, Any]]] = None) -> List[Tuple[str, Any]]:
+    """Flattens VERIFIED_METRICS into (json_path, value) pairs for provenance tracking."""
+    if out is None:
+        out = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            _flatten_metrics(v, f"{path}.{k}" if path else str(k), out)
+    elif isinstance(data, (list, tuple)):
+        for i, v in enumerate(data):
+            _flatten_metrics(v, f"{path}[{i}]", out)
+    else:
+        out.append((path, data))
+    return out
+
+
+def _claim_decimals(claim: "NumericClaim") -> int:
+    """Number of decimal places in the claim's raw numeric string."""
+    s = claim.raw_str.rstrip("%")
+    return len(s.split(".")[1]) if "." in s else 0
+
+
+def _pct_conversion_tolerance(claim: "NumericClaim") -> float:
+    """
+    Precision-aware tolerance for percentage<->fraction conversion.
+    A claim of '26.5%' implies fraction precision 0.001, so half a step (5e-4)
+    is allowed; '99.98%' implies 0.0001 precision and only 5e-5 is allowed.
+    This prevents a fabricated '99.98%' from matching a ground-truth 1.0.
+    """
+    return max(0.5 * (10 ** -(_claim_decimals(claim) + 2)), 1e-4)
+
+
+def _direct_match_tolerance(claim: "NumericClaim") -> float:
+    """
+    Tolerance for matching the claim value directly against pool numbers.
+    Percentage claims are matched at half their last-digit step (so '99.98%'
+    cannot match a ground-truth 100.0 via a loose relative tolerance); other
+    claims keep a small absolute + relative window for float formatting drift.
+    """
+    if claim.is_percentage:
+        return max(0.5 * (10 ** -_claim_decimals(claim)), 1e-3)
+    return 1e-3
+
+
 class GroundTruthMatcher:
     """Matches candidate numbers against indexed verified ground truth."""
 
@@ -193,35 +262,62 @@ class GroundTruthMatcher:
     def _build_pool(self):
         _collect_numbers_from_structure(self.verified_metrics, self.num_pool, self.str_pool)
 
-    def is_match(self, claim: NumericClaim, tolerance: float = 1e-3) -> bool:
+    def find_matches(self, claim: NumericClaim, tolerance: float = 1e-3) -> List[str]:
         """
-        Determines if a numeric claim matches any ground-truth metric.
-        Checks:
-        1. Exact string match (e.g. '102,058', '0.8543', '85.4%')
-        2. Float value match within tolerance
-        3. Percentage conversions: e.g. claim '85.43%' (val 85.43) vs pool float 0.8543 (or 85.43)
-        4. Integer rounding
+        Returns the VERIFIED_METRICS json-paths that ground this claim (empty if none).
+        Matching semantics are preserved from the original pool-based matcher
+        (num_pool includes rounded variants of every value); provenance paths are
+        derived from the flattened raw structure where an exact path exists.
         """
         val = claim.num_val
         raw = claim.raw_str
 
-        # 1. Exact string match in pool
-        if raw in self.str_pool or raw.replace(",", "") in self.str_pool:
-            return True
-
-        # 2. Direct float match
+        # 1. Numeric pool match (includes rounded variants added in _build_pool)
+        pct_tol = _pct_conversion_tolerance(claim)
+        direct_tol = _direct_match_tolerance(claim)
+        pool_match = False
         for target in self.num_pool:
-            if math.isclose(val, target, abs_tol=tolerance, rel_tol=0.01):
-                return True
+            if math.isclose(val, target, abs_tol=direct_tol):
+                pool_match = True
+                break
             # Check if claim was a percentage e.g. 85.4% (val=85.4) matching 0.854 in pool
-            if claim.is_percentage:
-                if math.isclose(val / 100.0, target, abs_tol=tolerance, rel_tol=0.01):
-                    return True
+            if claim.is_percentage and math.isclose(val / 100.0, target, abs_tol=pct_tol):
+                pool_match = True
+                break
             # Or pool had a percentage (85.4) and claim is decimal (0.854)
-            if math.isclose(val * 100.0, target, abs_tol=tolerance, rel_tol=0.01):
-                return True
+            if math.isclose(val * 100.0, target, abs_tol=tolerance):
+                pool_match = True
+                break
 
-        return False
+        # 2. Exact string match in pool
+        string_match = raw in self.str_pool or raw.replace(",", "") in self.str_pool
+
+        if not pool_match and not string_match:
+            return []
+
+        # Derive provenance paths from the raw structure (best effort)
+        matched_paths: List[str] = []
+        for path, target_val in _flatten_metrics(self.verified_metrics):
+            if isinstance(target_val, (int, float)) and not isinstance(target_val, bool):
+                target = float(target_val)
+                if math.isnan(target) or math.isinf(target):
+                    continue
+                if math.isclose(val, target, abs_tol=direct_tol):
+                    matched_paths.append(path)
+                elif claim.is_percentage and math.isclose(val / 100.0, target, abs_tol=pct_tol):
+                    matched_paths.append(path)
+                elif math.isclose(val * 100.0, target, abs_tol=tolerance):
+                    matched_paths.append(path)
+            elif isinstance(target_val, str) and target_val.strip() in {raw, raw.replace(",", "")}:
+                matched_paths.append(path)
+            if len(matched_paths) >= 3:
+                break
+
+        return matched_paths or ["<string-match>"]
+
+    def is_match(self, claim: NumericClaim, tolerance: float = 1e-3) -> bool:
+        """Boolean convenience wrapper around find_matches."""
+        return bool(self.find_matches(claim, tolerance))
 
 
 def verify_report_numbers(report_text: str, verified_metrics: Dict[str, Any]) -> VerificationResult:
@@ -236,9 +332,16 @@ def verify_report_numbers(report_text: str, verified_metrics: Dict[str, Any]) ->
 
     verified_list: List[NumericClaim] = []
     unverified_list: List[NumericClaim] = []
+    provenance_map: Dict[str, List[str]] = {}
 
     for c in claims:
-        if matcher.is_match(c):
+        matched_paths = matcher.find_matches(c)
+        if matched_paths:
+            c.provenance = matched_paths[0]
+            provenance_map.setdefault(c.raw_str, [])
+            for p in matched_paths:
+                if p not in provenance_map[c.raw_str]:
+                    provenance_map[c.raw_str].append(p)
             verified_list.append(c)
         else:
             unverified_list.append(c)
@@ -249,7 +352,10 @@ def verify_report_numbers(report_text: str, verified_metrics: Dict[str, Any]) ->
     if not is_valid:
         mismatch_lines = []
         for u in unverified_list[:15]:  # limit to top 15 distinct issues
-            mismatch_lines.append(f"- Line {u.line_number}: Claimed value `{u.raw_str}` in context: \"...{u.context}...\"")
+            section_note = f" [section: {u.section}]" if u.section else ""
+            mismatch_lines.append(
+                f"- Line {u.line_number}{section_note}: Claimed value `{u.raw_str}` in context: \"...{u.context}...\""
+            )
 
         correction_prompt = (
             "AUTOMATED NUMERIC VERIFICATION FAILED:\n"
@@ -269,7 +375,8 @@ def verify_report_numbers(report_text: str, verified_metrics: Dict[str, Any]) ->
         unverified_count=len(unverified_list),
         verified_claims=verified_list,
         unverified_claims=unverified_list,
-        correction_prompt=correction_prompt
+        correction_prompt=correction_prompt,
+        provenance_map=provenance_map,
     )
 
 

@@ -8,7 +8,8 @@ Prevents hallucination where agents claim to have generated files that don't exi
 import os
 import json
 import re
-from typing import List, Dict, Any, Optional, Tuple, Union
+import glob
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -303,6 +304,13 @@ def validate_artifacts(
             if not find_artifact_semantic(output_dir, required):
                 missing_artifacts.append(required)
 
+    # ML model-comparison contract: at least one immutable versioned model file
+    # must exist (e.g. logistic_regression_p0.pkl). The legacy mutable
+    # 'best_model.pkl' is NOT an acceptable substitute.
+    if agent_name == "MLAgent" and task_type == "model_comparison":
+        if not glob.glob(os.path.join(output_dir, "*_p*.pkl")):
+            missing_artifacts.append("versioned model artifact (e.g. logistic_regression_p0.pkl)")
+
     # Validate report structure if this is a reporter agent
     report_structure_valid = True
     report_structure_issues = []
@@ -365,8 +373,10 @@ def get_required_artifacts(agent_name: str, task_type: Optional[str] = None) -> 
                 "predictions.csv",
                 "ml_summary.json",
                 "model_registry.json",
-                "champion_model.json",
-                "best_model.pkl"
+                "champion_model.json"
+                # Versioned model artifacts (e.g. logistic_regression_p0.pkl) are also
+                # mandatory per the ML contract but their names are model-family
+                # dependent, so they are enforced by the *_p*.pkl glob check below.
             ]
         elif task_type == "hyperparameter_tuning":
             return [

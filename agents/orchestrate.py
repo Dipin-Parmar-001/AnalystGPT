@@ -43,6 +43,8 @@ from agents.artifact_validator import (
     build_hallucination_warning_prompt,
     ValidationResult
 )
+from agents.run_context import build_dataset_profile, render_dataset_profile_block
+from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
 
 
 try:
@@ -101,7 +103,26 @@ class WorkflowOrchestrator:
 
         # Artifact validation settings
         self.max_validation_retries: int = 2  # Max times to re-prompt agent for missing artifacts
-        self.extra_tool_calls_on_retry: int = 3  # Extra tool calls when retrying after validation failure
+
+        # Post-report repair loop: max correction passes after the final report is
+        # written. Each pass verifies with ALL methods (numeric verifier, consistency
+        # checker, LLM judge), combines findings into ONE prompt, and repairs via a
+        # single tool-free LLM call (no tool budget consumed).
+        self.max_repair_attempts: int = 2
+
+        # Hybrid verification & severity policy settings
+        self.enable_consistency_judge: bool = True   # LLM prose-consistency judge (hybrid stack)
+        self.judge_model: Optional[str] = None       # Defaults to reporter_model
+        self.severity_thresholds: Dict[str, int] = {
+            "max_critical_findings": 0,  # >0 critical findings => failed-consistency
+        }
+        self._consistency_judge_instance: Optional[Any] = None
+
+        # Populated at the end of every execute_plan run (also persisted to disk)
+        self.last_run_findings: List[Dict[str, Any]] = []
+        self.last_run_manifest: Dict[str, Any] = {}
+        self.consistency_report: Optional[Any] = None
+        self.repair_attempts_used: int = 0
 
     def reset(self, keep_sandbox: bool = False):
         """Resets orchestrator state, memory, and optionally global sandbox."""
@@ -111,6 +132,10 @@ class WorkflowOrchestrator:
         self.final_report = ""
         self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token = None
+        self.last_run_findings = []
+        self.last_run_manifest = {}
+        self.consistency_report = None
+        self.repair_attempts_used = 0
 
         if not keep_sandbox and reset_global_sandbox_manager is not None:
             try:
@@ -133,6 +158,229 @@ class WorkflowOrchestrator:
         return {
             "status": "idle",
             "message": "No active execution was running to cancel."
+        }
+
+    def _get_consistency_judge(self):
+        """Lazily instantiates the LLM consistency judge (hybrid verification layer)."""
+        if self._consistency_judge_instance is not None:
+            return self._consistency_judge_instance
+        try:
+            from agents.consistency_judge import ConsistencyJudge
+            self._consistency_judge_instance = ConsistencyJudge(
+                model_name=self.judge_model or self.reporter_model
+            )
+            return self._consistency_judge_instance
+        except Exception as judge_err:
+            print(f"[Orchestrator Notice] ConsistencyJudge unavailable: {judge_err}")
+            return None
+
+    def _run_final_verification(self, query_text: str, active_plan) -> Dict[str, Any]:
+        """
+        Full verification pass over the current final report using ALL methods:
+        1. Deterministic numeric verification (report claims vs VERIFIED_METRICS)
+        2. Deterministic cross-artifact consistency checks
+        3. LLM prose-consistency judge (skipped if unavailable)
+
+        Returns {"findings": [..], "verified_metrics": {..}, "numeric": {..}} where
+        findings is the merged list consumed by the repair loop and severity policy.
+        """
+        findings: List[Dict[str, Any]] = []
+
+        # Ground-truth metrics for numeric verification
+        verified_metrics: Dict[str, Any] = {}
+        vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
+        if os.path.exists(vm_path):
+            try:
+                with open(vm_path, "r", encoding="utf-8", errors="replace") as f:
+                    verified_metrics = json.load(f)
+            except Exception:
+                verified_metrics = {}
+
+        # 1. Numeric verification of the report itself
+        numeric_summary: Dict[str, Any] = {}
+        if self.final_report and verified_metrics:
+            try:
+                from agents.numeric_verifier import verify_report_numbers
+                numeric_res = verify_report_numbers(self.final_report, verified_metrics)
+                numeric_summary = {
+                    "is_valid": numeric_res.is_valid,
+                    "total_claims": numeric_res.total_claims_count,
+                    "verified_count": numeric_res.verified_count,
+                    "unverified_count": numeric_res.unverified_count,
+                    "unverified_samples": [c.raw_str for c in numeric_res.unverified_claims[:10]],
+                }
+                if not numeric_res.is_valid:
+                    for c in numeric_res.unverified_claims[:10]:
+                        findings.append({
+                            "severity": "minor",
+                            "code": "unverified_numeric_claim",
+                            "message": f"Numeric claim '{c.raw_str}' in section '{c.section or '?'}' is not grounded in VERIFIED_METRICS (context: \"{c.context[:80]}\").",
+                            "artifacts": ["final_report.md"],
+                            "source": "numeric_verifier",
+                        })
+            except Exception as num_err:
+                print(f"[Orchestrator Notice] numeric verification failed: {num_err}")
+
+        # 2. Deterministic cross-artifact consistency checks
+        try:
+            consistency_report = run_consistency_checks(
+                self.current_output_dir,
+                report_text=self.final_report,
+                uploaded_files=None,
+                persist=True,
+            )
+            self.consistency_report = consistency_report
+            findings.extend([asdict(f) for f in consistency_report.findings])
+        except Exception as check_err:
+            print(f"[Orchestrator Notice] consistency checks failed: {check_err}")
+
+        # 3. LLM prose-consistency judge
+        if self.enable_consistency_judge and self.final_report:
+            judge = self._get_consistency_judge()
+            if judge is not None:
+                try:
+                    from agents.consistency_judge import judge_result_to_findings
+                    judge_res = judge.judge_report(
+                        report_text=self.final_report,
+                        verified_metrics=verified_metrics,
+                        consistency_findings=findings,
+                    )
+
+                    # Persist judge output for auditability
+                    try:
+                        with open(os.path.join(self.current_output_dir, "judge_result.json"), "w", encoding="utf-8") as jf:
+                            json.dump(judge_res.to_dict(), jf, indent=2, default=str)
+                    except Exception:
+                        pass
+
+                    findings.extend(judge_result_to_findings(judge_res))
+                    print(f"[Orchestrator] ConsistencyJudge: {len(judge_res.claims)} claim(s) judged, "
+                          f"{len(judge_res.contradicted)} contradicted, {judge_res.discarded_claims} discarded by guardrails")
+                except Exception as judge_err:
+                    print(f"[Orchestrator Notice] consistency judge failed: {judge_err}")
+
+        self.last_run_findings = findings
+        return {
+            "findings": findings,
+            "verified_metrics": verified_metrics,
+            "numeric": numeric_summary,
+        }
+
+    def _repair_final_report(self, verification: Dict[str, Any], files_list: List[str],
+                             step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> int:
+        """
+        Post-report repair loop. While critical findings remain and attempts are
+        left: combine ALL findings (numeric + consistency + judge) into ONE
+        correction prompt and repair via a compact agent turn with a dedicated
+        5-call sandbox budget, then re-verify with all methods. Returns the
+        number of repair attempts used.
+        """
+        def _cb(event: str, data: Dict[str, Any]):
+            if step_callback:
+                try:
+                    step_callback(event, data)
+                except BaseException:
+                    pass
+
+        repair_attempts_used = 0
+        while repair_attempts_used < self.max_repair_attempts:
+            critical = [f for f in verification["findings"] if f.get("severity") == "critical"]
+            if not critical:
+                break
+
+            repair_attempt_no = repair_attempts_used + 1
+            _cb("report_repair_started", {
+                "attempt": repair_attempt_no,
+                "max_attempts": self.max_repair_attempts,
+                "critical_count": len(critical),
+            })
+
+            print(f"[Orchestrator] Report repair attempt {repair_attempt_no}/{self.max_repair_attempts} "
+                  f"({len(critical)} critical finding(s))...")
+
+            try:
+                profile_block = render_dataset_profile_block(
+                    build_dataset_profile(self.current_output_dir, files_list, persist=False)
+                )
+            except Exception:
+                profile_block = ""
+
+            corrected = self.reporter_agent.repair_report(
+                current_report=self.final_report,
+                findings=verification["findings"],
+                verified_metrics=verification.get("verified_metrics") or {},
+                profile_block=profile_block,
+                max_tool_calls=5,
+                cancellation_token=self.cancellation_token,
+            )
+
+            if not corrected or corrected == self.final_report:
+                print("[Orchestrator] Repair produced no changed report; stopping repair loop.")
+                break
+
+            self.final_report = corrected
+            try:
+                with open(os.path.join(self.current_output_dir, "final_report.md"), "w", encoding="utf-8") as rf:
+                    rf.write(self.final_report)
+            except Exception as write_err:
+                print(f"[Orchestrator Warning] Failed to save repaired report: {write_err}")
+
+            repair_attempts_used += 1
+            _cb("report_repair_completed", {
+                "attempt": repair_attempt_no,
+                "report_length": len(self.final_report),
+            })
+
+            # Re-verify the repaired report with ALL methods
+            verification = self._run_final_verification(query_text="", active_plan=None)
+
+        self.repair_attempts_used = repair_attempts_used
+        return repair_attempts_used
+
+    def _classify_run_status(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Severity-based failure policy (user-confirmed decision):
+        - fatal task errors                -> "failed"
+        - critical findings (post-retry)   -> "failed-consistency": findings surfaced
+                                              instead of a polished report
+        - minor findings only              -> "completed_with_warnings"
+        - clean                            -> "completed"
+        """
+        failed_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "failed"]
+        validation_failed_tasks = [tr for tr in self.completed_task_results if tr.get("validation_failed", False)]
+        critical_findings = [f for f in findings if f.get("severity") == "critical"]
+        minor_findings = [f for f in findings if f.get("severity") == "minor"]
+
+        max_critical = int(self.severity_thresholds.get("max_critical_findings", 0))
+
+        if failed_tasks:
+            status = "failed"
+            message = f"Workflow failed: {len(failed_tasks)} task(s) failed with errors."
+        elif len(critical_findings) > max_critical:
+            status = "failed-consistency"
+            message = (
+                f"Workflow produced {len(critical_findings)} critical consistency finding(s) that "
+                f"survived retries. The report is NOT cleared for delivery; review the findings."
+            )
+        elif validation_failed_tasks:
+            status = "failed-consistency"
+            message = f"Workflow completed but {len(validation_failed_tasks)} task(s) failed artifact validation."
+        elif minor_findings:
+            status = "completed_with_warnings"
+            message = f"Workflow completed with {len(minor_findings)} minor consistency warning(s). See findings."
+        else:
+            status = "completed"
+            message = "Workflow execution completed successfully; all verification gates passed."
+
+        return {
+            "status": status,
+            "message": message,
+            "counts": {
+                "critical_findings": len(critical_findings),
+                "minor_findings": len(minor_findings),
+                "tasks_failed": len(failed_tasks),
+                "tasks_validation_failed": len(validation_failed_tasks),
+            },
         }
 
     def _collect_agent_summaries(self, output_dir: str) -> Dict[str, Any]:
@@ -346,6 +594,18 @@ class WorkflowOrchestrator:
         if hasattr(self.tool_manager, "set_output_dir"):
             self.tool_manager.set_output_dir(self.current_output_dir)
 
+        # Authoritative dataset profile: rebuilt from disk before every task
+        # dispatch so agents never re-derive shapes/columns from memory.
+        dataset_profile: Dict[str, Any] = build_dataset_profile(self.current_output_dir, files_list)
+
+        def _refresh_dataset_profile() -> str:
+            nonlocal dataset_profile
+            try:
+                dataset_profile = build_dataset_profile(self.current_output_dir, files_list)
+            except Exception as profile_err:
+                print(f"[Orchestrator Notice] dataset profile refresh failed: {profile_err}")
+            return render_dataset_profile_block(dataset_profile)
+
         def _safe_callback(event: str, data: Dict[str, Any]):
             if step_callback:
                 try:
@@ -441,10 +701,14 @@ class WorkflowOrchestrator:
                                         max_retries=max_retries
                                     )
 
-                            # Determine tool call budget for this attempt
+                            # Tool call budget: fixed per task. Validation retries do
+                            # NOT grant extra calls — the agent must fit its corrected
+                            # work inside the same budget (user-confirmed policy).
                             current_tool_budget = max_tool_calls_per_agent
-                            if attempt > 0:
-                                current_tool_budget += self.extra_tool_calls_on_retry  # +3 extra calls on retry
+
+                            # Rebuild the authoritative dataset profile from disk for this
+                            # attempt so prompts always carry the current ground truth.
+                            profile_block = _refresh_dataset_profile()
 
                             # Use validation errors from the immediately previous attempt
                             validation_errors = last_validation_errors
@@ -476,6 +740,7 @@ class WorkflowOrchestrator:
                                         report_structure_valid=False,
                                         report_structure_issues=[]
                                     ), agent_class_name, '', task.description)}\n\nOriginal Query: {query_text}"
+                                reporter_prompt = f"{reporter_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
                                     prompt=reporter_prompt,
@@ -530,8 +795,10 @@ class WorkflowOrchestrator:
                                 )
 
                                 if is_hpt_task:
-                                    # Validate presence of model comparison artifacts
-                                    model_artifacts = ["model_comparison.csv", "best_model.pkl"]
+                                    # Validate presence of model comparison artifacts.
+                                    # The champion pointer (not a mutable best_model.pkl)
+                                    # is the canonical trained-model reference.
+                                    model_artifacts = ["model_comparison.csv", "champion_model.json"]
                                     missing_model_artifacts = [
                                         art for art in model_artifacts
                                         if art not in self.generated_artifacts and not os.path.exists(os.path.join(self.current_output_dir, art))
@@ -556,12 +823,12 @@ class WorkflowOrchestrator:
                                         return
 
                                     # Add comparison artifacts to ml_files
-                                    for art in ["model_comparison.csv", "best_model.pkl", "ml_summary.json"]:
+                                    for art in ["model_comparison.csv", "champion_model.json", "model_registry.json", "ml_summary.json"]:
                                         art_path = os.path.join(self.current_output_dir, art)
                                         if os.path.exists(art_path) and art_path not in ml_files and art not in ml_files:
                                             ml_files.append(art_path)
 
-                                    data_context_note = f"\n[INPUT DATASET CONTEXT]: Load trained model from 'best_model.pkl' and baseline scores from 'model_comparison.csv'. Dataset is '{current_dataset_file or 'dataset.csv'}'."
+                                    data_context_note = f"\n[INPUT DATASET CONTEXT]: Load the champion model referenced by 'champion_model.json' (an immutable versioned artifact, e.g. logistic_regression_p0.pkl) and baseline scores from 'model_comparison.csv'. Dataset is '{current_dataset_file or 'dataset.csv'}'. NEVER load a mutable 'best_model.pkl'."
                                 elif current_dataset_file:
                                     data_context_note = f"\n[INPUT DATASET CONTEXT]: Processed dataset is available as '{current_dataset_file}'. Load and train on this dataset directly (e.g. pd.read_csv('{current_dataset_file}')). Do NOT re-calculate raw duplicate/missing values."
                                 else:
@@ -580,6 +847,7 @@ class WorkflowOrchestrator:
                                         report_structure_valid=True,
                                         report_structure_issues=[]
                                     ), agent_class_name, '', task.description)}\n\n{ml_prompt}"
+                                ml_prompt = f"{ml_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
                                     prompt=ml_prompt,
@@ -613,6 +881,7 @@ class WorkflowOrchestrator:
                                         report_structure_valid=True,
                                         report_structure_issues=[]
                                     ), agent_class_name, '', task.description)}\n\n{analyst_prompt}"
+                                analyst_prompt = f"{analyst_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
                                     prompt=analyst_prompt,
@@ -641,7 +910,7 @@ class WorkflowOrchestrator:
                                     ), 'DataAnalystAgent', '', task.description)}\n\n{fallback_prompt}"
 
                                 fallback_res = self.data_analyst_agent.run_task(
-                                    prompt=fallback_prompt,
+                                    prompt=f"{fallback_prompt}{profile_block}",
                                     uploaded_files=files_list,
                                     plan=active_plan,
                                     task_id=task.task_id,
@@ -951,24 +1220,105 @@ class WorkflowOrchestrator:
                     "output_dir": self.current_output_dir
                 })
 
-                # Determine overall workflow status based on task results
-                validation_failed_tasks = [tr for tr in self.completed_task_results if tr.get("validation_failed", False)]
+                # ==================================================================
+                # FINAL VERIFICATION PHASE (hybrid stack) + SEVERITY-BASED STATUS
+                # ==================================================================
+                # 1. Deterministic cross-artifact consistency checks
+                # 2. LLM prose-consistency judge (if enabled/available)
+                # 3. Severity policy classifies the run:
+                #    failed / failed-consistency / completed_with_warnings / completed
                 completed_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "completed"]
                 skipped_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "skipped"]
                 failed_tasks = [tr for tr in self.completed_task_results if tr.get("status") == "failed"]
-
+                validation_failed_tasks = [tr for tr in self.completed_task_results if tr.get("validation_failed", False)]
                 has_validation_failures = len(validation_failed_tasks) > 0
                 has_fatal_failures = len(failed_tasks) > 0
 
-                if has_fatal_failures:
-                    workflow_status = "failed"
-                    workflow_message = f"Workflow failed: {len(failed_tasks)} task(s) failed with errors."
-                elif has_validation_failures:
-                    workflow_status = "completed_with_validation_failures"
-                    workflow_message = f"Workflow completed but {len(validation_failed_tasks)} task(s) failed artifact validation."
-                else:
-                    workflow_status = "completed"
-                    workflow_message = "Workflow execution completed successfully."
+                _safe_callback("final_verification_started", {"output_dir": self.current_output_dir})
+                verification = self._run_final_verification(query_text, active_plan)
+
+                # Post-report repair loop: while critical findings remain, combine
+                # ALL findings (numeric + consistency + judge) into one correction
+                # prompt and repair (max max_repair_attempts, 5 dedicated sandbox
+                # calls per attempt), re-verifying with all methods after each.
+                self._repair_final_report(verification, files_list, step_callback=step_callback)
+                findings = verification["findings"]
+
+                classification = self._classify_run_status(findings)
+                workflow_status = classification["status"]
+                workflow_message = classification["message"]
+
+                # Persist the findings for the UI and post-run audits
+                try:
+                    with open(os.path.join(self.current_output_dir, "findings.json"), "w", encoding="utf-8") as ff:
+                        json.dump({
+                            "run_status": workflow_status,
+                            "message": workflow_message,
+                            "counts": classification["counts"],
+                            "repair_attempts_used": getattr(self, "repair_attempts_used", 0),
+                            "numeric_verification": verification.get("numeric"),
+                            "findings": findings,
+                        }, ff, indent=2, default=str)
+                except Exception as ff_err:
+                    print(f"[Orchestrator Notice] could not persist findings.json: {ff_err}")
+
+                # Severity policy: a failed-consistency run must NOT look like a
+                # polished deliverable. Prepend a prominent non-delivery banner.
+                if workflow_status == "failed-consistency" and self.final_report:
+                    critical_msgs = [f.get("message", "") for f in findings if f.get("severity") == "critical"][:8]
+                    banner_lines = [
+                        "> ⛔ **RUN NOT CLEARED FOR DELIVERY (`failed-consistency`)**",
+                        "> This report failed the final consistency verification. The findings below were",
+                        "> established after agent retries and remain unresolved:",
+                    ]
+                    for msg in critical_msgs:
+                        banner_lines.append(f"> - {msg}")
+                    banner_lines.append("> ")
+                    banner_lines.append("> Treat every figure below as unverified until the findings are resolved.")
+                    self.final_report = "\n".join(banner_lines) + "\n\n" + self.final_report
+                    report_filepath = os.path.join(self.current_output_dir, "final_report.md")
+                    try:
+                        with open(report_filepath, "w", encoding="utf-8") as rf:
+                            rf.write(self.final_report)
+                    except Exception as write_err:
+                        print(f"[Orchestrator Warning] Failed to update {report_filepath}: {write_err}")
+
+                # Build the run manifest (machine-readable run record)
+                run_manifest = {
+                    "run_id": os.path.basename(self.current_output_dir),
+                    "plan_id": active_plan.plan_id,
+                    "query": query_text,
+                    "input_files": files_list,
+                    "output_dir": self.current_output_dir,
+                    "started_at": run_timestamp,
+                    "finished_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    "run_status": workflow_status,
+                    "status_message": workflow_message,
+                    "severity_counts": classification["counts"],
+                    "repair_attempts_used": getattr(self, "repair_attempts_used", 0),
+                    "numeric_verification": verification.get("numeric"),
+                    "tasks": [
+                        {
+                            "task_id": tr.get("task_id"),
+                            "title": tr.get("title"),
+                            "agent": tr.get("agent"),
+                            "status": tr.get("status"),
+                            "validation_retries": tr.get("validation_retries", 0),
+                        }
+                        for tr in self.completed_task_results
+                    ],
+                    "artifacts": sorted(
+                        set(self.generated_artifacts)
+                        | {f for f in os.listdir(self.current_output_dir) if os.path.isfile(os.path.join(self.current_output_dir, f))}
+                    ) if os.path.isdir(self.current_output_dir) else sorted(set(self.generated_artifacts)),
+                    "findings": findings,
+                }
+                self.last_run_manifest = run_manifest
+                try:
+                    with open(os.path.join(self.current_output_dir, "run_manifest.json"), "w", encoding="utf-8") as mf:
+                        json.dump(run_manifest, mf, indent=2, default=str)
+                except Exception as mf_err:
+                    print(f"[Orchestrator Notice] could not persist run_manifest.json: {mf_err}")
 
                 # Log validation failures for debugging
                 if has_validation_failures:
@@ -1001,7 +1351,10 @@ class WorkflowOrchestrator:
                     "total_tasks": len(active_plan.tasks),
                     "artifacts": self.generated_artifacts,
                     "output_dir": self.current_output_dir,
-                    "final_report": self.final_report
+                    "final_report": self.final_report,
+                    "severity_counts": classification["counts"],
+                    "repair_attempts_used": getattr(self, "repair_attempts_used", 0),
+                    "findings": findings[:20]
                 })
 
                 return {
@@ -1010,7 +1363,12 @@ class WorkflowOrchestrator:
                     "task_results": self.completed_task_results,
                     "generated_artifacts": self.generated_artifacts,
                     "final_report": self.final_report,
-                    "output_dir": self.current_output_dir
+                    "output_dir": self.current_output_dir,
+                    "findings": findings,
+                    "severity_counts": classification["counts"],
+                    "repair_attempts_used": getattr(self, "repair_attempts_used", 0),
+                    "status_message": workflow_message,
+                    "run_manifest": run_manifest
                 }
 
             except WorkflowCancelledException as cancel_err:
@@ -1122,9 +1480,22 @@ class WorkflowOrchestrator:
         """
         self.cancellation_token = cancellation_token or CancellationToken()
 
+        # Give the planner the same authoritative profile so the plan itself
+        # references real shapes/columns from the start.
+        planner_context = dataset_context or ""
+        try:
+            profile = build_dataset_profile(
+                self.current_output_dir if os.path.isdir(self.current_output_dir) else WORKSPACE_ROOT,
+                files,
+                persist=False,
+            )
+            planner_context = f"{planner_context}\n{render_dataset_profile_block(profile)}".strip()
+        except Exception as profile_err:
+            print(f"[Orchestrator Notice] planner profile build failed: {profile_err}")
+
         plan = self.create_plan(
             user_query=user_query,
-            dataset_context=dataset_context,
+            dataset_context=planner_context,
             files=files,
             max_tool_calls_per_task=max_tool_calls_per_agent,
             step_callback=step_callback,

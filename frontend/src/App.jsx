@@ -8,6 +8,7 @@ import StatusAlertBanner from './components/StatusAlertBanner';
 import ReportViewer from './components/ReportViewer';
 import ArtifactsGallery from './components/ArtifactsGallery';
 import DatasetPreviewModal from './components/DatasetPreviewModal';
+import FindingsPanel from './components/FindingsPanel';
 
 import {
   Play,
@@ -53,6 +54,12 @@ export default function App() {
   const [artifacts, setArtifacts] = useState([]);
   const [finalReport, setFinalReport] = useState('');
   const [maxToolCalls, setMaxToolCalls] = useState(10);
+
+  // Verification findings (severity-based failure policy)
+  const [runStatus, setRunStatus] = useState(null); // null | completed | completed_with_warnings | failed-consistency | failed
+  const [severityCounts, setSeverityCounts] = useState(null);
+  const [findings, setFindings] = useState([]);
+  const [repairAttemptsUsed, setRepairAttemptsUsed] = useState(0);
 
   // Termination Confirmation Modal
   const [terminateModalOpen, setTerminateModalOpen] = useState(false);
@@ -164,11 +171,19 @@ export default function App() {
       loadArtifacts();
     } else if (event === 'workflow_completed') {
       setIsRunning(false);
-      setCurrentStatus('completed');
-      setStatusMessage(payload.message || 'Workflow execution completed successfully.');
+      // The orchestrator's run status carries the severity policy verdict:
+      // completed | completed_with_warnings | failed-consistency | failed
+      const verifiedStatus = payload.status || data?.run_status || 'completed';
+      setCurrentStatus(verifiedStatus);
+      setRunStatus(verifiedStatus);
+      setStatusMessage(payload.message || 'Workflow execution completed.');
       if (data?.final_report) setFinalReport(data.final_report);
+      if (data?.severity_counts) setSeverityCounts(data.severity_counts);
+      if (Array.isArray(data?.findings)) setFindings(data.findings);
+      if (typeof data?.repair_attempts_used === 'number') setRepairAttemptsUsed(data.repair_attempts_used);
       loadArtifacts();
       loadReport();
+      loadFindings();
     } else if (event === 'workflow_cancelled') {
       setIsRunning(false);
       setCurrentStatus('cancelled');
@@ -190,6 +205,10 @@ export default function App() {
       setPlan(null);
       setFinalReport('');
       setEvents([]);
+      setRunStatus(null);
+      setSeverityCounts(null);
+      setFindings([]);
+      setRepairAttemptsUsed(0);
       loadArtifacts();
     }
   };
@@ -229,8 +248,28 @@ export default function App() {
       if (data.status === 'success' && data.report) {
         setFinalReport(data.report);
       }
+      if (data.run_status) {
+        setRunStatus(data.run_status);
+        if (data.severity_counts) setSeverityCounts(data.severity_counts);
+        if (typeof data.repair_attempts_used === 'number') setRepairAttemptsUsed(data.repair_attempts_used);
+      }
     } catch (err) {
       console.error("Failed to load report", err);
+    }
+  };
+
+  const loadFindings = async () => {
+    try {
+      const res = await fetch('/api/workflow/findings');
+      const data = await res.json();
+      if (data.status === 'success') {
+        if (data.run_status) setRunStatus(data.run_status);
+        if (data.counts) setSeverityCounts(data.counts);
+        if (Array.isArray(data.findings)) setFindings(data.findings);
+        if (typeof data.repair_attempts_used === 'number') setRepairAttemptsUsed(data.repair_attempts_used);
+      }
+    } catch (err) {
+      console.error("Failed to load findings", err);
     }
   };
 
@@ -244,6 +283,14 @@ export default function App() {
         if (data.plan) setPlan(data.plan);
         if (data.final_report) setFinalReport(data.final_report);
         if (data.message) setStatusMessage(data.message);
+        if (data.run_status) {
+          setRunStatus(data.run_status);
+          if (data.severity_counts) setSeverityCounts(data.severity_counts);
+          if (Array.isArray(data.findings)) setFindings(data.findings);
+          if (typeof data.repair_attempts_used === 'number') setRepairAttemptsUsed(data.repair_attempts_used);
+        } else if (data.final_report) {
+          loadFindings();
+        }
       }
     } catch (err) {
       console.error("Failed to check status", err);
@@ -616,6 +663,14 @@ export default function App() {
             {/* Tab 2: Executive Report & Artifacts */}
             {activeTab === 'report_artifacts' && (
               <div className="space-y-6 animate-in fade-in">
+                {/* Verification Findings (severity-based failure policy) */}
+                <FindingsPanel
+                  runStatus={runStatus}
+                  severityCounts={severityCounts}
+                  findings={findings}
+                  repairAttemptsUsed={repairAttemptsUsed}
+                />
+
                 {/* Report Viewer */}
                 <ReportViewer
                   reportText={finalReport}

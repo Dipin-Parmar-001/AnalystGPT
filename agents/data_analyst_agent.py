@@ -657,8 +657,12 @@ class DataAnalystAgent:
                 "task_id": task_id_val,
                 "task_title": assigned_tasks[0].title if assigned_tasks else "Data Analysis",
                 "status": agent_status,
+                # Honesty marker: this summary was assembled structurally from
+                # on-disk artifacts, NOT written by the analyst agent. Downstream
+                # consumers must not treat unspecified details as verified.
+                "source": "fallback_structural_summary",
                 "dataset_overview": {
-                    "filename": os.path.basename(uploaded_files[0]) if uploaded_files else "dataset.csv",
+                    "filename": os.path.basename(target_ds) if target_ds else "dataset.csv",
                     "initial_shape": init_shape,
                     "processed_shape": clean_shape,
                     "numerical_columns": num_cols,
@@ -672,11 +676,17 @@ class DataAnalystAgent:
                         "retained": total_rows_val
                     },
                     "missing_values_handled": {},
-                    "imputation_methods": {"numerical": "median", "categorical": "mode"},
+                    # NOT fabricated: leave imputation/encoding empty unless actually
+                    # observed. An empty value means "not recorded by this fallback",
+                    # never "median/mode imputation was applied".
+                    "imputation_methods": {},
                     "identifier_columns_excepted": ["customerID (retained in dataset for prediction traceability)"] if "customerID" in cat_cols else [],
                     "dropped_columns": [],
-                    "encoding": {"method": "One-Hot Encoding (drop_first=True)"},
-                    "transformations": ["Exported cleaned_dataset.csv"]
+                    "encoding": {},
+                    "transformations": [
+                        name for name in ["Exported cleaned_dataset.csv"]
+                        if os.path.exists(os.path.join(output_dir, "cleaned_dataset.csv"))
+                    ]
                 },
                 "statistical_findings": {
                     "summary_metrics": {},
@@ -687,7 +697,10 @@ class DataAnalystAgent:
                     for gf in generated_files if gf.endswith((".png", ".jpg", ".jpeg"))
                 ],
                 "saved_artifacts": generated_files,
-                "issues_and_caveats": ["Data analysis execution completed."]
+                "issues_and_caveats": [
+                    "FALLBACK SUMMARY: generated structurally from artifacts because the agent did not produce its own summary JSON. Preprocessing details (imputation, encoding) are intentionally left empty rather than assumed.",
+                    "Data analysis execution completed."
+                ]
             }
             try:
                 os.makedirs(output_dir, exist_ok=True)

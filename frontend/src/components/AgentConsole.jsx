@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Terminal, Bot, ChevronDown, ChevronRight, Play, CheckCircle2, Code2, AlertCircle, Sparkles, Filter } from 'lucide-react';
+import { Terminal, Bot, ChevronDown, ChevronRight, Play, CheckCircle2, Code2, AlertCircle, Sparkles, Filter, ShieldCheck, ShieldAlert } from 'lucide-react';
 
 export default function AgentConsole({ events, isRunning }) {
   const [autoScroll, setAutoScroll] = useState(true);
@@ -244,6 +244,49 @@ export default function AgentConsole({ events, isRunning }) {
                     <span className="text-[10px] text-amber-400 font-normal">{timestamp}</span>
                   </div>
                   <p className="text-xs text-amber-200">{data.error || data.message}</p>
+                </div>
+              );
+            }
+
+            // 7. Final Verification & Repair Events
+            if (eventType === 'final_verification_started') {
+              return (
+                <div key={key} className="p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-700/60 flex items-center justify-between">
+                  <span className="text-xs font-semibold text-indigo-300 flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
+                    Final Verification: numeric gate + consistency checker + LLM judge
+                  </span>
+                  <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                </div>
+              );
+            }
+
+            if (eventType === 'report_repair_started') {
+              return (
+                <div key={key} className="p-3 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-300 space-y-1">
+                  <div className="flex items-center justify-between font-bold text-xs">
+                    <span className="flex items-center gap-1.5">
+                      <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+                      Report Repair Pass {data.attempt}/{data.max_attempts}
+                    </span>
+                    <span className="text-[10px] text-amber-400 font-normal">{timestamp}</span>
+                  </div>
+                  <p className="text-xs text-amber-200">
+                    {data.critical_count} critical finding(s) survived. Combining all verification findings into one
+                    correction prompt (repair agent gets 5 sandbox tool calls).
+                  </p>
+                </div>
+              );
+            }
+
+            if (eventType === 'report_repair_completed') {
+              return (
+                <div key={key} className="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-800/50 flex items-center justify-between">
+                  <span className="text-xs font-medium text-emerald-300 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                    Repair Pass {data.attempt} complete — re-verifying with all methods
+                  </span>
+                  <span className="text-slate-500 text-[10px]">{timestamp}</span>
                 </div>
               );
             }

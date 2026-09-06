@@ -692,22 +692,23 @@ class MLAgent:
                 "task_title": assigned_tasks[0].title if assigned_tasks else "Machine Learning Modeling",
                 "status": final_status,
                 "task_type": "classification" if conf_data else "regression",
+                # Honesty marker: structurally assembled from artifacts, NOT written
+                # by the ML agent. Unspecified details were NOT verified.
+                "source": "fallback_structural_summary",
                 "target_column": "target",
                 "features_used": [f.get("feature") for f in top_feats if isinstance(f, dict)],
-                "identifier_columns": ["customerID"],
+                "identifier_columns": [],
                 "preprocessing": {
                     "dataset_source": source_file,
-                    "identifier_columns_excluded": ["customerID"],
-                    "imputation_applied": {"numerical": "median", "categorical": "mode"},
-                    "encoding_applied": {"method": "One-Hot Encoding (drop_first=True)"},
-                    "target_encoding": "LabelEncoder",
-                    "scaling_applied": "StandardScaler (fitted strictly on X_train)",
-                    "train_test_split": {"test_size": 0.2, "random_state": 42, "stratified": True},
+                    # NOT fabricated: preprocessing details are left empty unless the
+                    # agent recorded them. Empty means "not recorded by this fallback".
+                    "imputation_applied": {},
+                    "encoding_applied": {},
+                    "target_encoding": "",
+                    "scaling_applied": "",
+                    "train_test_split": {},
                     "transformations": [
-                        f"Loaded dataset from {source_file}",
-                        "Preserved identifier columns in predictions.csv and excluded from X",
-                        "Applied One-Hot Encoding to categorical features (drop_first=True)",
-                        "StandardScaler fitted on X_train"
+                        f"Loaded dataset from {source_file}"
                     ]
                 },
                 "baseline_performance": baseline_data or {"model": "Dummy baseline", "metrics": {}},
@@ -730,7 +731,9 @@ class MLAgent:
                     {"file": gf, "description": f"Generated artifact: {gf}"}
                     for gf in generated_files
                 ],
-                "issues_and_caveats": []
+                "issues_and_caveats": [
+                    "FALLBACK SUMMARY: generated structurally from artifacts because the agent did not produce its own summary JSON. Preprocessing details (imputation, encoding, scaling, split) are intentionally left empty rather than assumed."
+                ]
             }
             try:
                 os.makedirs(output_dir, exist_ok=True)
