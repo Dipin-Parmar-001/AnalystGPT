@@ -364,7 +364,12 @@ class ReporterAgent:
             f"2. You have a budget of up to {effective_max_calls} tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently.\n"
             "3. STRICT GROUNDING: Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim. Do not compute, round, or estimate any number yourself. If a number the report needs isn't present in `VERIFIED_METRICS`, write \"not verified in current run\" instead of guessing.\n"
             "4. On contradiction: `VERIFIED_METRICS` is authoritative. Note any upstream discrepancies in Operational Caveats.\n"
-            "5. Generate the complete executive markdown report following the required structure."
+            "5. DELIVERABLE: The report itself must be CREATED VIA A TOOL CALL. Use `execute_python` to write the complete markdown report to a file named exactly `final_report.md` (write the whole report in ONE call), e.g.:\n"
+            "   report = \"\"\"<complete markdown report>\"\"\"\n"
+            "   with open(\"final_report.md\", \"w\", encoding=\"utf-8\") as f:\n"
+            "       f.write(report)\n"
+            "   Your chat response does NOT save the report — only the `final_report.md` file written via the tool is the deliverable.\n"
+            "6. Generate the complete executive markdown report following the required structure."
         )
 
         user_content = "\n\n".join(user_content_parts)
@@ -504,6 +509,26 @@ class ReporterAgent:
             memory_manager.append_assistant({"role": "assistant", "content": final_report})
 
         # ==============================================================================
+        # RETRIEVE THE REPORT ARTIFACT: the deliverable is the `final_report.md` file
+        # written via execute_python (sandbox returns files, ToolManager saves them to
+        # output_dir). Prefer the saved artifact over the chat response, which is only
+        # a brief confirmation and is not persisted anywhere.
+        # ==============================================================================
+        report_filepath = os.path.join(output_dir, "final_report.md")
+        if os.path.exists(report_filepath):
+            try:
+                with open(report_filepath, "r", encoding="utf-8") as rf:
+                    file_report = rf.read()
+                if file_report and file_report.strip() and len(file_report.strip()) >= len(final_report.strip()):
+                    if HAS_LOGFIRE:
+                        logfire.info("ReporterAgent retrieved final report from saved artifact", path=report_filepath, length=len(file_report))
+                    else:
+                        print(f"[ReporterAgent] Retrieved final report from saved artifact: {report_filepath} ({len(file_report)} chars)")
+                    final_report = file_report
+            except Exception as read_err:
+                print(f"[ReporterAgent Warning] Could not read {report_filepath}: {read_err}. Falling back to LLM response.")
+
+        # ==============================================================================
         # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
         # ==============================================================================
         self.last_verification_result = None
@@ -589,6 +614,24 @@ class ReporterAgent:
                 "correction_turns_used": correction_turn
             })
 
+        # Keep the saved artifact in sync with the returned report: verification
+        # corrections or the warning banner may have modified the text after the
+        # tool call wrote final_report.md.
+        try:
+            if final_report:
+                existing_content = ""
+                if os.path.exists(report_filepath):
+                    with open(report_filepath, "r", encoding="utf-8") as rf:
+                        existing_content = rf.read()
+                if existing_content != final_report:
+                    os.makedirs(output_dir, exist_ok=True)
+                    with open(report_filepath, "w", encoding="utf-8") as rf:
+                        rf.write(final_report)
+                    if HAS_LOGFIRE:
+                        logfire.info("ReporterAgent synced final_report.md with final report", path=report_filepath)
+        except Exception as sync_err:
+            print(f"[ReporterAgent Warning] Failed to sync final_report.md: {sync_err}")
+
         if HAS_LOGFIRE:
             logfire.info(
                 "ReporterAgent Synthesized Executive Report",
@@ -644,10 +687,16 @@ class ReporterAgent:
         # minimum size. The orchestrator additionally persists final_report.md to
         # disk and enforces existence/size/structure validation.
         report_ok = bool(report_md) and len(report_md.strip()) >= 100
+        # The report artifact lives in the ToolManager output dir (saved by the
+        # execute_python tool call that wrote final_report.md, or synced locally).
+        report_output_dir = getattr(self.tool_manager, "output_dir", "outputs")
+        report_artifact_path = os.path.join(report_output_dir, "final_report.md")
         return {
             "status": "completed" if report_ok else "failed",
             "agent": self.agent_name,
             "final_report": report_md,
+            "report_filepath": report_artifact_path,
+            "generated_files": ["final_report.md"] if report_ok else [],
             "summary": "Executive summary report generated successfully." if report_ok else "Report generation failed: empty or undersized report."
         }
 

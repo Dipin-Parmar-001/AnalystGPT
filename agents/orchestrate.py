@@ -501,6 +501,8 @@ class WorkflowOrchestrator:
                                         with open(report_filepath, "w", encoding="utf-8") as rf:
                                             rf.write(self.final_report)
                                         print(f"[Orchestrator] ReporterAgent task #{task.task_id}: wrote final_report.md for validation")
+                                        if report_filename not in self.generated_artifacts:
+                                            self.generated_artifacts.append(report_filename)
                                     except Exception as write_err:
                                         print(f"[Orchestrator Warning] Failed to save {report_filepath}: {write_err}")
 
@@ -893,6 +895,8 @@ class WorkflowOrchestrator:
                     if self.final_report:
                         report_filename = "final_report.md"
                         report_filepath = os.path.join(self.current_output_dir, report_filename)
+                        if report_filename not in self.generated_artifacts:
+                            self.generated_artifacts.append(report_filename)
                         try:
                             with open(report_filepath, "w", encoding="utf-8") as rf:
                                 rf.write(self.final_report)

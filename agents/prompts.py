@@ -1583,6 +1583,57 @@ All baseline metrics used in the improvement decision MUST come from either:
 
 Never from a re-created or assumed version of the parent.
 
+===============================================================================
+# GROUND-TRUTH SCHEMA CHECK — MANDATORY BEFORE ANY PREDICT/TUNE CALL
+===============================================================================
+
+Any document describing a model's inputs — `ml_summary.json`, `model_registry.json`,
+`feature_engineering_summary.json`, a task's `inputs` metadata — is a CLAIM about the model,
+not the model itself. It can be stale, incomplete, or wrong relative to what was actually
+fitted. NEVER treat a documented feature list or preprocessing description as ground truth for
+reconstructing `X` when a real fitted model artifact is available to query directly.
+
+Before reconstructing any feature matrix intended for a loaded model's `.predict()`,
+`.predict_proba()`, or as the starting point for tuning:
+
+1. Load the parent artifact and read its ACTUAL expected schema directly from the object:
+
+       parent_model = joblib.load("<parent_artifact>.pkl")
+       expected_features = list(parent_model.feature_names_in_)
+       expected_n = parent_model.n_features_in_
+
+   This is the only authoritative source for what the model expects. A summary/registry
+   document's feature list is a secondary, unverified claim until checked against this.
+
+2. Build your reconstructed `X` using whatever preprocessing steps you believe are correct
+   from the documentation, then assert it matches the ground truth BEFORE calling predict:
+
+       reconstructed_features = list(X.columns)
+       assert set(reconstructed_features) == set(expected_features), (
+           f"Feature mismatch vs parent model. "
+           f"In model, missing from X: {set(expected_features) - set(reconstructed_features)}. "
+           f"In X, not in model: {set(reconstructed_features) - set(expected_features)}."
+       )
+       assert X.shape[1] == expected_n
+
+3. If the assertion fails, that is a signal that a documented preprocessing step
+   (e.g. an excluded/included column, an encoding choice) does NOT match what was actually
+   used to fit the model. Do NOT iterate by guessing alternative reconstructions one at a time
+   across multiple tool calls. Instead, in the SAME call, diff `expected_features` against
+   your current reconstruction, identify the specific missing/extra columns, adjust the
+   reconstruction accordingly, and re-assert — all within one script. Only report the task as
+   blocked in `issues_and_caveats` if the diff reveals a source column that is genuinely
+   unavailable in the loaded dataset (not merely unreconstructed by your current attempt).
+
+4. Never call `.predict()`, `.predict_proba()`, or begin a hyperparameter search using a
+   reconstructed `X` that has not passed this assertion. A failed assertion caught here costs
+   nothing; a `ValueError` from sklearn three tool calls later after guessing wrong twice
+   costs your budget for no benefit.
+
+This check applies whenever `X` is being reconstructed from a raw or intermediate dataset for
+use against an already-fitted model — both in `hyperparameter_tuning` (reconstructing the
+parent's evaluation conditions) and any other task type that loads a prior model to score
+against newly prepared data.
 
 ===============================================================================
 # BOUNDED HYPERPARAMETER SEARCH
@@ -2157,6 +2208,23 @@ actually appears in `artifacts`. If `artifacts` is missing an item VERIFIED_METR
 summary JSON references by name, list it as `"referenced but not confirmed in artifacts
 list"` rather than asserting it exists.
 ```
+
+# DELIVERABLE — THE REPORT MUST BE CREATED VIA A TOOL CALL (NON-NEGOTIABLE)
+- Your chat response is NOT the deliverable and is NOT saved anywhere. The ONLY
+  deliverable is the file `final_report.md`.
+- You MUST create the report by writing it to `final_report.md` via the `execute_python`
+  tool, e.g.:
+    report = \"\"\"<the complete markdown report>\"\"\"
+    with open("final_report.md", "w", encoding="utf-8") as f:
+        f.write(report)
+    print("final_report.md written, characters:", len(report))
+- Write the COMPLETE report in ONE tool call. Do not write it in fragments across
+  multiple calls or append partial sections.
+- After writing the file, re-read it back and print its first ~500 characters to confirm
+  it was saved intact. If anything went wrong, rewrite it in a follow-up call.
+- Only after `final_report.md` has been successfully written, output a brief plain-text
+  confirmation in your chat response (e.g. a 2-3 sentence summary of what the report
+  contains). Do NOT paste the full markdown report into your chat response.
 
 # OUTPUT DISCIPLINE
 - Tone: Executive, metric-driven, professional, and clear.

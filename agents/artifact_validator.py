@@ -365,7 +365,8 @@ def get_required_artifacts(agent_name: str, task_type: Optional[str] = None) -> 
                 "predictions.csv",
                 "ml_summary.json",
                 "model_registry.json",
-                "champion_model.json"
+                "champion_model.json",
+                "best_model.pkl"
             ]
         elif task_type == "hyperparameter_tuning":
             return [
