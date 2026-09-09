@@ -17,6 +17,15 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
+from agents.logger import setup_logfire
+
+try:
+    import logfire
+except ImportError:
+    logfire = None
+
+setup_logfire()
+
 # Dataset artifacts in lifecycle order; later entries supersede earlier ones
 # when determining the "current dataset".
 DATASET_LIFECYCLE = [
@@ -87,6 +96,8 @@ def build_dataset_profile(
         "notes": [],
     }
 
+    if logfire:
+        logfire.info("RunContext: building dataset profile", output_dir=output_dir, persist=persist)
     raw_path = _find_raw_dataset(output_dir, uploaded_files)
     if raw_path:
         ext = os.path.splitext(raw_path)[1].lower()
@@ -130,9 +141,32 @@ def build_dataset_profile(
             with open(os.path.join(output_dir, _PROFILE_FILENAME), "w", encoding="utf-8") as f:
                 json.dump(profile, f, indent=2, default=str)
         except Exception as e:
+            if logfire:
+                logfire.warn("RunContext: could not persist dataset profile", output_dir=output_dir, error=str(e))
             print(f"[RunContext] Notice: could not persist dataset profile: {e}")
 
+    if logfire:
+        ds_summaries = {
+            key: {"file": ds.get("file"), "rows": ds.get("rows"), "cols": ds.get("cols"), "error": ds.get("error")}
+            for key, ds in profile["datasets"].items() if ds
+        }
+        logfire.info(
+            "RunContext: dataset profile built",
+            datasets=ds_summaries,
+            num_engineered_features=len(profile["engineered_features"]),
+            current_dataset=profile["current_dataset"],
+            notes=profile["notes"],
+        )
+
     return profile
+
+
+def _lf_span(name: str, **attrs):
+    """Returns a logfire span when logfire is available, else a no-op context."""
+    import contextlib
+    if logfire:
+        return logfire.span(name, **attrs)
+    return contextlib.nullcontext()
 
 
 def render_dataset_profile_block(profile: Optional[Dict[str, Any]]) -> str:

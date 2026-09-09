@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShieldAlert, ShieldCheck, ChevronDown, ChevronRight, AlertOctagon, AlertTriangle } from 'lucide-react';
+import { ShieldCheck, ChevronDown, ChevronRight, AlertOctagon, AlertTriangle, Wrench } from 'lucide-react';
 
 const CODE_LABELS = {
   shape_mismatch: 'Shape mismatch',
@@ -21,16 +21,16 @@ const CODE_LABELS = {
 
 const SEVERITY_STYLE = {
   critical: {
-    icon: <AlertOctagon className="w-4 h-4 text-red-400 shrink-0" />,
-    border: 'border-red-800/70',
-    bg: 'bg-red-950/30',
-    title: 'text-red-300',
+    icon: AlertOctagon,
+    chip: 'bg-danger-wash text-danger border-danger-edge',
+    card: 'border-danger-edge hover:border-danger/50',
+    label: 'text-danger',
   },
   minor: {
-    icon: <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />,
-    border: 'border-amber-800/60',
-    bg: 'bg-amber-950/20',
-    title: 'text-amber-300',
+    icon: AlertTriangle,
+    chip: 'bg-caution-wash text-caution border-caution-edge',
+    card: 'border-caution-edge hover:border-caution/50',
+    label: 'text-caution',
   },
 };
 
@@ -38,38 +38,43 @@ function FindingCard({ finding, defaultOpen }) {
   const [open, setOpen] = useState(defaultOpen);
   const sev = finding.severity === 'critical' ? 'critical' : 'minor';
   const style = SEVERITY_STYLE[sev];
+  const Icon = style.icon;
   const label = CODE_LABELS[finding.code] || finding.code || 'finding';
 
   return (
-    <div className={`rounded-xl border ${style.border} ${style.bg} overflow-hidden`}>
+    <div className={`rounded-lg border bg-card shadow-card transition-colors ${style.card}`}>
       <button
         onClick={() => setOpen(!open)}
-        className="w-full px-4 py-3 flex items-center gap-3 text-left hover:bg-white/[0.03] transition-colors"
+        className="w-full px-4 py-3 flex items-center gap-3 text-left"
       >
-        {style.icon}
-        <span className={`text-xs font-bold uppercase tracking-wider font-mono ${style.title}`}>
-          [{sev}]
+        <Icon className={`w-4 h-4 shrink-0 ${sev === 'critical' ? 'text-danger' : 'text-caution'}`} />
+        <span className={`text-[11px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${style.chip}`}>
+          {sev}
         </span>
-        <span className="text-xs font-semibold text-slate-200 flex-1 truncate">
-          {label}: {finding.message?.slice(0, 140)}
+        <span className="text-[13px] font-medium text-ink flex-1 truncate">
+          {label}
+          <span className="text-ink-faint font-normal"> — {finding.message?.slice(0, 110)}</span>
         </span>
-        {open ? <ChevronDown className="w-4 h-4 text-slate-500" /> : <ChevronRight className="w-4 h-4 text-slate-500" />}
+        {open ? <ChevronDown className="w-4 h-4 text-ink-faint" /> : <ChevronRight className="w-4 h-4 text-ink-faint" />}
       </button>
       {open && (
-        <div className="px-4 pb-3 pt-0 space-y-2">
-          <p className="text-xs text-slate-300 leading-relaxed">{finding.message}</p>
+        <div className="px-4 pb-4 pt-0 space-y-2.5 border-t border-edge-soft pt-3 mx-4 mb-1 pl-4">
+          <p className="text-[13px] text-ink-soft leading-relaxed">{finding.message}</p>
           {finding.grounding && (
-            <p className="text-[11px] text-slate-400 font-mono">Grounding: {finding.grounding}</p>
+            <p className="text-[12px] text-ink-faint">
+              <span className="font-medium text-ink-soft">Grounding:</span> {finding.grounding}
+            </p>
           )}
           {finding.artifacts?.length > 0 && (
-            <p className="text-[11px] text-slate-500 font-mono">
-              Artifacts: {finding.artifacts.map((a, i) => (
-                <span key={i} className="inline-block mr-2 text-slate-400">`{a}`</span>
+            <p className="text-[12px] text-ink-faint">
+              <span className="font-medium text-ink-soft">Artifacts:</span>{' '}
+              {finding.artifacts.map((a, i) => (
+                <code key={i} className="font-code text-[11px] bg-paper border border-edge rounded px-1 py-0.5 mr-1.5">{a}</code>
               ))}
             </p>
           )}
           {finding.source && (
-            <p className="text-[10px] text-slate-600 font-mono uppercase">source: {finding.source}</p>
+            <p className="text-[11px] text-ink-faint">Source: {finding.source}</p>
           )}
         </div>
       )}
@@ -78,102 +83,108 @@ function FindingCard({ finding, defaultOpen }) {
 }
 
 export default function FindingsPanel({ runStatus, severityCounts, findings, repairAttemptsUsed }) {
-  if (!runStatus || runStatus === 'idle') return null;
-  if (runStatus === 'completed' && (!findings || findings.length === 0)) {
+  if (!runStatus || runStatus === 'idle') {
     return (
-      <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-800/60 flex items-center gap-3">
-        <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
+      <div className="p-10 text-center border border-dashed border-edge-strong rounded-xl bg-card/60">
+        <ShieldCheck className="w-8 h-8 text-ink-faint/50 mx-auto mb-3" strokeWidth={1.6} />
+        <p className="text-[14px] font-medium text-ink-soft">No verification results yet</p>
+        <p className="text-[13px] text-ink-faint mt-1">
+          Findings appear here after a run finishes its verification passes.
+        </p>
+      </div>
+    );
+  }
+
+  const findingsList = findings || [];
+  const critical = findingsList.filter((f) => f.severity === 'critical');
+  const minor = findingsList.filter((f) => f.severity !== 'critical');
+
+  // Fully clean run
+  if (runStatus === 'completed' && findingsList.length === 0) {
+    return (
+      <div className="p-6 rounded-xl bg-accent-wash border border-accent-edge flex items-start gap-4">
+        <div className="w-10 h-10 rounded-lg bg-accent text-white flex items-center justify-center shrink-0">
+          <ShieldCheck className="w-5 h-5" />
+        </div>
         <div>
-          <h4 className="text-xs font-bold text-emerald-300 font-mono uppercase tracking-wider">
-            Verification Passed
-          </h4>
-          <p className="text-xs text-emerald-200/80 mt-0.5">
-            All gates passed: numeric verification, cross-artifact consistency, and the LLM consistency judge found no issues.
+          <h4 className="text-[15px] font-semibold text-accent-deep">Report cleared for delivery</h4>
+          <p className="text-[13px] text-ink-soft mt-1 leading-relaxed">
+            All verification gates passed — the numeric check, cross-artifact consistency, and the LLM
+            consistency judge found no issues.
           </p>
         </div>
       </div>
     );
   }
 
-  const findingsList = findings || [];
-  if (findingsList.length === 0 && runStatus !== 'failed-consistency' && runStatus !== 'completed_with_warnings') {
-    return null;
-  }
-
-  const critical = findingsList.filter((f) => f.severity === 'critical');
-  const minor = findingsList.filter((f) => f.severity !== 'critical');
-
-  const statusBanner = () => {
+  const banner = () => {
     if (runStatus === 'failed-consistency') {
-      return {
-        cls: 'bg-red-950/50 border-red-700/80',
-        icon: <ShieldAlert className="w-5 h-5 text-red-400 shrink-0" />,
-        title: 'Run NOT cleared for delivery (failed-consistency)',
-        text:
-          'Critical consistency findings survived verification and the automated repair passes. The report below is NOT cleared for delivery — treat every figure as unverified until the findings are resolved.',
-        titleCls: 'text-red-300',
-      };
+      return (
+        <div className="p-4 rounded-lg bg-danger-wash border border-danger-edge">
+          <h4 className="text-[14px] font-semibold text-danger">Not cleared for delivery</h4>
+          <p className="text-[13px] text-ink-soft mt-1 leading-relaxed">
+            Critical findings survived verification and {repairAttemptsUsed || 'the automated'} repair
+            {repairAttemptsUsed === 1 ? ' pass' : ' passes'}. The report is shown for diagnostics only —
+            treat every figure as unverified until these findings are resolved.
+          </p>
+        </div>
+      );
     }
     if (runStatus === 'completed_with_warnings') {
-      return {
-        cls: 'bg-amber-950/40 border-amber-700/70',
-        icon: <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0" />,
-        title: 'Delivered with warnings (completed_with_warnings)',
-        text: 'Minor consistency warnings were detected. The report is usable, but review the findings below.',
-        titleCls: 'text-amber-300',
-      };
+      return (
+        <div className="p-4 rounded-lg bg-caution-wash border border-caution-edge">
+          <h4 className="text-[14px] font-semibold text-caution">Delivered with warnings</h4>
+          <p className="text-[13px] text-ink-soft mt-1 leading-relaxed">
+            The report is usable, but review the {minor.length} minor finding{minor.length === 1 ? '' : 's'} below.
+          </p>
+        </div>
+      );
     }
     return null;
   };
 
-  const banner = statusBanner();
-
   return (
-    <div className="border border-surface-border rounded-xl bg-surface-100/70 shadow-xl overflow-hidden">
-      <div className="px-4 py-3 bg-surface-200/90 border-b border-surface-border flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <ShieldAlert className="w-4 h-4 text-brand-secondary" />
-          <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono">
-            Verification Findings
-          </h3>
+    <div className="space-y-4">
+      {/* Header row */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-[15px] font-semibold text-ink">Verification findings</h3>
+          <p className="text-[12px] text-ink-faint mt-0.5">
+            Detected by the numeric gate, cross-artifact consistency checks, and the consistency judge.
+          </p>
         </div>
-        <div className="flex items-center gap-2 text-[11px] font-mono">
-          <span className="px-2 py-0.5 rounded-full bg-red-950/60 border border-red-800 text-red-300">
-            {critical.length} critical
-          </span>
-          <span className="px-2 py-0.5 rounded-full bg-amber-950/50 border border-amber-800 text-amber-300">
-            {minor.length} minor
-          </span>
+        <div className="flex items-center gap-2">
           {typeof repairAttemptsUsed === 'number' && repairAttemptsUsed > 0 && (
-            <span className="px-2 py-0.5 rounded-full bg-surface-300/60 border border-surface-border text-slate-300">
+            <span className="inline-flex items-center gap-1 h-7 px-2.5 rounded-full border border-edge bg-card text-[11px] font-medium text-ink-soft">
+              <Wrench className="w-3 h-3" />
               {repairAttemptsUsed} repair {repairAttemptsUsed === 1 ? 'pass' : 'passes'}
             </span>
           )}
+          <span className="inline-flex items-center h-7 px-2.5 rounded-full border border-danger-edge bg-danger-wash text-[11px] font-semibold text-danger">
+            {critical.length} critical
+          </span>
+          <span className="inline-flex items-center h-7 px-2.5 rounded-full border border-caution-edge bg-caution-wash text-[11px] font-semibold text-caution">
+            {minor.length} minor
+          </span>
         </div>
       </div>
 
-      <div className="p-4 space-y-3">
-        {banner && (
-          <div className={`p-3 rounded-lg border ${banner.cls} flex items-start gap-3`}>
-            {banner.icon}
-            <div>
-              <h4 className={`text-xs font-bold ${banner.titleCls}`}>{banner.title}</h4>
-              <p className="text-xs text-slate-300/90 mt-0.5 leading-relaxed">{banner.text}</p>
-            </div>
-          </div>
-        )}
+      {banner()}
 
-        {findingsList.length === 0 && (
-          <p className="text-xs text-slate-500 font-mono">No findings recorded for this run.</p>
-        )}
-
-        {critical.map((f, i) => (
-          <FindingCard key={`c-${i}`} finding={f} defaultOpen />
-        ))}
-        {minor.map((f, i) => (
-          <FindingCard key={`m-${i}`} finding={f} defaultOpen={false} />
-        ))}
-      </div>
+      {findingsList.length === 0 ? (
+        <div className="p-8 text-center border border-dashed border-edge-strong rounded-xl bg-card/60">
+          <p className="text-[13px] text-ink-faint">No findings recorded for this run.</p>
+        </div>
+      ) : (
+        <div className="space-y-2.5">
+          {critical.map((f, i) => (
+            <FindingCard key={`c-${i}`} finding={f} defaultOpen />
+          ))}
+          {minor.map((f, i) => (
+            <FindingCard key={`m-${i}`} finding={f} defaultOpen={false} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

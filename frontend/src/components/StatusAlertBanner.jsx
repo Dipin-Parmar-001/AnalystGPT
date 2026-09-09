@@ -1,123 +1,95 @@
 import React from 'react';
-import { CheckCircle2, XCircle, AlertTriangle, Info, ShieldCheck, ShieldAlert, Flame } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, ShieldAlert, Flame, Loader2 } from 'lucide-react';
+
+const BANNERS = {
+  completed: {
+    cls: 'bg-accent-wash border-accent-edge',
+    icon: CheckCircle2,
+    iconCls: 'bg-accent-wash text-accent border-accent-edge',
+    titleCls: 'text-accent-deep',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Verified', cls: 'bg-accent text-white' },
+    fallback: 'All tasks finished, the report passed verification, and the executive deliverable is ready.',
+  },
+  completed_with_warnings: {
+    cls: 'bg-caution-wash border-caution-edge',
+    icon: ShieldAlert,
+    iconCls: 'bg-caution-wash text-caution border-caution-edge',
+    titleCls: 'text-caution',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Review findings', cls: 'bg-caution text-white' },
+    fallback: 'The report is delivered, but minor consistency warnings were detected. Open Verification for the details.',
+  },
+  'failed-consistency': {
+    cls: 'bg-danger-wash border-danger-edge',
+    icon: ShieldAlert,
+    iconCls: 'bg-danger-wash text-danger border-danger-edge',
+    titleCls: 'text-danger',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Not cleared', cls: 'bg-danger text-white' },
+    fallback: 'Critical consistency findings survived verification and the automated repair passes. The report is NOT cleared for delivery — open Verification for the findings.',
+  },
+  cancelled: {
+    cls: 'bg-card border-edge',
+    icon: Flame,
+    iconCls: 'bg-danger-wash text-danger border-danger-edge',
+    titleCls: 'text-ink',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Terminated', cls: 'bg-danger text-white' },
+    fallback: 'Workflow was intentionally terminated by user confirmation. No further agent calls were made.',
+  },
+  failed: {
+    cls: 'bg-caution-wash border-caution-edge',
+    icon: AlertTriangle,
+    iconCls: 'bg-caution-wash text-caution border-caution-edge',
+    titleCls: 'text-caution',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Error', cls: 'bg-caution text-white' },
+    fallback: 'An error occurred during task execution. Pipeline stopped cleanly and state was preserved.',
+  },
+};
 
 export default function StatusAlertBanner({ status, message, error, cancelledStep }) {
-  if (!status || status === 'idle') return null;
+  if (!status || status === 'idle' || status === 'planning' || status === 'plan_ready' || status === 'executing') return null;
 
-  if (status === 'completed') {
-    return (
-      <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-700/60 shadow-lg glow-success flex items-start gap-3 animate-in fade-in">
-        <div className="w-8 h-8 rounded-lg bg-emerald-900/60 border border-emerald-600 flex items-center justify-center shrink-0 mt-0.5">
-          <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-        </div>
-        <div className="flex-1">
-          <h4 className="text-sm font-bold text-emerald-300 flex items-center gap-2">
-            Workflow Execution Successfully Completed
-            <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-200 border border-emerald-700">
-              Verified
-            </span>
-          </h4>
-          <p className="text-xs text-emerald-200/90 mt-1 leading-relaxed">
-            {message || 'All tasks finished and final executive synthesis report generated.'}
-          </p>
-        </div>
+  const b = BANNERS[status];
+  if (!b) return null;
+
+  const Icon = b.icon;
+
+  return (
+    <div className={`p-4 rounded-xl border ${b.cls} flex items-start gap-3.5 animate-fade-up`}>
+      <div className={`w-9 h-9 rounded-lg border flex items-center justify-center shrink-0 ${b.iconCls}`}>
+        <Icon className="w-[18px] h-[18px]" />
       </div>
-    );
-  }
-
-  if (status === 'completed_with_warnings') {
-    return (
-      <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-700/70 shadow-lg glow-warning flex items-start gap-3 animate-in fade-in">
-        <div className="w-8 h-8 rounded-lg bg-amber-900/60 border border-amber-600 flex items-center justify-center shrink-0 mt-0.5">
-          <ShieldAlert className="w-5 h-5 text-amber-400" />
-        </div>
-        <div className="flex-1">
-          <h4 className="text-sm font-bold text-amber-300 flex items-center gap-2">
-            Workflow Completed With Warnings
-            <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-amber-900/60 text-amber-200 border border-amber-700">
-              Review Findings
-            </span>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <h4 className={`text-[14px] font-semibold ${b.titleCls}`}>
+            {status === 'completed' && 'Workflow completed'}
+            {status === 'completed_with_warnings' && 'Completed with warnings'}
+            {status === 'failed-consistency' && 'Run not cleared for delivery'}
+            {status === 'cancelled' && 'Workflow terminated'}
+            {status === 'failed' && 'Execution error'}
           </h4>
-          <p className="text-xs text-amber-200/90 mt-1 leading-relaxed">
-            {message || 'The report is delivered, but minor consistency warnings were detected. Review the verification findings below.'}
-          </p>
+          <span className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full text-white ${b.chip.cls}`}>
+            {b.chip.label}
+          </span>
         </div>
-      </div>
-    );
-  }
+        <p className={`text-[13px] mt-1 leading-relaxed ${b.textCls}`}>
+          {message || b.fallback}
+        </p>
 
-  if (status === 'failed-consistency') {
-    return (
-      <div className="p-4 rounded-xl bg-red-950/50 border border-red-700/80 shadow-lg glow-danger flex items-start gap-3 animate-in fade-in">
-        <div className="w-8 h-8 rounded-lg bg-red-900/60 border border-red-600 flex items-center justify-center shrink-0 mt-0.5">
-          <ShieldAlert className="w-5 h-5 text-red-400" />
-        </div>
-        <div className="flex-1">
-          <h4 className="text-sm font-bold text-red-300 flex items-center gap-2">
-            Run Not Cleared For Delivery
-            <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-red-900/60 text-red-200 border border-red-700">
-              Failed Consistency
-            </span>
-          </h4>
-          <p className="text-xs text-red-200/90 mt-1 leading-relaxed">
-            {message || 'Critical consistency findings survived verification and the automated repair passes. The report is NOT cleared for delivery — review the verification findings.'}
+        {cancelledStep && status === 'cancelled' && (
+          <p className="text-[12px] text-ink-faint mt-1.5">
+            Stopped at step: <span className="text-ink-soft font-medium">{cancelledStep}</span>
           </p>
-        </div>
+        )}
+        {error && status === 'failed' && (
+          <pre className="mt-2.5 p-3 rounded-lg bg-card border border-caution-edge text-[11px] font-code text-danger overflow-x-auto whitespace-pre-wrap">
+            {error}
+          </pre>
+        )}
       </div>
-    );
-  }
-
-  if (status === 'cancelled') {
-    return (
-      <div className="p-4 rounded-xl bg-red-950/50 border border-red-700/80 shadow-lg glow-danger flex items-start gap-3 animate-in fade-in">
-        <div className="w-8 h-8 rounded-lg bg-red-900/60 border border-red-600 flex items-center justify-center shrink-0 mt-0.5">
-          <Flame className="w-5 h-5 text-red-400" />
-        </div>
-        <div className="flex-1">
-          <h4 className="text-sm font-bold text-red-300 flex items-center gap-2">
-            Workflow Execution Stopped by User Request
-            <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-red-900/60 text-red-200 border border-red-700">
-              Terminated
-            </span>
-          </h4>
-          <p className="text-xs text-red-200/90 mt-1 leading-relaxed">
-            {message || 'Workflow was intentionally terminated by user confirmation. No unwanted subsequent calls were made.'}
-          </p>
-          {cancelledStep && (
-            <p className="text-[11px] text-red-300 font-mono mt-1">
-              Stopped at step: <span className="underline">{cancelledStep}</span>
-            </p>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  if (status === 'failed') {
-    return (
-      <div className="p-4 rounded-xl bg-amber-950/50 border border-amber-700/80 shadow-lg glow-warning flex items-start gap-3 animate-in fade-in">
-        <div className="w-8 h-8 rounded-lg bg-amber-900/60 border border-amber-600 flex items-center justify-center shrink-0 mt-0.5">
-          <AlertTriangle className="w-5 h-5 text-amber-400" />
-        </div>
-        <div className="flex-1">
-          <h4 className="text-sm font-bold text-amber-300 flex items-center gap-2">
-            Workflow Halted Due to Execution Error
-            <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-amber-900/60 text-amber-200 border border-amber-700">
-              Diagnostic State
-            </span>
-          </h4>
-          <p className="text-xs text-amber-200/90 mt-1 leading-relaxed">
-            {message || 'An error occurred during task execution. Pipeline stopped cleanly and state was preserved.'}
-          </p>
-          {error && (
-            <div className="mt-2 p-2.5 rounded-lg bg-black/40 border border-amber-900/60 font-mono text-[11px] text-amber-200 overflow-x-auto">
-              {error}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  return null;
+    </div>
+  );
 }

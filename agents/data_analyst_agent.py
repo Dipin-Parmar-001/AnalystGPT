@@ -89,7 +89,7 @@ DEFAULT_PORTKEY_CONFIG = {
     ]
 }
 
-from agents.prompts import DATA_ANALYST_AGENT, DATA_ANALYST_SYSTEM_PROMPT
+from agents.prompts import DATA_ANALYST_AGENT, DATA_ANALYST_SYSTEM_PROMPT, resolve_budget_placeholders
 
 
 class DataAnalystAgent:
@@ -367,7 +367,7 @@ class DataAnalystAgent:
                 f"3. Scope discipline: Construct ONLY the derived features named in the task description above.\n"
                 f"4. Preserve all existing columns and identifiers (e.g. customerID, user_id).\n"
                 f"5. Reload-and-assert: Reload `feature_engineered_dataset.csv` and verify shape and columns before finishing.\n"
-                f"6. MANDATORY OUTPUTS: Save the engineered dataset as `feature_engineered_dataset.csv` and summary as `feature_engineering_summary.json`.\n"
+                f"6. MANDATORY OUTPUTS: Save the engineered dataset as `feature_engineered_dataset.csv`, the engineering summary as `feature_engineering_summary.json`, AND your own task summary as `analyst_summary_task_{task_id_val}.json` plus `analyst_summary.json` — both must include the engineered feature definitions, rationale, and verified output shape.\n"
                 f"7. Provide a concise summary of the engineered features and verified dataset shape."
             )
         elif task_type == "stats_and_viz":
@@ -377,7 +377,7 @@ class DataAnalystAgent:
                 f"2. Load the input dataset named in your task inputs (e.g. `feature_engineered_dataset.csv` or `cleaned_dataset.csv`).\n"
                 f"3. Compute summary statistics, correlations, and grouped aggregations.\n"
                 f"4. Generate ONLY the specific charts requested in the task description and save as PNG files.\n"
-                f"5. Save `analyst_summary.json` (and `analyst_summary_task_{task_id_val}.json`) with complete metric breakdowns.\n"
+                f"5. MANDATORY SUMMARY: Save your own task summary as `analyst_summary_task_{task_id_val}.json` AND `analyst_summary.json` with complete metric breakdowns.\n"
                 f"6. Provide a comprehensive summary of key statistical insights and findings."
             )
         else:
@@ -388,7 +388,7 @@ class DataAnalystAgent:
                 f"3. RAW DATA INSPECTION & ROW RECONCILIATION (CRITICAL): Calculate duplicates (`df.duplicated().sum()`) and nulls (`df.isnull().sum()`) on the RAW dataset FIRST before any column exclusions. Track `initial_rows`, explicit `removed` breakdown with reason and count, and `retained` rows.\n"
                 f"4. IDENTIFIER PRESERVATION: Do NOT drop identifier columns (e.g., customerID, id). Except/exclude them from feature correlations and plots, but KEEP them in the dataset.\n"
                 f"5. EXPORT CLEANED DATASET: ALWAYS save the cleaned dataset to `cleaned_dataset.csv` (e.g., `df.to_csv('cleaned_dataset.csv', index=False)`).\n"
-                f"6. Save `analyst_summary.json` (and `analyst_summary_task_{task_id_val}.json`) and all visualization PNGs.\n"
+                f"6. MANDATORY SUMMARY: In addition to any intermediate summary (e.g. `cleaning_summary.json`), you MUST save your own task summary as `analyst_summary_task_{task_id_val}.json` AND `analyst_summary.json` with the complete metric breakdowns.\n"
                 f"7. Provide a comprehensive final answer summarizing your cleaning, findings, and figures."
             )
 
@@ -399,7 +399,7 @@ class DataAnalystAgent:
         )
 
         memory_manager = MessageHistoryManager(
-            system_prompt=DATA_ANALYST_SYSTEM_PROMPT,
+            system_prompt=resolve_budget_placeholders(DATA_ANALYST_SYSTEM_PROMPT, effective_max_calls),
             keep_last_tool_pairs=self.keep_last_tool_pairs,
             stdout_stderr_token_limit=self.stdout_stderr_token_limit,
             max_tokens_before_compact=self.max_tokens_before_compact
@@ -715,6 +715,27 @@ class DataAnalystAgent:
             except Exception as write_err:
                 print(f"[DataAnalystAgent] Notice saving fallback summary: {write_err}")
 
+        # Enforce that the task generated ITS OWN designated summary (not a borrowed
+        # intermediate from another task type). This check applies to summaries only.
+        required_task_summary = {
+            "cleaning": "cleaning_summary.json",
+            "feature_engineering": "feature_engineering_summary.json",
+            "stats_and_viz": summary_filename,
+        }.get(task_type, summary_filename)
+        missing_required_summary = None
+        if not os.path.exists(os.path.join(output_dir, required_task_summary)):
+            missing_required_summary = required_task_summary
+            if HAS_LOGFIRE:
+                logfire.warn(
+                    "DataAnalystAgent task did not produce its own required summary",
+                    agent="DataAnalystAgent",
+                    task_type=task_type,
+                    required_summary=required_task_summary,
+                    generated_files=generated_files,
+                )
+            else:
+                print(f"[DataAnalystAgent] WARNING: task_type '{task_type}' did not produce its required summary '{required_task_summary}'.", flush=True)
+
         if HAS_LOGFIRE:
             logfire.info(
                 "DataAnalystAgent Task Finished",
@@ -743,6 +764,7 @@ class DataAnalystAgent:
             "executed_code": executed_code_blocks,
             "generated_files": generated_files,
             "summary_data": summary_data,
+            "missing_required_summary": missing_required_summary,
             "plan": plan.to_dict() if isinstance(plan, ExecutionPlan) else plan
         }
 

@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Upload, FileSpreadsheet, Eye, CheckCircle2, AlertCircle, HardDrive, Trash2 } from 'lucide-react';
+import { Upload, FileSpreadsheet, Eye, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 
 export default function DatasetUploader({
   datasets,
@@ -86,27 +86,16 @@ export default function DatasetUploader({
 
   return (
     <div className="space-y-4">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
-          <HardDrive className="w-4 h-4 text-brand-secondary" />
-          Dataset Workspace
-        </h3>
-        <span className="text-xs text-slate-400 font-mono">
-          {datasets.length} available
-        </span>
-      </div>
-
-      {/* Drag and Drop Zone */}
+      {/* Drop zone */}
       <div
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         onClick={() => !disabled && fileInputRef.current?.click()}
-        className={`border-2 border-dashed rounded-xl p-4 text-center cursor-pointer transition-all duration-200 ${
+        className={`border border-dashed rounded-lg p-5 text-center cursor-pointer transition-colors ${
           isDragging
-            ? 'border-brand-primary bg-brand-primary/10 shadow-lg glow-primary'
-            : 'border-slate-700/80 bg-surface-100/60 hover:bg-surface-100 hover:border-slate-600'
+            ? 'border-accent bg-accent-wash'
+            : 'border-edge-strong bg-paper hover:bg-edge-soft hover:border-ink-faint/50'
         } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
       >
         <input
@@ -118,37 +107,35 @@ export default function DatasetUploader({
           disabled={disabled}
         />
 
-        <div className="flex flex-col items-center justify-center gap-2">
-          <div className="w-10 h-10 rounded-full bg-brand-primary/10 text-brand-primary flex items-center justify-center">
+        <div className="flex flex-col items-center gap-2">
+          <div className="w-10 h-10 rounded-full bg-card border border-edge flex items-center justify-center">
             {uploading ? (
-              <div className="w-5 h-5 border-2 border-brand-primary border-t-transparent rounded-full animate-spin"></div>
+              <Loader2 className="w-5 h-5 text-accent animate-spin" />
             ) : (
-              <Upload className="w-5 h-5 text-indigo-400" />
+              <Upload className="w-5 h-5 text-ink-soft" strokeWidth={1.8} />
             )}
           </div>
           <div>
-            <p className="text-xs font-medium text-slate-200">
-              {uploading ? 'Parsing & Ingesting CSV...' : 'Click or drag CSV dataset here'}
+            <p className="text-[13px] font-medium text-ink">
+              {uploading ? 'Parsing & ingesting CSV…' : 'Click or drag a CSV here'}
             </p>
-            <p className="text-[11px] text-slate-400 mt-0.5">
-              Supports standard tabular CSV files
-            </p>
+            <p className="text-[11.5px] text-ink-faint mt-0.5">Standard tabular CSV files</p>
           </div>
         </div>
       </div>
 
       {uploadError && (
-        <div className="p-2.5 rounded-lg bg-red-950/60 border border-red-800/80 text-xs text-red-300 flex items-center gap-2">
-          <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+        <div className="px-3 py-2.5 rounded-lg bg-danger-wash border border-danger-edge text-[12px] text-danger flex items-center gap-2">
+          <AlertCircle className="w-3.5 h-3.5 shrink-0" />
           <span>{uploadError}</span>
         </div>
       )}
 
-      {/* Dataset List */}
-      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+      {/* Dataset list */}
+      <div className="space-y-1.5 max-h-64 overflow-y-auto pr-0.5">
         {datasets.length === 0 ? (
-          <p className="text-xs text-slate-400 text-center py-4 italic">
-            No datasets uploaded yet. Upload a CSV to get started.
+          <p className="text-[12px] text-ink-faint text-center py-4">
+            No datasets uploaded yet.
           </p>
         ) : (
           datasets.map((ds) => {
@@ -156,47 +143,41 @@ export default function DatasetUploader({
             return (
               <div
                 key={ds.filename}
-                className={`p-3 rounded-lg border transition-all flex items-center justify-between ${
+                className={`flex items-center justify-between gap-2 p-2.5 rounded-lg border transition-colors ${
                   isSelected
-                    ? 'bg-brand-primary/10 border-brand-primary/60 text-slate-100'
-                    : 'bg-surface-100/80 border-surface-border hover:bg-surface-hover text-slate-300'
+                    ? 'bg-accent-wash/60 border-accent-edge'
+                    : 'bg-card border-edge hover:border-edge-strong'
                 }`}
               >
                 <div
                   className="flex items-center gap-2.5 flex-1 min-w-0 cursor-pointer"
                   onClick={() => onToggleSelect(ds.filename)}
                 >
-                  <div
-                    className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${
-                      isSelected
-                        ? 'bg-brand-primary border-brand-primary text-white'
-                        : 'border-slate-600 bg-surface-200'
+                  <span
+                    className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors ${
+                      isSelected ? 'bg-accent border-accent text-white' : 'border-edge-strong bg-card'
                     }`}
                   >
-                    {isSelected && <CheckCircle2 className="w-3.5 h-3.5" />}
-                  </div>
+                    {isSelected && <CheckCircle2 className="w-3 h-3" />}
+                  </span>
 
-                  <FileSpreadsheet className="w-4 h-4 text-brand-secondary shrink-0" />
+                  <FileSpreadsheet className="w-4 h-4 text-ink-faint shrink-0" />
 
-                  <div className="truncate">
-                    <p className="text-xs font-medium text-slate-200 truncate">
-                      {ds.filename}
-                    </p>
-                    <p className="text-[10px] text-slate-400 font-mono">
-                      {ds.row_count !== undefined ? `${ds.row_count.toLocaleString()} rows • ${ds.col_count} cols` : 'Ready'} • {formatBytes(ds.size_bytes)}
+                  <div className="min-w-0">
+                    <p className="text-[12.5px] font-medium text-ink truncate">{ds.filename}</p>
+                    <p className="text-[11px] text-ink-faint tabular-nums">
+                      {ds.row_count !== undefined ? `${ds.row_count.toLocaleString()} rows · ${ds.col_count} cols · ${formatBytes(ds.size_bytes)}` : formatBytes(ds.size_bytes)}
                     </p>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1.5 shrink-0 ml-2">
-                  <button
-                    onClick={() => onPreviewDataset(ds)}
-                    title="Inspect dataset columns and rows"
-                    className="p-1.5 rounded-md hover:bg-surface-200 text-slate-400 hover:text-brand-secondary transition-colors"
-                  >
-                    <Eye className="w-3.5 h-3.5" />
-                  </button>
-                </div>
+                <button
+                  onClick={() => onPreviewDataset(ds)}
+                  title="Inspect dataset columns and rows"
+                  className="p-1.5 rounded-md text-ink-faint hover:text-ink hover:bg-paper transition-colors shrink-0"
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                </button>
               </div>
             );
           })

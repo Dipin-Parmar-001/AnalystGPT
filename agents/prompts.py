@@ -402,7 +402,7 @@ MANDATORY sections below explicitly require.
 - Tool: `execute_python` (executes stateful Python code in a secure Modal Cloud Sandbox).
 - Available Packages: pandas, numpy, matplotlib, seaborn, scipy, statsmodels, openpyxl, scikit-learn.
 - File Registry & Paths: Available datasets are registered in `FILE_REGISTRY`. Load them directly by their filename (e.g. `pd.read_csv("data.csv")`) or via helper `pd.read_csv(get_file_path("data.csv"))`. Never prepend directory paths like "uploads/data.csv".
-- Tool Call Limit: You have a STRICT MAXIMUM limit of 7 tool calls.
+- Tool Call Limit: You have a STRICT MAXIMUM limit of {MAX_TOOL_CALLS} tool calls.
 - STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this tool call limit. Any tool call
   beyond the limit is rejected and will NOT be executed. You MUST complete ALL work — inspection,
   transformation, artifact saving, and verification — within this budget. Plan your calls before
@@ -744,7 +744,7 @@ loaded artifacts.
 
 # TOOL CALL LIMIT
 
-You have a STRICT MAXIMUM of 7 tool calls for either task type.
+You have a STRICT MAXIMUM of {MAX_TOOL_CALLS} tool calls for either task type.
 
 STRICT BUDGET RULES (NON-NEGOTIABLE):
 - You MUST stay inside this tool call limit. Any tool call beyond the limit is rejected and will
@@ -2159,7 +2159,7 @@ strictly grounded in the authoritative execution artifacts.
 # ENVIRONMENT & TOOLING
 - Tool: `execute_python` (stateful Modal Cloud Sandbox).
 - Sandbox already contains ALL upstream artifacts.
-- Tool Call Budget: You have a budget of up to 10 tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently to avoid unnecessary back-and-forth.
+- Tool Call Budget: You have a budget of up to {MAX_TOOL_CALLS} tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently to avoid unnecessary back-and-forth.
 - STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this budget. Any tool call beyond the limit is rejected and will NOT be executed. You MUST complete the entire report — all verification checks and the final report — within this budget. Never assume extra calls will be granted.
 
 # STRICT GROUNDING & ANTI-HALLUCINATION RULES
@@ -2307,7 +2307,7 @@ ALWAYS do this:
 - Turn 2 (if needed): Inspect the printed results, fix any script errors if they occurred, or proceed
   directly to writing the final analytical report based on the output.
  
-You have a maximum of 7 tool calls available, but your goal is to succeed in 1-2 calls.
+You have a maximum of {MAX_TOOL_CALLS} tool calls available, but your goal is to succeed in 1-2 calls.
 STRICT BUDGET RULE (NON-NEGOTIABLE): You MUST stay inside this tool call limit and MUST complete
 all work within it. Calls beyond the limit are rejected and never executed, and no extra calls
 will be granted — combine steps and finish within the budget.
@@ -2434,3 +2434,10 @@ file is written, your chat response should be only a brief plain-text confirmati
 === VERIFIED_METRICS (ground truth for all numbers) ===
 {verified_metrics_block}
 """
+
+
+def resolve_budget_placeholders(prompt: str, max_tool_calls: int) -> str:
+    """Fill the {MAX_TOOL_CALLS} placeholder in an agent system prompt with the
+    actual runtime budget. Uses .replace instead of str.format because the
+    prompts contain literal JSON braces (schemas, examples)."""
+    return prompt.replace("{MAX_TOOL_CALLS}", str(int(max_tool_calls)))

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { FileText, Copy, Check, Download, ExternalLink, Code } from 'lucide-react';
+import { FileText, Copy, Check, Download, Code } from 'lucide-react';
 
 export default function ReportViewer({ reportText }) {
   const [copied, setCopied] = useState(false);
@@ -28,62 +28,60 @@ export default function ReportViewer({ reportText }) {
 
   if (!reportText) {
     return (
-      <div className="p-8 text-center border border-surface-border rounded-xl bg-surface-100/40">
-        <FileText className="w-8 h-8 text-slate-500 mx-auto mb-2 opacity-50" />
-        <p className="text-sm font-medium text-slate-400">No Report Generated Yet</p>
-        <p className="text-xs text-slate-500 mt-1">
-          Execute a workflow to synthesize findings into an executive markdown report.
+      <div className="p-10 text-center border border-dashed border-edge-strong rounded-xl bg-card/60">
+        <FileText className="w-8 h-8 text-ink-faint/50 mx-auto mb-3" strokeWidth={1.6} />
+        <p className="text-[14px] font-medium text-ink-soft">No report yet</p>
+        <p className="text-[13px] text-ink-faint mt-1">
+          Once a run completes, the verified executive report appears here in a readable document layout.
         </p>
       </div>
     );
   }
 
   return (
-    <div className="border border-surface-border rounded-xl bg-surface-100/70 shadow-xl overflow-hidden flex flex-col">
-      {/* Header Controls */}
-      <div className="px-4 py-3 bg-surface-200/90 border-b border-surface-border flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <FileText className="w-4 h-4 text-brand-secondary" />
-          <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono">
-            Executive Analysis Report
-          </h3>
+    <div className="bg-card border border-edge rounded-xl shadow-card overflow-hidden">
+      {/* Header */}
+      <div className="px-5 py-3.5 border-b border-edge-soft flex items-center justify-between bg-card sticky top-16 z-10">
+        <div className="flex items-center gap-2.5">
+          <FileText className="w-4 h-4 text-ink-faint" />
+          <h3 className="text-[13px] font-semibold text-ink">Executive Report</h3>
         </div>
 
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowRaw(!showRaw)}
-            className="px-2.5 py-1 rounded-lg text-xs font-medium bg-surface-100 hover:bg-surface-hover border border-surface-border text-slate-300 flex items-center gap-1 transition-colors"
+            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-edge bg-paper hover:bg-edge-soft text-[11px] font-medium text-ink-soft transition-colors"
           >
-            <Code className="w-3.5 h-3.5 text-slate-400" />
-            {showRaw ? 'Rendered' : 'Raw Markdown'}
+            <Code className="w-3 h-3" />
+            {showRaw ? 'Rendered' : 'Raw'}
           </button>
 
           <button
             onClick={handleCopy}
-            className="px-2.5 py-1 rounded-lg text-xs font-medium bg-surface-100 hover:bg-surface-hover border border-surface-border text-slate-300 flex items-center gap-1 transition-colors"
+            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-edge bg-paper hover:bg-edge-soft text-[11px] font-medium text-ink-soft transition-colors"
           >
-            {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+            {copied ? <Check className="w-3 h-3 text-accent" /> : <Copy className="w-3 h-3" />}
             {copied ? 'Copied' : 'Copy'}
           </button>
 
           <button
             onClick={handleDownload}
-            className="px-2.5 py-1 rounded-lg text-xs font-medium bg-brand-primary/20 hover:bg-brand-primary/30 border border-brand-primary/40 text-indigo-300 flex items-center gap-1 transition-colors"
+            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md bg-accent hover:bg-accent-deep text-[11px] font-medium text-white transition-colors"
           >
-            <Download className="w-3.5 h-3.5" />
+            <Download className="w-3 h-3" />
             Download .md
           </button>
         </div>
       </div>
 
-      {/* Report Content Body */}
-      <div className="p-6 overflow-y-auto max-h-[600px] text-slate-200">
+      {/* Document body */}
+      <div className="px-8 lg:px-12 py-8 overflow-y-auto max-h-[calc(100vh-220px)]">
         {showRaw ? (
-          <pre className="font-mono text-xs text-slate-300 whitespace-pre-wrap bg-surface-200 p-4 rounded-lg border border-surface-border">
+          <pre className="font-code text-[12px] text-ink-soft whitespace-pre-wrap bg-paper border border-edge p-4 rounded-lg">
             {reportText}
           </pre>
         ) : (
-          <div className="markdown-body">
+          <div className="markdown-body max-w-[68ch]">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {reportText}
             </ReactMarkdown>

@@ -1,17 +1,25 @@
 import React, { useState } from 'react';
-import { Image, FileSpreadsheet, FileCode, Download, Eye, ExternalLink, Box } from 'lucide-react';
+import { Image, FileSpreadsheet, FileCode, Download, Eye, ExternalLink, Package } from 'lucide-react';
+
+const TYPE_META = {
+  image: { icon: Image, cls: 'text-agent-ml bg-agent-ml/10 border-agent-ml/25', label: 'Chart' },
+  dataset: { icon: FileSpreadsheet, cls: 'text-agent-analyst bg-agent-analyst/10 border-agent-analyst/25', label: 'Dataset' },
+  model: { icon: Package, cls: 'text-agent-planner bg-agent-planner/10 border-agent-planner/25', label: 'Model' },
+  report: { icon: FileCode, cls: 'text-agent-reporter bg-agent-reporter/10 border-agent-reporter/25', label: 'Report' },
+  file: { icon: FileCode, cls: 'text-ink-soft bg-paper border-edge', label: 'File' },
+  json: { icon: FileCode, cls: 'text-ink-soft bg-paper border-edge', label: 'JSON' },
+};
 
 export default function ArtifactsGallery({ artifacts }) {
   const [selectedImage, setSelectedImage] = useState(null);
-  const [previewCsv, setPreviewCsv] = useState(null);
 
   if (!artifacts || artifacts.length === 0) {
     return (
-      <div className="p-8 text-center border border-surface-border rounded-xl bg-surface-100/40">
-        <Box className="w-8 h-8 text-slate-500 mx-auto mb-2 opacity-50" />
-        <p className="text-sm font-medium text-slate-400">No Artifacts Generated Yet</p>
-        <p className="text-xs text-slate-500 mt-1">
-          Visualizations (PNG), model comparisons (CSV), and metric summaries will be listed here.
+      <div className="p-10 text-center border border-dashed border-edge-strong rounded-xl bg-card/60">
+        <Package className="w-8 h-8 text-ink-faint/50 mx-auto mb-3" strokeWidth={1.6} />
+        <p className="text-[14px] font-medium text-ink-soft">No artifacts yet</p>
+        <p className="text-[13px] text-ink-faint mt-1">
+          Charts, model comparison tables, and metric summaries produced by the run will be listed here.
         </p>
       </div>
     );
@@ -27,118 +35,102 @@ export default function ArtifactsGallery({ artifacts }) {
 
   return (
     <div className="space-y-4">
-      {/* Header */}
       <div className="flex items-center justify-between">
-        <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono flex items-center gap-2">
-          <Box className="w-4 h-4 text-brand-secondary" />
-          Generated Deliverables & Artifacts ({artifacts.length})
-        </h3>
+        <h3 className="text-[15px] font-semibold text-ink">Generated artifacts</h3>
+        <span className="text-[12px] text-ink-faint">{artifacts.length} files</span>
       </div>
 
-      {/* Grid of artifacts */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {artifacts.map((art, idx) => {
           const isImg = art.type === 'image';
           const isCsv = art.type === 'dataset';
-          const isModel = art.type === 'model';
-          const isReport = art.type === 'report';
+          const meta = TYPE_META[art.type] || TYPE_META.file;
+          const Icon = meta.icon;
 
           return (
             <div
               key={idx}
-              className="p-3 rounded-xl bg-surface-100/80 border border-surface-border hover:border-slate-600 transition-all flex flex-col justify-between group shadow-sm hover:shadow-md"
+              className="flex flex-col justify-between bg-card border border-edge rounded-xl shadow-card hover:shadow-pop transition-shadow overflow-hidden"
             >
-              {/* Top info */}
-              <div>
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div className="flex items-center gap-2">
-                    {isImg && <Image className="w-4 h-4 text-sky-400" />}
-                    {isCsv && <FileSpreadsheet className="w-4 h-4 text-emerald-400" />}
-                    {isModel && <Box className="w-4 h-4 text-fuchsia-400" />}
-                    {isReport && <FileCode className="w-4 h-4 text-amber-400" />}
-                    {!isImg && !isCsv && !isModel && !isReport && <FileCode className="w-4 h-4 text-slate-400" />}
-                    
-                    <span className="text-[10px] uppercase font-mono font-bold px-1.5 py-0.5 rounded bg-surface-200 text-slate-400 border border-surface-border">
-                      {art.type}
+              {/* Thumbnail zone for images */}
+              {isImg ? (
+                <button
+                  onClick={() => setSelectedImage(art.relative_url)}
+                  className="relative h-36 bg-paper border-b border-edge-soft overflow-hidden group/img block w-full"
+                >
+                  <img
+                    src={art.relative_url}
+                    alt={art.filename}
+                    className="w-full h-full object-contain p-2 transition-transform group-hover/img:scale-[1.03]"
+                    loading="lazy"
+                  />
+                  <span className="absolute inset-0 bg-ink/0 group-hover/img:bg-ink/10 transition-colors flex items-center justify-center">
+                    <span className="opacity-0 group-hover/img:opacity-100 transition-opacity inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ink text-paper text-[11px] font-medium">
+                      <Eye className="w-3.5 h-3.5" /> Expand
                     </span>
-                  </div>
-
-                  <span className="text-[10px] text-slate-500 font-mono">
-                    {formatBytes(art.size_bytes)}
                   </span>
+                </button>
+              ) : (
+                <div className="h-1.5 bg-paper border-b border-edge-soft" />
+              )}
+
+              <div className="p-4 flex-1 flex flex-col">
+                <div className="flex items-center justify-between mb-2">
+                  <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[10.5px] font-semibold uppercase tracking-wide ${meta.cls}`}>
+                    <Icon className="w-3 h-3" />
+                    {meta.label}
+                  </span>
+                  <span className="text-[11px] text-ink-faint tabular-nums">{formatBytes(art.size_bytes)}</span>
                 </div>
 
-                <p className="text-xs font-semibold text-slate-200 truncate" title={art.filename}>
+                <p className="text-[12.5px] font-medium text-ink truncate" title={art.filename}>
                   {art.filename}
                 </p>
 
-                {/* If image, show small thumbnail */}
-                {isImg && (
-                  <div
-                    onClick={() => setSelectedImage(art.relative_url)}
-                    className="mt-2.5 h-32 rounded-lg bg-black/40 border border-surface-border overflow-hidden cursor-pointer relative group/img"
-                  >
-                    <img
-                      src={art.relative_url}
-                      alt={art.filename}
-                      className="w-full h-full object-contain p-1 transition-transform group-hover/img:scale-105"
-                      loading="lazy"
-                    />
-                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 transition-opacity flex items-center justify-center text-white text-xs font-medium gap-1">
-                      <Eye className="w-4 h-4" /> Expand Chart
-                    </div>
-                  </div>
-                )}
-
-                {/* If CSV preview rows available */}
                 {isCsv && art.preview && art.preview.length > 0 && (
-                  <div className="mt-2 text-[10px] text-slate-400 font-mono">
-                    <span className="text-emerald-400 font-semibold">{art.preview.length}</span> preview rows captured
-                  </div>
+                  <p className="mt-1 text-[11px] text-ink-faint">
+                    {art.preview.length} preview rows captured
+                  </p>
                 )}
-              </div>
 
-              {/* Action Buttons */}
-              <div className="mt-3 pt-2 border-t border-surface-border/60 flex items-center justify-between">
-                <a
-                  href={art.relative_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-[11px] text-brand-secondary hover:underline flex items-center gap-1"
-                >
-                  <ExternalLink className="w-3 h-3" />
-                  Open
-                </a>
-
-                <a
-                  href={art.relative_url}
-                  download={art.filename}
-                  className="px-2 py-1 rounded bg-surface-200 hover:bg-surface-hover text-slate-300 text-[11px] flex items-center gap-1 transition-colors"
-                >
-                  <Download className="w-3 h-3" />
-                  Download
-                </a>
+                <div className="mt-3 pt-3 border-t border-edge-soft flex items-center justify-between">
+                  <a
+                    href={art.relative_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[12px] text-accent-deep hover:text-accent font-medium inline-flex items-center gap-1 transition-colors"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    Open
+                  </a>
+                  <a
+                    href={art.relative_url}
+                    download={art.filename}
+                    className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md border border-edge bg-paper hover:bg-edge-soft text-[11px] font-medium text-ink-soft transition-colors"
+                  >
+                    <Download className="w-3 h-3" />
+                    Download
+                  </a>
+                </div>
               </div>
             </div>
           );
         })}
       </div>
 
-      {/* Image Modal Preview */}
+      {/* Lightbox */}
       {selectedImage && (
         <div
           onClick={() => setSelectedImage(null)}
-          className="fixed inset-0 z-50 p-6 bg-black/85 backdrop-blur-sm flex items-center justify-center cursor-pointer animate-in fade-in"
+          className="fixed inset-0 z-50 p-6 bg-ink/80 flex items-center justify-center cursor-pointer animate-fade-up"
         >
-          <div className="relative max-w-4xl max-h-[85vh] bg-surface-100 p-2 rounded-2xl border border-surface-border shadow-2xl overflow-hidden">
+          <div className="relative max-w-4xl max-h-[85vh] bg-card p-2 rounded-xl shadow-pop border border-edge overflow-hidden">
             <img
               src={selectedImage}
-              alt="Visualization Zoom"
-              className="max-w-full max-h-[80vh] object-contain rounded-xl"
+              alt="Visualization zoom"
+              className="max-w-full max-h-[80vh] object-contain rounded-lg"
             />
-            <p className="text-center text-xs text-slate-400 py-2 font-mono">
-              Click anywhere outside to close
-            </p>
+            <p className="text-center text-[11px] text-ink-faint py-2">Click anywhere outside to close</p>
           </div>
         </div>
       )}

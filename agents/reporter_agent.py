@@ -27,7 +27,7 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC, build_verified_metrics
-from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT, REPORT_REPAIR_PROMPT
+from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT, REPORT_REPAIR_PROMPT, resolve_budget_placeholders
 from agents.memory_manager import MessageHistoryManager, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan
 from agents.cancellation import CancellationToken, WorkflowCancelledException
@@ -375,7 +375,7 @@ class ReporterAgent:
         user_content = "\n\n".join(user_content_parts)
 
         memory_manager = MessageHistoryManager(
-            system_prompt=REPORTER_SYSTEM_PROMPT,
+            system_prompt=resolve_budget_placeholders(REPORTER_SYSTEM_PROMPT, effective_max_calls),
             keep_last_tool_pairs=self.keep_last_tool_pairs,
             stdout_stderr_token_limit=self.stdout_stderr_token_limit,
             max_tokens_before_compact=self.max_tokens_before_compact
@@ -697,7 +697,7 @@ class ReporterAgent:
         )
 
         memory_manager = MessageHistoryManager(
-            system_prompt=REPORTER_SYSTEM_PROMPT,
+            system_prompt=resolve_budget_placeholders(REPORTER_SYSTEM_PROMPT, max_tool_calls),
             keep_last_tool_pairs=self.keep_last_tool_pairs,
             stdout_stderr_token_limit=self.stdout_stderr_token_limit,
             max_tokens_before_compact=self.max_tokens_before_compact

@@ -19,8 +19,18 @@ VERIFIED_METRICS now includes:
 
 import re
 import math
+import contextlib
 from typing import Dict, Any, List, Set, Optional, Tuple
 from dataclasses import dataclass, field
+
+from agents.logger import setup_logfire
+
+try:
+    import logfire
+except ImportError:
+    logfire = None
+
+setup_logfire()
 
 
 @dataclass
@@ -327,26 +337,43 @@ def verify_report_numbers(report_text: str, verified_metrics: Dict[str, Any]) ->
     Returns:
         VerificationResult with lists of verified and unverified claims, and formatted correction prompt if invalid.
     """
-    claims = extract_numeric_claims(report_text)
-    matcher = GroundTruthMatcher(verified_metrics)
+    span_ctx = logfire.span(
+        "NumericVerifier: Verify Report Numbers",
+        report_length=len(report_text or ""),
+        num_metrics=len(verified_metrics or {}),
+    ) if logfire else contextlib.nullcontext()
 
-    verified_list: List[NumericClaim] = []
-    unverified_list: List[NumericClaim] = []
-    provenance_map: Dict[str, List[str]] = {}
+    with span_ctx:
+        claims = extract_numeric_claims(report_text)
+        matcher = GroundTruthMatcher(verified_metrics)
 
-    for c in claims:
-        matched_paths = matcher.find_matches(c)
-        if matched_paths:
-            c.provenance = matched_paths[0]
-            provenance_map.setdefault(c.raw_str, [])
-            for p in matched_paths:
-                if p not in provenance_map[c.raw_str]:
-                    provenance_map[c.raw_str].append(p)
-            verified_list.append(c)
-        else:
-            unverified_list.append(c)
+        verified_list: List[NumericClaim] = []
+        unverified_list: List[NumericClaim] = []
+        provenance_map: Dict[str, List[str]] = {}
 
-    is_valid = len(unverified_list) == 0
+        for c in claims:
+            matched_paths = matcher.find_matches(c)
+            if matched_paths:
+                c.provenance = matched_paths[0]
+                provenance_map.setdefault(c.raw_str, [])
+                for p in matched_paths:
+                    if p not in provenance_map[c.raw_str]:
+                        provenance_map[c.raw_str].append(p)
+                verified_list.append(c)
+            else:
+                unverified_list.append(c)
+
+        is_valid = len(unverified_list) == 0
+
+        if logfire:
+            logfire.info(
+                "NumericVerifier: verification complete",
+                is_valid=is_valid,
+                total_claims=len(claims),
+                verified_count=len(verified_list),
+                unverified_count=len(unverified_list),
+                unverified_samples=[c.raw_str for c in unverified_list[:10]],
+            )
 
     correction_prompt = ""
     if not is_valid:

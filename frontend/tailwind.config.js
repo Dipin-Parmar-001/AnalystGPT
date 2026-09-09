@@ -4,43 +4,81 @@ export default {
     "./index.html",
     "./src/**/*.{js,ts,jsx,tsx}",
   ],
-  darkMode: 'class',
   theme: {
     extend: {
       colors: {
-        background: '#0B0F19',
-        surface: {
-          50: '#1A2234',
-          100: '#141B2D',
-          200: '#0F1523',
-          300: '#0B0F19',
-          border: '#1E293B',
-          hover: '#243048'
+        // Warm paper canvas — no gradients, no neon
+        paper: '#F6F4EF',
+        card: '#FFFFFF',
+        edge: {
+          DEFAULT: '#E6E1D6',   // hairline borders
+          strong: '#D8D2C4',
+          soft: '#EFEBE2',
         },
-        brand: {
-          primary: '#6366F1',
-          primaryHover: '#4F46E5',
-          secondary: '#38BDF8',
-          accent: '#10B981',
-          danger: '#EF4444',
-          warning: '#F59E0B',
-          purple: '#A855F7'
-        }
+        ink: {
+          DEFAULT: '#23201B',   // primary text
+          soft: '#5D574B',      // secondary text
+          faint: '#9A9284',     // tertiary/meta text
+        },
+        // Single interactive accent: forest green
+        accent: {
+          DEFAULT: '#2F6B4F',
+          deep: '#255743',
+          wash: '#EAF1EC',
+          edge: '#C9DCD1',
+        },
+        // Severity
+        danger: {
+          DEFAULT: '#B3261E',
+          deep: '#8F1D17',
+          wash: '#FBEDEC',
+          edge: '#EBCFCB',
+        },
+        caution: {
+          DEFAULT: '#946200',
+          wash: '#FBF3E2',
+          edge: '#EBDDBB',
+        },
+        // Agent identities (muted, distinguishable)
+        agent: {
+          planner: '#704826',   // russet
+          analyst: '#2F6B4F',   // forest
+          ml: '#B0562F',        // terracotta
+          reporter: '#8A7A2E',  // olive gold
+        },
+        // Live console panel (the one intentionally dark surface)
+        walnut: {
+          950: '#1C1915',
+          900: '#242019',
+          800: '#2E2921',
+          700: '#3A342A',
+          text: '#EFEAE0',
+          mute: '#A79E8F',
+        },
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
-        mono: ['JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', 'monospace'],
+        sans: ['"Instrument Sans"', 'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'sans-serif'],
+        serif: ['"Source Serif 4"', 'Georgia', 'Cambria', 'serif'],
+        code: ['"IBM Plex Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
-      animation: {
-        'pulse-subtle': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-        'glow': 'glow 2s ease-in-out infinite alternate',
+      boxShadow: {
+        card: '0 1px 2px rgba(33,29,24,0.04), 0 2px 10px rgba(33,29,24,0.05)',
+        pop: '0 2px 4px rgba(33,29,24,0.06), 0 12px 32px rgba(33,29,24,0.12)',
       },
       keyframes: {
-        glow: {
-          '0%': { boxShadow: '0 0 10px rgba(99, 102, 241, 0.2)' },
-          '100%': { boxShadow: '0 0 25px rgba(99, 102, 241, 0.6)' },
-        }
-      }
+        'fade-up': {
+          '0%': { opacity: '0', transform: 'translateY(4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        blink: {
+          '0%, 100%': { opacity: '1' },
+          '50%': { opacity: '0.35' },
+        },
+      },
+      animation: {
+        'fade-up': 'fade-up 0.25s ease-out both',
+        blink: 'blink 1.6s ease-in-out infinite',
+      },
     },
   },
   plugins: [],

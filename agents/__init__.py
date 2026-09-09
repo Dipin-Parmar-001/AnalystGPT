@@ -19,6 +19,7 @@ from agents.prompts import (
     REPORTER_AGENT,
     REPORTER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    resolve_budget_placeholders,
 )
 
 from agents.orchestrate import WorkflowOrchestrator, MultiAgentOrchestrator
@@ -51,6 +52,7 @@ __all__ = [
     "REPORTER_AGENT",
     "REPORTER_SYSTEM_PROMPT",
     "SYSTEM_PROMPT",
+    "resolve_budget_placeholders",
 ]
 
 

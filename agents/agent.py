@@ -86,7 +86,7 @@ DEFAULT_PORTKEY_CONFIG = {
     ]
 }
 
-from agents.prompts import SYSTEM_PROMPT
+from agents.prompts import SYSTEM_PROMPT, resolve_budget_placeholders
 
 class DataAnalystAgent:
     def __init__(
@@ -137,7 +137,7 @@ class DataAnalystAgent:
 
         # Memory and history manager instance
         self.memory_manager = MessageHistoryManager(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=resolve_budget_placeholders(SYSTEM_PROMPT, getattr(self, "max_tool_calls", 7)),
             keep_last_tool_pairs=keep_last_tool_pairs,
             stdout_stderr_token_limit=stdout_stderr_token_limit,
             max_tokens_before_compact=max_tokens_before_compact,

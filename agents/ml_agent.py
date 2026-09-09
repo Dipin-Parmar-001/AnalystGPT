@@ -31,7 +31,7 @@ from agents.tools import reset_global_sandbox_manager, extract_code_from_content
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
-from agents.prompts import ML_AGENT, ML_SYSTEM_PROMPT
+from agents.prompts import ML_AGENT, ML_SYSTEM_PROMPT, resolve_budget_placeholders
 from agents.cancellation import CancellationToken, WorkflowCancelledException
 
 
@@ -364,6 +364,7 @@ class MLAgent:
                 f"   - `tuned_model_comparison.csv` (Comparing baseline vs tuned metrics side by side)\n"
                 f"   - `best_params.json` (Winning hyperparameter combination and best CV score)\n"
                 f"   - `hyperparameter_tuning_summary.json` (Structured tuning summary JSON)\n"
+                f"   - `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json` AND `ml_summary.json` (Your own task summary with tuned-vs-baseline metric deltas — both files required)\n"
                 f"   - `best_model.pkl` (Updated only if tuned model won)\n"
                 f"7. Provide a concise summary of tuning results, parameter improvements, and test metric deltas."
             )
@@ -383,7 +384,7 @@ class MLAgent:
                 f"   - `confusion_matrix.json` (Confusion matrix data for best model)\n"
                 f"   - `predictions.csv` (Predictions with customerID, actual, predicted, probability)\n"
                 f"   - `best_model.pkl` (Best model saved via joblib.dump)\n"
-                f"   - `ml_summary.json` (Structured machine learning summary)\n"
+                f"   - `ml_summary.json` AND `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json` (Structured machine learning summary — both files required)\n"
                 f"8. You have a budget of MAX {effective_max_calls} tool calls.\n"
                 f"9. Output the final structured JSON summary and metric details."
             )
@@ -395,7 +396,7 @@ class MLAgent:
         )
 
         memory_manager = MessageHistoryManager(
-            system_prompt=ML_SYSTEM_PROMPT,
+            system_prompt=resolve_budget_placeholders(ML_SYSTEM_PROMPT, effective_max_calls),
             keep_last_tool_pairs=self.keep_last_tool_pairs,
             stdout_stderr_token_limit=self.stdout_stderr_token_limit,
             max_tokens_before_compact=self.max_tokens_before_compact,
@@ -748,6 +749,27 @@ class MLAgent:
             except Exception as write_err:
                 print(f"[MLAgent] Notice saving fallback summary: {write_err}")
 
+        # Enforce that the task generated ITS OWN designated summary (not a borrowed
+        # intermediate from another task type). This check applies to summaries only.
+        required_task_summary = (
+            "hyperparameter_tuning_summary.json"
+            if task_type == "hyperparameter_tuning"
+            else "ml_summary.json"
+        )
+        missing_required_summary = None
+        if not os.path.exists(os.path.join(output_dir, required_task_summary)):
+            missing_required_summary = required_task_summary
+            if HAS_LOGFIRE:
+                logfire.warn(
+                    "MLAgent task did not produce its own required summary",
+                    agent="MLAgent",
+                    task_type=task_type,
+                    required_summary=required_task_summary,
+                    generated_files=generated_files,
+                )
+            else:
+                print(f"[MLAgent] WARNING: task_type '{task_type}' did not produce its required summary '{required_task_summary}'.", flush=True)
+
         if HAS_LOGFIRE:
             logfire.info(
                 "MLAgent Task Finished",
@@ -767,6 +789,7 @@ class MLAgent:
             "generated_files": generated_files,
             "final_response": final_text,
             "summary_data": summary_data,
+            "missing_required_summary": missing_required_summary,
             "token_usage": memory_manager.token_usage(),
         }
 

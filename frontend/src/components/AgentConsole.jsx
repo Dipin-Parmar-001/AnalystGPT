@@ -1,5 +1,24 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Terminal, Bot, ChevronDown, ChevronRight, Play, CheckCircle2, Code2, AlertCircle, Sparkles, Filter, ShieldCheck, ShieldAlert } from 'lucide-react';
+import {
+  Terminal, Bot, ChevronDown, ChevronRight, CheckCircle2, Code2, ShieldCheck, ShieldAlert,
+  Loader2, Play, Wrench, XCircle, AlertTriangle, Filter, ArrowDownToLine
+} from 'lucide-react';
+
+const AGENT_COLORS = {
+  planner: { dot: 'bg-agent-planner', text: 'text-agent-planner', chip: 'bg-agent-planner/10 text-agent-planner border-agent-planner/30' },
+  analyst: { dot: 'bg-agent-analyst', text: 'text-agent-analyst', chip: 'bg-agent-analyst/10 text-agent-analyst border-agent-analyst/30' },
+  ml: { dot: 'bg-agent-ml', text: 'text-agent-ml', chip: 'bg-agent-ml/10 text-agent-ml border-agent-ml/30' },
+  reporter: { dot: 'bg-agent-reporter', text: 'text-agent-reporter', chip: 'bg-agent-reporter/10 text-agent-reporter border-agent-reporter/30' },
+};
+
+function agentMeta(name) {
+  const n = (name || '').toLowerCase();
+  if (n.includes('planner')) return AGENT_COLORS.planner;
+  if (n.includes('analyst') || n.includes('data')) return AGENT_COLORS.analyst;
+  if (n.includes('ml') || n.includes('machine')) return AGENT_COLORS.ml;
+  if (n.includes('reporter') || n.includes('report')) return AGENT_COLORS.reporter;
+  return { dot: 'bg-ink-faint', text: 'text-walnut-mute', chip: 'bg-walnut-800 text-walnut-text border-walnut-700' };
+}
 
 export default function AgentConsole({ events, isRunning }) {
   const [autoScroll, setAutoScroll] = useState(true);
@@ -17,15 +36,6 @@ export default function AgentConsole({ events, isRunning }) {
     setExpandedTurns((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const getAgentColor = (agent) => {
-    const a = (agent || '').toLowerCase();
-    if (a.includes('planner')) return 'text-indigo-400 border-indigo-800 bg-indigo-950/60';
-    if (a.includes('analyst')) return 'text-emerald-400 border-emerald-800 bg-emerald-950/60';
-    if (a.includes('ml')) return 'text-fuchsia-400 border-fuchsia-800 bg-fuchsia-950/60';
-    if (a.includes('reporter')) return 'text-amber-400 border-amber-800 bg-amber-950/60';
-    return 'text-sky-400 border-sky-800 bg-sky-950/60';
-  };
-
   const filteredEvents = events.filter((ev) => {
     if (filterAgent === 'all') return true;
     const agent = (ev.data?.agent || ev.agent || '').toLowerCase();
@@ -33,33 +43,29 @@ export default function AgentConsole({ events, isRunning }) {
   });
 
   return (
-    <div className="border border-surface-border rounded-xl bg-surface-200/90 flex flex-col h-[520px] overflow-hidden shadow-xl">
-      {/* Console Header */}
-      <div className="px-4 py-2.5 bg-surface-100/90 border-b border-surface-border flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-brand-secondary" />
-          <span className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono">
-            Agent Live Stream
-          </span>
+    <div className="rounded-xl border border-edge bg-card shadow-card overflow-hidden">
+      {/* Chrome */}
+      <div className="px-4 py-3 border-b border-edge-soft flex items-center justify-between bg-card">
+        <div className="flex items-center gap-2.5">
+          <Terminal className="w-4 h-4 text-ink-faint" />
+          <span className="text-[13px] font-semibold text-ink">Live Console</span>
           {isRunning && (
-            <span className="flex items-center gap-1 text-[11px] text-indigo-400 font-mono">
-              <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping"></span>
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-accent-deep">
+              <Loader2 className="w-3 h-3 animate-spin" />
               Streaming
             </span>
           )}
         </div>
 
-        {/* Console Controls */}
         <div className="flex items-center gap-2">
-          {/* Agent Filter */}
-          <div className="flex items-center gap-1 text-[11px] bg-surface-200 border border-surface-border rounded-md px-2 py-0.5 text-slate-300">
-            <Filter className="w-3 h-3 text-slate-500" />
+          <div className="flex items-center gap-1.5 text-[12px]">
+            <Filter className="w-3.5 h-3.5 text-ink-faint" />
             <select
               value={filterAgent}
               onChange={(e) => setFilterAgent(e.target.value)}
-              className="bg-transparent border-none text-slate-300 text-[11px] focus:outline-none cursor-pointer"
+              className="h-7 px-2 rounded-md border border-edge bg-paper text-[12px] text-ink-soft focus:outline-none focus:border-accent cursor-pointer"
             >
-              <option value="all">All Agents</option>
+              <option value="all">All agents</option>
               <option value="Planner">Planner</option>
               <option value="Analyst">Analyst</option>
               <option value="ML">ML Agent</option>
@@ -69,23 +75,25 @@ export default function AgentConsole({ events, isRunning }) {
 
           <button
             onClick={() => setAutoScroll(!autoScroll)}
-            className={`px-2 py-0.5 rounded text-[11px] font-mono border transition-colors ${
+            className={`inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border text-[11px] font-medium transition-colors ${
               autoScroll
-                ? 'bg-brand-primary/20 text-indigo-300 border-brand-primary/40'
-                : 'bg-surface-200 text-slate-400 border-surface-border'
+                ? 'bg-accent-wash text-accent-deep border-accent-edge'
+                : 'bg-paper text-ink-faint border-edge hover:text-ink-soft'
             }`}
           >
-            Auto-Scroll: {autoScroll ? 'ON' : 'OFF'}
+            <ArrowDownToLine className="w-3 h-3" />
+            Auto-scroll {autoScroll ? 'on' : 'off'}
           </button>
         </div>
       </div>
 
-      {/* Events Stream Body */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3 font-mono text-xs">
+      {/* Stream body — the one dark surface */}
+      <div className="bg-walnut-900 scrollbar-walnut overflow-y-auto h-[calc(100vh-260px)] min-h-[420px] max-h-[720px] p-4 space-y-2.5 font-code text-[12px]">
         {filteredEvents.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-slate-500 italic space-y-1">
-            <Bot className="w-6 h-6 opacity-40" />
-            <p>Live telemetry and agent interactions will stream here in real-time.</p>
+          <div className="h-full min-h-[380px] flex flex-col items-center justify-center text-walnut-mute space-y-2">
+            <Bot className="w-7 h-7 opacity-40" strokeWidth={1.5} />
+            <p className="font-sans text-[13px]">Live telemetry and agent interactions stream here in real time.</p>
+            <p className="font-sans text-[12px] opacity-70">Start a run from Setup &amp; Run to begin.</p>
           </div>
         ) : (
           filteredEvents.map((ev, index) => {
@@ -93,25 +101,27 @@ export default function AgentConsole({ events, isRunning }) {
             const data = ev.data || ev;
             const timestamp = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
             const key = `event-${index}`;
+            const am = agentMeta(data.agent);
 
-            // 1. LLM Thought Event
+            // LLM thought
             if (eventType === 'llm_thought') {
               return (
-                <div key={key} className="p-3 rounded-lg bg-surface-100/70 border border-surface-border">
-                  <div className="flex items-center justify-between text-[11px] mb-1.5">
-                    <span className={`px-2 py-0.5 rounded border font-semibold ${getAgentColor(data.agent)}`}>
-                      {data.agent || 'Agent'} Thought (Turn {data.turn || 1})
+                <div key={key} className="rounded-lg bg-walnut-800/80 border border-walnut-700 p-3 animate-fade-up">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-sans text-[11px] font-medium ${am.chip}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${am.dot}`} />
+                      {data.agent || 'Agent'} · thought
                     </span>
-                    <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                    <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                   </div>
-                  <p className="text-slate-300 whitespace-pre-wrap font-sans text-xs leading-relaxed">
+                  <p className="text-walnut-text/90 whitespace-pre-wrap font-sans text-[13px] leading-relaxed">
                     {data.thought}
                   </p>
                 </div>
               );
             }
 
-            // 2. Tool Executing
+            // Tool executing
             if (eventType === 'tool_executing') {
               let parsedCode = '';
               try {
@@ -120,28 +130,24 @@ export default function AgentConsole({ events, isRunning }) {
               } catch {
                 parsedCode = data.raw_args;
               }
-
               const isExp = expandedTurns[key];
 
               return (
-                <div key={key} className="p-3 rounded-lg bg-indigo-950/20 border border-indigo-900/50 space-y-1.5">
-                  <div
-                    className="flex items-center justify-between cursor-pointer"
+                <div key={key} className="rounded-lg bg-walnut-950/60 border border-walnut-700 space-y-1 animate-fade-up">
+                  <button
                     onClick={() => toggleTurn(key)}
+                    className="w-full flex items-center justify-between px-3 py-2 text-left"
                   >
-                    <div className="flex items-center gap-2">
-                      {isExp ? <ChevronDown className="w-3.5 h-3.5 text-indigo-400" /> : <ChevronRight className="w-3.5 h-3.5 text-indigo-400" />}
-                      <Code2 className="w-3.5 h-3.5 text-indigo-400" />
-                      <span className="text-xs font-semibold text-indigo-300">
-                        {data.agent}: Executing {data.fn_name || 'Python Script'}
-                      </span>
-                    </div>
-                    <span className="text-slate-500 text-[10px]">{timestamp}</span>
-                  </div>
-
+                    <span className="flex items-center gap-2 font-sans text-[12px] font-medium text-walnut-text">
+                      {isExp ? <ChevronDown className="w-3.5 h-3.5 text-walnut-mute" /> : <ChevronRight className="w-3.5 h-3.5 text-walnut-mute" />}
+                      <Code2 className="w-3.5 h-3.5 text-accent" />
+                      {data.agent || 'Agent'} — executing <span className="text-walnut-mute">{data.fn_name || 'execute_python'}</span>
+                    </span>
+                    <span className="text-walnut-mute text-[10px]">{timestamp}</span>
+                  </button>
                   {parsedCode && (
-                    <div className={isExp ? 'block' : 'line-clamp-3'}>
-                      <pre className="bg-black/50 p-2 rounded text-[11px] text-emerald-300 overflow-x-auto border border-indigo-950">
+                    <div className={`${isExp ? 'block' : 'hidden'}`}>
+                      <pre className="px-3 pb-3 text-[11px] leading-relaxed text-walnut-text/80 overflow-x-auto">
                         <code>{parsedCode}</code>
                       </pre>
                     </div>
@@ -150,7 +156,7 @@ export default function AgentConsole({ events, isRunning }) {
               );
             }
 
-            // 3. Tool Completed
+            // Tool completed
             if (eventType === 'tool_completed') {
               const res = data.result || {};
               const stdout = res.stdout || res.output || '';
@@ -159,36 +165,38 @@ export default function AgentConsole({ events, isRunning }) {
               const isExp = expandedTurns[key];
 
               return (
-                <div key={key} className="p-3 rounded-lg bg-surface-100/50 border border-surface-border space-y-1.5">
-                  <div
-                    className="flex items-center justify-between cursor-pointer"
+                <div key={key} className="rounded-lg bg-walnut-800/50 border border-walnut-700/70 space-y-1 animate-fade-up">
+                  <button
                     onClick={() => toggleTurn(key)}
+                    className="w-full flex items-center justify-between px-3 py-2 text-left"
                   >
-                    <div className="flex items-center gap-2">
-                      {isExp ? <ChevronDown className="w-3.5 h-3.5 text-emerald-400" /> : <ChevronRight className="w-3.5 h-3.5 text-emerald-400" />}
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                      <span className="text-xs font-medium text-slate-300">
-                        {data.agent}: Tool Output {res.success ? '(Success)' : '(Finished)'}
-                      </span>
-                    </div>
-                    <span className="text-slate-500 text-[10px]">{timestamp}</span>
-                  </div>
+                    <span className="flex items-center gap-2 font-sans text-[12px] font-medium text-walnut-text">
+                      {isExp ? <ChevronDown className="w-3.5 h-3.5 text-walnut-mute" /> : <ChevronRight className="w-3.5 h-3.5 text-walnut-mute" />}
+                      {res.success ? (
+                        <CheckCircle2 className="w-3.5 h-3.5 text-accent" />
+                      ) : (
+                        <XCircle className="w-3.5 h-3.5 text-danger" />
+                      )}
+                      {data.agent || 'Agent'} — {res.success ? 'tool finished' : 'tool failed'}
+                    </span>
+                    <span className="text-walnut-mute text-[10px]">{timestamp}</span>
+                  </button>
 
                   {(stdout || stderr || files.length > 0) && (
-                    <div className={`space-y-1 ${isExp ? 'block' : 'line-clamp-3'}`}>
+                    <div className={`${isExp ? 'block' : 'hidden'} px-3 pb-3 space-y-1.5`}>
                       {stdout && (
-                        <pre className="bg-black/40 p-2 rounded text-[11px] text-slate-300 overflow-x-auto">
+                        <pre className="bg-walnut-950/70 p-2.5 rounded text-[11px] text-walnut-text/75 overflow-x-auto">
                           <code>{stdout}</code>
                         </pre>
                       )}
                       {stderr && (
-                        <pre className="bg-red-950/30 border border-red-900/40 p-2 rounded text-[11px] text-red-300 overflow-x-auto">
+                        <pre className="bg-danger/10 border border-danger/30 p-2.5 rounded text-[11px] text-danger/90 overflow-x-auto">
                           <code>{stderr}</code>
                         </pre>
                       )}
                       {files.length > 0 && (
-                        <p className="text-[11px] text-brand-secondary font-mono">
-                          Saved Artifacts: {files.join(', ')}
+                        <p className="font-sans text-[11px] text-walnut-mute">
+                          Saved: {files.join(', ')}
                         </p>
                       )}
                     </div>
@@ -197,82 +205,56 @@ export default function AgentConsole({ events, isRunning }) {
               );
             }
 
-            // 4. Task Execution Start / Completed
+            // Task start / completed
             if (eventType === 'task_execution_start') {
               return (
-                <div key={key} className="p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-700/60 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-indigo-300 flex items-center gap-1.5">
-                    <Play className="w-3.5 h-3.5 text-indigo-400" />
-                    Starting Task #{data.task_id}: {data.title} ({data.assigned_agent})
+                <div key={key} className="flex items-center justify-between px-3 py-2 rounded-lg bg-walnut-800/70 border border-walnut-700 animate-fade-up">
+                  <span className="font-sans text-[12px] font-medium text-walnut-text flex items-center gap-2">
+                    <Play className="w-3.5 h-3.5 text-accent" />
+                    Task #{data.task_id} started — {data.title}
                   </span>
-                  <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                  <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                 </div>
               );
             }
 
             if (eventType === 'task_execution_completed') {
               return (
-                <div key={key} className="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-800/50 flex items-center justify-between">
-                  <span className="text-xs font-medium text-emerald-300 flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    Completed Task #{data.task_id}: {data.title}
+                <div key={key} className="flex items-center justify-between px-3 py-2 rounded-lg bg-walnut-800/40 border border-walnut-700/60 animate-fade-up">
+                  <span className="font-sans text-[12px] text-walnut-text/85 flex items-center gap-2">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-accent" />
+                    Task #{data.task_id} {data.status === 'completed' ? 'completed' : `ended (${data.status || 'done'})`} — {data.title}
                   </span>
-                  <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                  <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                 </div>
               );
             }
 
-            // 5. Workflow Cancelled Event
-            if (eventType === 'workflow_cancelled') {
-              return (
-                <div key={key} className="p-3 rounded-lg bg-red-950/60 border border-red-700 text-red-300 space-y-1">
-                  <div className="flex items-center justify-between font-bold">
-                    <span>🛑 Workflow Execution Halted by User Request</span>
-                    <span className="text-[10px] text-red-400 font-normal">{timestamp}</span>
-                  </div>
-                  <p className="text-xs text-red-200">{data.message || 'Execution stopped immediately.'}</p>
-                </div>
-              );
-            }
-
-            // 6. Workflow Failed Event
-            if (eventType === 'workflow_failed') {
-              return (
-                <div key={key} className="p-3 rounded-lg bg-amber-950/60 border border-amber-700 text-amber-300 space-y-1">
-                  <div className="flex items-center justify-between font-bold">
-                    <span>⚠️ Workflow Execution Error</span>
-                    <span className="text-[10px] text-amber-400 font-normal">{timestamp}</span>
-                  </div>
-                  <p className="text-xs text-amber-200">{data.error || data.message}</p>
-                </div>
-              );
-            }
-
-            // 7. Final Verification & Repair Events
+            // Verification & repair
             if (eventType === 'final_verification_started') {
               return (
-                <div key={key} className="p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-700/60 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-indigo-300 flex items-center gap-1.5">
-                    <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
-                    Final Verification: numeric gate + consistency checker + LLM judge
+                <div key={key} className="flex items-center justify-between px-3 py-2 rounded-lg bg-accent/10 border border-accent/30 animate-fade-up">
+                  <span className="font-sans text-[12px] font-medium text-accent flex items-center gap-2">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    Final verification — numeric gate, consistency checks, LLM judge
                   </span>
-                  <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                  <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                 </div>
               );
             }
 
             if (eventType === 'report_repair_started') {
               return (
-                <div key={key} className="p-3 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-300 space-y-1">
-                  <div className="flex items-center justify-between font-bold text-xs">
-                    <span className="flex items-center gap-1.5">
-                      <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
-                      Report Repair Pass {data.attempt}/{data.max_attempts}
+                <div key={key} className="px-3 py-2.5 rounded-lg bg-caution/10 border border-caution/30 space-y-0.5 animate-fade-up">
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-[12px] font-semibold text-caution flex items-center gap-2">
+                      <Wrench className="w-3.5 h-3.5" />
+                      Report repair pass {data.attempt}/{data.max_attempts}
                     </span>
-                    <span className="text-[10px] text-amber-400 font-normal">{timestamp}</span>
+                    <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                   </div>
-                  <p className="text-xs text-amber-200">
-                    {data.critical_count} critical finding(s) survived. Combining all verification findings into one
+                  <p className="font-sans text-[11.5px] text-walnut-text/75">
+                    {data.critical_count} critical finding(s) remain — all findings combined into one
                     correction prompt (repair agent gets 5 sandbox tool calls).
                   </p>
                 </div>
@@ -281,24 +263,52 @@ export default function AgentConsole({ events, isRunning }) {
 
             if (eventType === 'report_repair_completed') {
               return (
-                <div key={key} className="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-800/50 flex items-center justify-between">
-                  <span className="text-xs font-medium text-emerald-300 flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    Repair Pass {data.attempt} complete — re-verifying with all methods
+                <div key={key} className="flex items-center justify-between px-3 py-2 rounded-lg bg-accent/10 border border-accent/30 animate-fade-up">
+                  <span className="font-sans text-[12px] text-accent flex items-center gap-2">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Repair pass {data.attempt} complete — re-verifying with all methods
                   </span>
-                  <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                  <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                 </div>
               );
             }
 
-            // Fallback generic event log
+            // Workflow cancelled / failed
+            if (eventType === 'workflow_cancelled') {
+              return (
+                <div key={key} className="px-3 py-2.5 rounded-lg bg-danger/10 border border-danger/40 space-y-0.5 animate-fade-up">
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-[12px] font-semibold text-danger">Workflow terminated by user</span>
+                    <span className="text-walnut-mute text-[10px]">{timestamp}</span>
+                  </div>
+                  <p className="font-sans text-[11.5px] text-walnut-text/75">{data.message || 'Execution stopped immediately.'}</p>
+                </div>
+              );
+            }
+
+            if (eventType === 'workflow_failed') {
+              return (
+                <div key={key} className="px-3 py-2.5 rounded-lg bg-caution/10 border border-caution/40 space-y-0.5 animate-fade-up">
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-[12px] font-semibold text-caution flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5" /> Workflow error
+                    </span>
+                    <span className="text-walnut-mute text-[10px]">{timestamp}</span>
+                  </div>
+                  <p className="font-sans text-[11.5px] text-walnut-text/75">{data.error || data.message}</p>
+                </div>
+              );
+            }
+
+            // Generic fallback
             return (
-              <div key={key} className="p-2 rounded bg-surface-100/40 border border-surface-border text-slate-400 flex items-center justify-between text-[11px]">
-                <span>
-                  <strong className="text-slate-300">{eventType}: </strong>
-                  {typeof data === 'string' ? data : data.message || JSON.stringify(data).slice(0, 120)}
+              <div key={key} className="flex items-center justify-between px-3 py-1.5 text-walnut-mute animate-fade-up">
+                <span className="font-sans text-[11.5px]">
+                  <span className="text-walnut-text/70 font-medium">{eventType}</span>
+                  {' — '}
+                  {typeof data === 'string' ? data : data.message || JSON.stringify(data).slice(0, 110)}
                 </span>
-                <span className="text-slate-500 text-[10px]">{timestamp}</span>
+                <span className="text-[10px]">{timestamp}</span>
               </div>
             );
           })

@@ -21,11 +21,20 @@ import os
 import json
 import glob
 import hashlib
+import contextlib
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 
 from agents.run_context import build_dataset_profile
+from agents.logger import setup_logfire
+
+try:
+    import logfire
+except ImportError:
+    logfire = None
+
+setup_logfire()
 
 SEVERITY_CRITICAL = "critical"
 SEVERITY_MINOR = "minor"
@@ -461,30 +470,61 @@ def run_consistency_checks(
     profile = build_dataset_profile(output_dir, uploaded_files, persist=False)
     findings: List[Finding] = []
 
-    for check in (
-        lambda: check_dataset_shape_claims(output_dir, profile),
-        lambda: check_phantom_columns(output_dir, profile),
-        lambda: check_missing_values_consistency(output_dir, profile),
-        lambda: check_model_artifact_consistency(output_dir),
-        lambda: check_duplicate_summaries(output_dir),
-        lambda: check_report_artifact_references(output_dir, report_text or ""),
-    ):
-        try:
-            findings.extend(check())
-        except Exception as e:
-            findings.append(Finding(
-                SEVERITY_MINOR, "check_error",
-                f"Consistency check raised an error and was skipped: {e}",
-                [],
-            ))
+    checks = (
+        ("dataset_shape_claims", lambda: check_dataset_shape_claims(output_dir, profile)),
+        ("phantom_columns", lambda: check_phantom_columns(output_dir, profile)),
+        ("missing_values_consistency", lambda: check_missing_values_consistency(output_dir, profile)),
+        ("model_artifact_consistency", lambda: check_model_artifact_consistency(output_dir)),
+        ("duplicate_summaries", lambda: check_duplicate_summaries(output_dir)),
+        ("report_artifact_references", lambda: check_report_artifact_references(output_dir, report_text or "")),
+    )
+
+    span_ctx = logfire.span(
+        "ConsistencyChecker: Run Cross-Artifact Checks", output_dir=output_dir, num_checks=len(checks)
+    ) if logfire else contextlib.nullcontext()
+
+    with span_ctx:
+        for check_name, check in checks:
+            try:
+                check_findings = check()
+                findings.extend(check_findings)
+                if logfire:
+                    logfire.info(
+                        f"ConsistencyChecker: {check_name} finished",
+                        check=check_name,
+                        findings_count=len(check_findings),
+                        critical_count=sum(1 for f in check_findings if f.severity == SEVERITY_CRITICAL),
+                        codes=[f.code for f in check_findings],
+                    )
+            except Exception as e:
+                findings.append(Finding(
+                    SEVERITY_MINOR, "check_error",
+                    f"Consistency check raised an error and was skipped: {e}",
+                    [],
+                ))
+                if logfire:
+                    logfire.warn(f"ConsistencyChecker: {check_name} raised an error; check skipped",
+                                 check=check_name, error=str(e))
 
     report = ConsistencyReport(
         output_dir=output_dir,
         checked_at=datetime.now().isoformat(timespec="seconds"),
         findings=findings,
     )
+    if logfire:
+        logfire.info(
+            "ConsistencyChecker: consistency report complete",
+            output_dir=output_dir,
+            is_valid=report.is_valid,
+            **report.counts(),
+        )
     if persist:
-        report.save()
+        saved_path = report.save()
+        if logfire:
+            if saved_path:
+                logfire.info("ConsistencyChecker: report persisted", path=saved_path)
+            else:
+                logfire.warn("ConsistencyChecker: could not persist consistency report", output_dir=output_dir)
     return report
 
 

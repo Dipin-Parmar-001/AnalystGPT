@@ -4,102 +4,116 @@
 
 @layer base {
   :root {
-    --bg-primary: #0B0F19;
-    --card-bg: #141B2D;
-    --card-border: #1E293B;
+    --paper: #F6F4EF;
+    --ink: #23201B;
+    --accent: #2F6B4F;
+  }
+
+  html {
+    font-feature-settings: "ss01", "cv06";
   }
 
   body {
-    background-color: var(--bg-primary);
-    color: #F1F5F9;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    background-color: var(--paper);
+    color: var(--ink);
+    /* Tabular figures everywhere numbers appear in data contexts */
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: rgba(47, 107, 79, 0.16);
   }
 }
 
-/* Custom sleek scrollbar */
+/* Quiet scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #0B0F19;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1E293B;
-  border-radius: 4px;
+  background: #D8D2C4;
+  border-radius: 8px;
+  border: 2px solid #F6F4EF;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+  background: #C4BCAB;
 }
 
-/* Glassmorphism utility */
-.glass-panel {
-  background: rgba(20, 27, 45, 0.75);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(30, 41, 59, 0.8);
+/* Dark console scrollbar */
+.scrollbar-walnut::-webkit-scrollbar-thumb {
+  background: #3A342A;
+  border-color: #242019;
+}
+.scrollbar-walnut::-webkit-scrollbar-thumb:hover {
+  background: #4A4335;
 }
 
-.glass-card {
-  background: rgba(26, 34, 52, 0.6);
-  backdrop-filter: blur(8px);
-  border: 1px solid rgba(51, 65, 85, 0.5);
+/* Editorial markdown styling for the executive report */
+.markdown-body {
+  font-family: "Source Serif 4", Georgia, serif;
+  color: #23201B;
+  font-size: 15px;
+  line-height: 1.75;
 }
-
-/* Subtle glow badges */
-.glow-primary {
-  box-shadow: 0 0 15px rgba(99, 102, 241, 0.35);
-}
-.glow-danger {
-  box-shadow: 0 0 15px rgba(239, 68, 68, 0.35);
-}
-.glow-success {
-  box-shadow: 0 0 15px rgba(16, 185, 129, 0.35);
-}
-.glow-warning {
-  box-shadow: 0 0 15px rgba(245, 158, 11, 0.35);
-}
-
-/* Markdown styling inside reports */
 .markdown-body h1 {
-  @apply text-2xl font-bold text-slate-100 mt-6 mb-3 border-b border-slate-700/60 pb-2 flex items-center gap-2;
+  @apply text-2xl font-semibold text-ink mt-8 mb-3 pb-2 border-b border-edge;
+  font-family: "Instrument Sans", sans-serif;
+  letter-spacing: -0.01em;
 }
 .markdown-body h2 {
-  @apply text-xl font-semibold text-brand-secondary mt-5 mb-2 border-b border-slate-800 pb-1;
+  @apply text-xl font-semibold text-ink mt-7 mb-2 pb-1.5 border-b border-edge-soft;
+  font-family: "Instrument Sans", sans-serif;
 }
 .markdown-body h3 {
-  @apply text-lg font-medium text-slate-200 mt-4 mb-2;
+  @apply text-base font-semibold text-ink mt-5 mb-2;
+  font-family: "Instrument Sans", sans-serif;
 }
 .markdown-body p {
-  @apply text-slate-300 my-2 leading-relaxed text-sm;
+  @apply my-3 text-ink-soft;
+}
+.markdown-body strong {
+  @apply text-ink font-semibold;
 }
 .markdown-body ul, .markdown-body ol {
-  @apply pl-6 my-2 text-slate-300 text-sm space-y-1 list-disc;
+  @apply pl-6 my-3 text-ink-soft space-y-1.5 list-disc;
 }
 .markdown-body ol {
   @apply list-decimal;
 }
+.markdown-body li::marker {
+  color: #2F6B4F;
+}
 .markdown-body table {
-  @apply w-full my-4 border-collapse text-xs;
+  @apply w-full my-5 border-collapse text-[13px];
+  font-family: "Instrument Sans", sans-serif;
 }
 .markdown-body th {
-  @apply bg-surface-100 border border-surface-border text-slate-200 font-semibold p-2.5 text-left;
+  @apply bg-paper border border-edge text-ink font-semibold px-3 py-2 text-left;
 }
 .markdown-body td {
-  @apply border border-surface-border p-2 text-slate-300;
+  @apply border border-edge px-3 py-2 text-ink-soft;
 }
 .markdown-body tr:nth-child(even) {
-  @apply bg-surface-200/40;
+  @apply bg-paper/60;
 }
 .markdown-body blockquote {
-  @apply border-l-4 border-brand-primary pl-4 py-1 my-3 bg-brand-primary/10 rounded-r text-slate-300 italic text-sm;
+  @apply border-l-[3px] border-accent pl-4 pr-3 py-2 my-4 bg-accent-wash rounded-r-md text-ink-soft text-sm not-italic;
 }
 .markdown-body code {
-  @apply bg-surface-200 text-brand-secondary px-1.5 py-0.5 rounded font-mono text-xs border border-slate-700/50;
+  @apply bg-paper border border-edge text-ink px-1.5 py-0.5 rounded font-code text-[12px];
 }
 .markdown-body pre {
-  @apply bg-surface-200/90 border border-slate-700/80 p-3 rounded-lg overflow-x-auto my-3 font-mono text-xs;
+  @apply bg-walnut-900 text-walnut-text border border-walnut-700 p-4 rounded-lg overflow-x-auto my-4 font-code text-xs leading-relaxed;
 }
 .markdown-body pre code {
-  @apply bg-transparent p-0 border-none text-slate-200;
+  @apply bg-transparent p-0 border-none text-walnut-text;
+}
+.markdown-body hr {
+  @apply border-edge my-6;
+}
+.markdown-body a {
+  @apply text-accent underline underline-offset-2;
 }

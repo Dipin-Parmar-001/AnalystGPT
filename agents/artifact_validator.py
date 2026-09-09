@@ -113,7 +113,13 @@ def detect_fallback_generation(agent_response: Dict[str, Any], output_dir: str) 
         if isinstance(issues, list):
             for issue in issues:
                 if isinstance(issue, str):
-                    if any(kw in issue.lower() for kw in ["fallback", "not generated", "not produced", "could not"]):
+                    # Only an explicit 'fallback' mention counts. Softer phrases
+                    # ('could not', 'not produced') are routine honest caveats
+                    # (e.g. 'could not drop the ID column') and previously caused
+                    # false fallback flags that failed otherwise-valid tasks;
+                    # genuinely missing files are already caught by the
+                    # missing_artifacts check.
+                    if re.search(r"\bfallback\b", issue.lower()):
                         fallback_indicators.append(f"Summary issue: {issue[:100]}")
 
         # Check status

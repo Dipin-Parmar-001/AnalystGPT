@@ -1,73 +1,77 @@
 import React from 'react';
-import { AlertOctagon, ShieldAlert, Check, X, Flame } from 'lucide-react';
+import { AlertOctagon, ShieldAlert, Loader2, X, Flame } from 'lucide-react';
 
 export default function TerminateModal({ isOpen, onClose, onConfirm, terminating }) {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
-      <div className="bg-surface-100 border border-red-800/80 rounded-2xl max-w-md w-full p-6 shadow-2xl glow-danger relative overflow-hidden">
-        {/* Top warning accent bar */}
-        <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-red-600 via-rose-500 to-amber-500"></div>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-ink/60 animate-fade-up">
+      <div className="bg-card border border-danger-edge rounded-xl max-w-md w-full shadow-pop relative overflow-hidden">
+        <button
+          onClick={onClose}
+          className="absolute top-3.5 right-3.5 p-1.5 rounded-md text-ink-faint hover:text-ink hover:bg-paper transition-colors"
+        >
+          <X className="w-4 h-4" />
+        </button>
 
-        {/* Icon & Title */}
-        <div className="flex items-start gap-4">
-          <div className="w-12 h-12 rounded-xl bg-red-950/80 border border-red-700 flex items-center justify-center shrink-0">
-            <AlertOctagon className="w-6 h-6 text-red-400 animate-pulse" />
+        <div className="p-6">
+          {/* Title */}
+          <div className="flex items-start gap-4">
+            <div className="w-11 h-11 rounded-lg bg-danger-wash border border-danger-edge flex items-center justify-center shrink-0">
+              <AlertOctagon className="w-5 h-5 text-danger" />
+            </div>
+            <div>
+              <h3 className="text-[16px] font-semibold text-ink">Terminate the workflow?</h3>
+              <p className="text-[12.5px] text-ink-soft mt-0.5">
+                This immediately halts every agent and sandbox process.
+              </p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-base font-bold text-slate-100">
-              Terminate Multi-Agent Workflow?
-            </h3>
-            <p className="text-xs text-red-300/90 font-mono mt-0.5">
-              Confirm Immediate Cancellation
+
+          {/* Impact */}
+          <div className="mt-5 p-4 rounded-lg bg-paper border border-edge text-[13px] text-ink-soft">
+            <p className="font-medium text-ink flex items-center gap-1.5 pb-2">
+              <ShieldAlert className="w-4 h-4 text-danger" />
+              What happens when you confirm
             </p>
+            <ul className="list-disc pl-5 space-y-1 text-[12.5px]">
+              <li>Current agent code execution and sandbox processes stop immediately.</li>
+              <li>All remaining tasks and report synthesis are aborted.</li>
+              <li>No further tokens or LLM queries are consumed.</li>
+              <li>Artifacts generated before termination are preserved.</li>
+            </ul>
           </div>
-        </div>
 
-        {/* Details & Impact Explanation */}
-        <div className="mt-4 p-3.5 rounded-xl bg-surface-200/80 border border-surface-border text-xs text-slate-300 space-y-2">
-          <p className="font-semibold text-slate-200 flex items-center gap-1.5">
-            <ShieldAlert className="w-4 h-4 text-red-400" />
-            What happens when confirmed:
-          </p>
-          <ul className="list-disc pl-5 space-y-1 text-slate-400 text-[11px]">
-            <li>Current agent code execution & sandbox processes stop immediately.</li>
-            <li>All remaining planned tasks and report synthesis are aborted.</li>
-            <li>No additional tokens or LLM queries will be consumed.</li>
-            <li>Artifacts generated before termination are preserved.</li>
-          </ul>
-        </div>
+          {/* Actions */}
+          <div className="mt-6 flex items-center justify-end gap-2.5">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={terminating}
+              className="h-9 px-4 rounded-lg border border-edge-strong bg-card hover:bg-paper text-[13px] font-medium text-ink transition-colors disabled:opacity-50"
+            >
+              Keep running
+            </button>
 
-        {/* Buttons: Cancel vs Confirm Termination */}
-        <div className="mt-6 flex items-center justify-end gap-3">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={terminating}
-            className="px-4 py-2 rounded-xl text-xs font-medium bg-surface-200 hover:bg-surface-hover border border-surface-border text-slate-300 transition-colors"
-          >
-            Keep Running
-          </button>
-
-          <button
-            type="button"
-            onClick={onConfirm}
-            disabled={terminating}
-            className="px-4 py-2 rounded-xl text-xs font-bold bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white shadow-lg shadow-red-900/40 flex items-center gap-1.5 transition-all disabled:opacity-50"
-          >
-            {terminating ? (
-              <>
-                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                Halting Workflow...
-              </>
-            ) : (
-              <>
-                <Flame className="w-3.5 h-3.5" />
-                Confirm Termination
-              </>
-            )}
-          </button>
+            <button
+              type="button"
+              onClick={onConfirm}
+              disabled={terminating}
+              className="inline-flex items-center gap-2 h-9 px-4 rounded-lg bg-danger hover:bg-danger-deep text-white text-[13px] font-semibold transition-colors disabled:opacity-60"
+            >
+              {terminating ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Halting…
+                </>
+              ) : (
+                <>
+                  <Flame className="w-4 h-4" />
+                  Confirm termination
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>

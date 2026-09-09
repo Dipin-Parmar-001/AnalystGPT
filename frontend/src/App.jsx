@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import Navbar from './components/Navbar';
+import Sidebar from './components/Sidebar';
+import Topbar from './components/Topbar';
 import DatasetUploader from './components/DatasetUploader';
 import PlanViewer from './components/PlanViewer';
 import AgentConsole from './components/AgentConsole';
@@ -9,22 +10,10 @@ import ReportViewer from './components/ReportViewer';
 import ArtifactsGallery from './components/ArtifactsGallery';
 import DatasetPreviewModal from './components/DatasetPreviewModal';
 import FindingsPanel from './components/FindingsPanel';
+import WorkspaceView from './views/WorkspaceView';
 
 import {
-  Play,
-  Sparkles,
-  Flame,
-  FileText,
-  Terminal,
-  Box,
-  Layers,
-  CheckCircle2,
-  RefreshCw,
-  Send,
-  AlertOctagon,
-  BrainCircuit,
-  Settings2,
-  HelpCircle
+  Sparkles, Play, BrainCircuit, ListChecks, Terminal, ShieldCheck, FileText, Package, LayoutDashboard
 } from 'lucide-react';
 
 const SUGGESTED_QUERIES = [
@@ -33,9 +22,18 @@ const SUGGESTED_QUERIES = [
   "Run feature importance ranking, evaluate baseline vs best ML model, and generate an executive report."
 ];
 
+const VIEW_META = {
+  workspace: { title: 'Setup & Run', desc: 'Describe the analysis, choose datasets, and start the run', icon: LayoutDashboard },
+  plan: { title: 'Execution Plan', desc: 'The PlannerAgent decomposition — review, modify, then execute', icon: ListChecks },
+  console: { title: 'Live Console', desc: 'Real-time agent reasoning and sandbox execution telemetry', icon: Terminal },
+  findings: { title: 'Verification', desc: 'Numeric gate, cross-artifact consistency, and the LLM judge', icon: ShieldCheck },
+  report: { title: 'Executive Report', desc: 'The final verified deliverable', icon: FileText },
+  artifacts: { title: 'Artifacts', desc: 'Charts, datasets, and model files produced by the run', icon: Package },
+};
+
 export default function App() {
   // Navigation & View
-  const [activeTab, setActiveTab] = useState('plan_console'); // 'plan_console' | 'report_artifacts'
+  const [activeView, setActiveView] = useState('workspace');
 
   // Datasets
   const [datasets, setDatasets] = useState([]);
@@ -46,7 +44,7 @@ export default function App() {
   const [query, setQuery] = useState('');
   const [plan, setPlan] = useState(null);
   const [isRunning, setIsRunning] = useState(false);
-  const [currentStatus, setCurrentStatus] = useState('idle'); // 'idle', 'planning', 'plan_ready', 'executing', 'completed', 'cancelled', 'failed'
+  const [currentStatus, setCurrentStatus] = useState('idle');
   const [statusMessage, setStatusMessage] = useState('Ready');
   const [lastError, setLastError] = useState('');
   const [cancelledStep, setCancelledStep] = useState('');
@@ -56,7 +54,7 @@ export default function App() {
   const [maxToolCalls, setMaxToolCalls] = useState(10);
 
   // Verification findings (severity-based failure policy)
-  const [runStatus, setRunStatus] = useState(null); // null | completed | completed_with_warnings | failed-consistency | failed
+  const [runStatus, setRunStatus] = useState(null);
   const [severityCounts, setSeverityCounts] = useState(null);
   const [findings, setFindings] = useState([]);
   const [repairAttemptsUsed, setRepairAttemptsUsed] = useState(0);
@@ -107,7 +105,6 @@ export default function App() {
 
       ws.onclose = () => {
         setWsConnected(false);
-        // Attempt reconnection after 3 seconds
         reconnectTimerRef.current = setTimeout(() => {
           setupWebSocket();
         }, 3000);
@@ -121,6 +118,8 @@ export default function App() {
     }
   };
 
+  const navigate = (view) => setActiveView(view);
+
   const handleWebSocketMessage = (payload) => {
     const { event, data, timestamp } = payload;
 
@@ -132,11 +131,13 @@ export default function App() {
         setPlan(newPlan);
         setCurrentStatus('plan_ready');
         setStatusMessage(payload.message || 'Execution plan generated.');
+        navigate('plan');
       }
     } else if (event === 'plan_execution_started' || event === 'workflow_started') {
       setIsRunning(true);
       setCurrentStatus('executing');
       setStatusMessage('Workflow executing across specialized agents...');
+      navigate('console');
     } else if (event === 'task_execution_start') {
       if (plan && plan.tasks) {
         setPlan((prevPlan) => {
@@ -171,8 +172,6 @@ export default function App() {
       loadArtifacts();
     } else if (event === 'workflow_completed') {
       setIsRunning(false);
-      // The orchestrator's run status carries the severity policy verdict:
-      // completed | completed_with_warnings | failed-consistency | failed
       const verifiedStatus = payload.status || data?.run_status || 'completed';
       setCurrentStatus(verifiedStatus);
       setRunStatus(verifiedStatus);
@@ -184,6 +183,8 @@ export default function App() {
       loadArtifacts();
       loadReport();
       loadFindings();
+      // Route the user to the outcome: failed verification -> findings, else report
+      navigate(verifiedStatus === 'failed-consistency' ? 'findings' : 'report');
     } else if (event === 'workflow_cancelled') {
       setIsRunning(false);
       setCurrentStatus('cancelled');
@@ -210,6 +211,7 @@ export default function App() {
       setFindings([]);
       setRepairAttemptsUsed(0);
       loadArtifacts();
+      navigate('workspace');
     }
   };
 
@@ -220,7 +222,6 @@ export default function App() {
       if (data.status === 'success' && data.datasets) {
         setDatasets(data.datasets);
         if (data.datasets.length > 0 && selectedFiles.length === 0) {
-          // Select first dataset by default
           setSelectedFiles([data.datasets[0].filename]);
         }
       }
@@ -442,252 +443,133 @@ export default function App() {
         setFinalReport('');
         setCurrentStatus('idle');
         setStatusMessage('System reset to idle.');
+        setRunStatus(null);
+        setSeverityCounts(null);
+        setFindings([]);
+        setRepairAttemptsUsed(0);
         loadArtifacts();
+        navigate('workspace');
       } catch (err) {
         console.error("Reset error", err);
       }
     }
   };
 
+  // Sidebar badges
+  const completedTasks = plan ? (plan.tasks || []).filter((t) => t.status === 'completed').length : 0;
+  const badges = {
+    plan: plan ? { count: (plan.tasks || []).length, tone: 'neutral' } : null,
+    console: isRunning ? { count: events.length, tone: 'accent' } : null,
+    findings: severityCounts && (severityCounts.critical > 0 || severityCounts.minor > 0)
+      ? { count: severityCounts.critical + severityCounts.minor, tone: severityCounts.critical > 0 ? 'danger' : 'neutral' }
+      : null,
+    artifacts: artifacts.length > 0 ? { count: artifacts.length, tone: 'neutral' } : null,
+  };
+
+  const meta = VIEW_META[activeView] || VIEW_META.workspace;
+
   return (
-    <div className="min-h-screen bg-background text-slate-100 flex flex-col selection:bg-brand-primary/30">
-      {/* Top Navbar */}
-      <Navbar
-        wsConnected={wsConnected}
-        isRunning={isRunning}
-        currentStatus={currentStatus}
-        onReset={handleResetWorkflow}
+    <div className="flex min-h-screen">
+      <Sidebar
+        activeView={activeView}
+        onNavigate={navigate}
+        badges={badges}
+        runStatus={currentStatus}
       />
 
-      {/* Main App Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        
-        {/* Explicit Status Notification Banner (Completed / Terminated / Error) */}
-        <StatusAlertBanner
-          status={currentStatus}
-          message={statusMessage}
-          error={lastError}
-          cancelledStep={cancelledStep}
+      {/* Main column */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        <Topbar
+          viewTitle={meta.title}
+          viewDesc={meta.desc}
+          currentStatus={currentStatus}
+          wsConnected={wsConnected}
+          isRunning={isRunning}
+          onReset={handleResetWorkflow}
+          onOpenTerminate={handleOpenTerminateModal}
         />
 
-        {/* Top Query & Action Bar */}
-        <section className="p-5 rounded-2xl bg-surface-100/90 border border-surface-border glass-panel shadow-2xl relative overflow-hidden">
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono flex items-center gap-2">
-                <BrainCircuit className="w-4 h-4 text-brand-primary" />
-                Multi-Agent Analysis Query
-              </label>
+        {/* Global status banner */}
+        <div className="px-6 lg:px-8 pt-5">
+          <StatusAlertBanner
+            status={currentStatus}
+            message={statusMessage}
+            error={lastError}
+            cancelledStep={cancelledStep}
+          />
+        </div>
 
-              {selectedFiles.length > 0 && (
-                <span className="text-[11px] font-mono text-brand-secondary bg-surface-200 px-2.5 py-0.5 rounded-full border border-surface-border">
-                  Targeting: {selectedFiles.join(', ')}
-                </span>
-              )}
-            </div>
+        <main className="flex-1 px-6 lg:px-8 py-6">
+          {/* ---------- Workspace ---------- */}
+          {activeView === 'workspace' && (
+            <WorkspaceView
+              query={query}
+              setQuery={setQuery}
+              onGeneratePlan={handleGeneratePlan}
+              onExecuteWorkflow={handleExecuteWorkflow}
+              isRunning={isRunning}
+              hasPlan={!!plan}
+              suggestedQueries={SUGGESTED_QUERIES}
+              datasets={datasets}
+              selectedFiles={selectedFiles}
+              onToggleSelect={handleToggleSelectFile}
+              onUploadSuccess={handleUploadSuccess}
+              onPreviewDataset={setPreviewingDataset}
+              plan={plan}
+              artifacts={artifacts}
+              maxToolCalls={maxToolCalls}
+              setMaxToolCalls={setMaxToolCalls}
+              runStatus={currentStatus}
+            />
+          )}
 
-            <form onSubmit={handleGeneratePlan} className="flex flex-col sm:flex-row gap-3">
-              <div className="flex-1 relative">
-                <input
-                  type="text"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="e.g. Conduct full EDA, evaluate missing values, build classification models, and output key metrics..."
-                  disabled={isRunning}
-                  className="w-full px-4 py-3 text-sm rounded-xl bg-surface-200/90 border border-surface-border text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-primary focus:ring-1 focus:ring-brand-primary transition-all disabled:opacity-50"
-                />
-              </div>
-
-              <div className="flex items-center gap-2">
-                {/* Plan button */}
-                <button
-                  type="submit"
-                  disabled={isRunning || !query.trim()}
-                  className="px-4 py-3 rounded-xl text-xs font-bold bg-surface-200 hover:bg-surface-hover border border-surface-border text-slate-200 flex items-center gap-2 transition-all disabled:opacity-40"
-                >
-                  <Sparkles className="w-4 h-4 text-brand-secondary" />
-                  Plan Tasks
-                </button>
-
-                {/* Execute Button */}
-                {!isRunning ? (
-                  <button
-                    type="button"
-                    onClick={handleExecuteWorkflow}
-                    disabled={isRunning || (!query.trim() && !plan)}
-                    className="px-5 py-3 rounded-xl text-xs font-bold bg-gradient-to-r from-brand-primary to-indigo-600 hover:from-brand-primaryHover hover:to-indigo-500 text-white shadow-lg shadow-brand-primary/20 flex items-center gap-2 transition-all disabled:opacity-40"
-                  >
-                    <Play className="w-4 h-4" />
-                    Run Workflow
-                  </button>
-                ) : (
-                  /* CRITICAL TERMINATE WORKFLOW BUTTON */
-                  <button
-                    type="button"
-                    onClick={handleOpenTerminateModal}
-                    className="px-5 py-3 rounded-xl text-xs font-bold bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white shadow-lg shadow-red-900/40 flex items-center gap-2 transition-all animate-pulse"
-                  >
-                    <Flame className="w-4 h-4" />
-                    Terminate Workflow
-                  </button>
-                )}
-              </div>
-            </form>
-
-            {/* Query suggestions */}
-            <div className="flex flex-wrap items-center gap-2 pt-1">
-              <span className="text-[11px] text-slate-500 font-mono">Suggestions:</span>
-              {SUGGESTED_QUERIES.map((sq, sIdx) => (
-                <button
-                  key={sIdx}
-                  type="button"
-                  onClick={() => setQuery(sq)}
-                  disabled={isRunning}
-                  className="text-[11px] px-2.5 py-1 rounded-lg bg-surface-200/60 hover:bg-surface-200 text-slate-400 hover:text-slate-200 border border-surface-border/60 transition-colors truncate max-w-xs"
-                >
-                  {sq}
-                </button>
-              ))}
-            </div>
-          </div>
-        </section>
-
-        {/* Split Grid Layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          
-          {/* Left Column: Datasets & Workspace Controls (4 cols) */}
-          <div className="lg:col-span-4 space-y-6">
-            {/* Dataset Uploader & Selector */}
-            <div className="p-5 rounded-2xl bg-surface-100/90 border border-surface-border glass-panel shadow-lg">
-              <DatasetUploader
-                datasets={datasets}
-                selectedFiles={selectedFiles}
-                onToggleSelect={handleToggleSelectFile}
-                onUploadSuccess={handleUploadSuccess}
-                onPreviewDataset={(ds) => setPreviewingDataset(ds)}
+          {/* ---------- Plan ---------- */}
+          {activeView === 'plan' && (
+            <div className="max-w-4xl mx-auto animate-fade-up">
+              <PlanViewer
+                plan={plan}
+                isRunning={isRunning}
+                onExecutePlan={handleExecuteWorkflow}
+                onModifyPlan={handleModifyPlan}
                 disabled={isRunning}
               />
             </div>
+          )}
 
-            {/* Quick Stats & Telemetry */}
-            <div className="p-4 rounded-2xl bg-surface-100/70 border border-surface-border text-xs text-slate-300 space-y-2 font-mono">
-              <div className="flex items-center justify-between text-slate-400">
-                <span>Active Plan ID:</span>
-                <span className="text-slate-200 font-semibold">{plan?.plan_id || 'None'}</span>
-              </div>
-              <div className="flex items-center justify-between text-slate-400">
-                <span>Completed Tasks:</span>
-                <span className="text-slate-200 font-semibold">
-                  {plan ? plan.tasks.filter((t) => t.status === 'completed').length : 0} / {plan?.tasks.length || 0}
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-slate-400">
-                <span>Artifacts Produced:</span>
-                <span className="text-slate-200 font-semibold">{artifacts.length}</span>
-              </div>
-              <div className="flex items-center justify-between text-slate-400">
-                <span>Max Tool Calls/Agent:</span>
-                <span className="text-slate-200 font-semibold">{maxToolCalls}</span>
-              </div>
+          {/* ---------- Console ---------- */}
+          {activeView === 'console' && (
+            <div className="max-w-5xl mx-auto animate-fade-up">
+              <AgentConsole events={events} isRunning={isRunning} />
             </div>
-          </div>
+          )}
 
-          {/* Right Column: Execution Workspace & Deliverables (8 cols) */}
-          <div className="lg:col-span-8 space-y-4">
-            
-            {/* Tab Navigation */}
-            <div className="flex items-center justify-between border-b border-surface-border pb-2">
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setActiveTab('plan_console')}
-                  className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all ${
-                    activeTab === 'plan_console'
-                      ? 'bg-brand-primary text-white shadow-md shadow-brand-primary/20'
-                      : 'bg-surface-100 text-slate-400 hover:text-slate-200 border border-surface-border'
-                  }`}
-                >
-                  <Terminal className="w-3.5 h-3.5" />
-                  Plan & Live Agent Stream
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('report_artifacts')}
-                  className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all ${
-                    activeTab === 'report_artifacts'
-                      ? 'bg-brand-primary text-white shadow-md shadow-brand-primary/20'
-                      : 'bg-surface-100 text-slate-400 hover:text-slate-200 border border-surface-border'
-                  }`}
-                >
-                  <FileText className="w-3.5 h-3.5" />
-                  Executive Report & Artifacts
-                  {artifacts.length > 0 && (
-                    <span className="w-5 h-5 rounded-full bg-surface-300 text-[10px] flex items-center justify-center font-mono">
-                      {artifacts.length}
-                    </span>
-                  )}
-                </button>
-              </div>
-
-              {/* In-running Emergency Terminate Button on Tab Bar */}
-              {isRunning && (
-                <button
-                  onClick={handleOpenTerminateModal}
-                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-red-950/80 hover:bg-red-900 border border-red-700 text-red-300 flex items-center gap-1.5 transition-all animate-pulse"
-                >
-                  <AlertOctagon className="w-3.5 h-3.5 text-red-400" />
-                  Stop Execution
-                </button>
-              )}
+          {/* ---------- Findings ---------- */}
+          {activeView === 'findings' && (
+            <div className="max-w-4xl mx-auto animate-fade-up">
+              <FindingsPanel
+                runStatus={runStatus || (currentStatus === 'completed' ? 'completed' : null)}
+                severityCounts={severityCounts}
+                findings={findings}
+                repairAttemptsUsed={repairAttemptsUsed}
+              />
             </div>
+          )}
 
-            {/* Tab 1: Plan & Agent Console */}
-            {activeTab === 'plan_console' && (
-              <div className="space-y-6 animate-in fade-in">
-                {/* Plan Viewer */}
-                <PlanViewer
-                  plan={plan}
-                  isRunning={isRunning}
-                  onExecutePlan={handleExecuteWorkflow}
-                  onModifyPlan={handleModifyPlan}
-                  disabled={isRunning}
-                />
+          {/* ---------- Report ---------- */}
+          {activeView === 'report' && (
+            <div className="max-w-3xl mx-auto animate-fade-up">
+              <ReportViewer reportText={finalReport} />
+            </div>
+          )}
 
-                {/* Agent Live Console */}
-                <AgentConsole
-                  events={events}
-                  isRunning={isRunning}
-                />
-              </div>
-            )}
-
-            {/* Tab 2: Executive Report & Artifacts */}
-            {activeTab === 'report_artifacts' && (
-              <div className="space-y-6 animate-in fade-in">
-                {/* Verification Findings (severity-based failure policy) */}
-                <FindingsPanel
-                  runStatus={runStatus}
-                  severityCounts={severityCounts}
-                  findings={findings}
-                  repairAttemptsUsed={repairAttemptsUsed}
-                />
-
-                {/* Report Viewer */}
-                <ReportViewer
-                  reportText={finalReport}
-                />
-
-                {/* Artifacts Gallery */}
-                <ArtifactsGallery
-                  artifacts={artifacts}
-                />
-              </div>
-            )}
-
-          </div>
-
-        </div>
-
-      </main>
+          {/* ---------- Artifacts ---------- */}
+          {activeView === 'artifacts' && (
+            <div className="max-w-5xl mx-auto animate-fade-up">
+              <ArtifactsGallery artifacts={artifacts} />
+            </div>
+          )}
+        </main>
+      </div>
 
       {/* Two-Step Termination Confirmation Modal */}
       <TerminateModal

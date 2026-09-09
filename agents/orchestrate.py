@@ -171,7 +171,7 @@ class WorkflowOrchestrator:
             )
             return self._consistency_judge_instance
         except Exception as judge_err:
-            print(f"[Orchestrator Notice] ConsistencyJudge unavailable: {judge_err}")
+            logfire.warn("ConsistencyJudge unavailable; judge layer disabled", error=str(judge_err))
             return None
 
     def _run_final_verification(self, query_text: str, active_plan) -> Dict[str, Any]:
@@ -184,87 +184,120 @@ class WorkflowOrchestrator:
         Returns {"findings": [..], "verified_metrics": {..}, "numeric": {..}} where
         findings is the merged list consumed by the repair loop and severity policy.
         """
-        findings: List[Dict[str, Any]] = []
+        with logfire.span("Orchestrator: Final Verification Pass (numeric + consistency + judge)",
+                          report_length=len(self.final_report or "")):
+            findings: List[Dict[str, Any]] = []
 
-        # Ground-truth metrics for numeric verification
-        verified_metrics: Dict[str, Any] = {}
-        vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
-        if os.path.exists(vm_path):
-            try:
-                with open(vm_path, "r", encoding="utf-8", errors="replace") as f:
-                    verified_metrics = json.load(f)
-            except Exception:
-                verified_metrics = {}
-
-        # 1. Numeric verification of the report itself
-        numeric_summary: Dict[str, Any] = {}
-        if self.final_report and verified_metrics:
-            try:
-                from agents.numeric_verifier import verify_report_numbers
-                numeric_res = verify_report_numbers(self.final_report, verified_metrics)
-                numeric_summary = {
-                    "is_valid": numeric_res.is_valid,
-                    "total_claims": numeric_res.total_claims_count,
-                    "verified_count": numeric_res.verified_count,
-                    "unverified_count": numeric_res.unverified_count,
-                    "unverified_samples": [c.raw_str for c in numeric_res.unverified_claims[:10]],
-                }
-                if not numeric_res.is_valid:
-                    for c in numeric_res.unverified_claims[:10]:
-                        findings.append({
-                            "severity": "minor",
-                            "code": "unverified_numeric_claim",
-                            "message": f"Numeric claim '{c.raw_str}' in section '{c.section or '?'}' is not grounded in VERIFIED_METRICS (context: \"{c.context[:80]}\").",
-                            "artifacts": ["final_report.md"],
-                            "source": "numeric_verifier",
-                        })
-            except Exception as num_err:
-                print(f"[Orchestrator Notice] numeric verification failed: {num_err}")
-
-        # 2. Deterministic cross-artifact consistency checks
-        try:
-            consistency_report = run_consistency_checks(
-                self.current_output_dir,
-                report_text=self.final_report,
-                uploaded_files=None,
-                persist=True,
-            )
-            self.consistency_report = consistency_report
-            findings.extend([asdict(f) for f in consistency_report.findings])
-        except Exception as check_err:
-            print(f"[Orchestrator Notice] consistency checks failed: {check_err}")
-
-        # 3. LLM prose-consistency judge
-        if self.enable_consistency_judge and self.final_report:
-            judge = self._get_consistency_judge()
-            if judge is not None:
+            # Ground-truth metrics for numeric verification
+            verified_metrics: Dict[str, Any] = {}
+            vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
+            if os.path.exists(vm_path):
                 try:
-                    from agents.consistency_judge import judge_result_to_findings
-                    judge_res = judge.judge_report(
-                        report_text=self.final_report,
-                        verified_metrics=verified_metrics,
-                        consistency_findings=findings,
+                    with open(vm_path, "r", encoding="utf-8", errors="replace") as f:
+                        verified_metrics = json.load(f)
+                except Exception as vm_err:
+                    logfire.warn("Orchestrator: could not load verified_metrics.json; numeric gate will be skipped",
+                                 path=vm_path, error=str(vm_err))
+                    verified_metrics = {}
+            else:
+                logfire.warn("Orchestrator: verified_metrics.json not found; numeric verification skipped",
+                             output_dir=self.current_output_dir)
+
+            # 1. Numeric verification of the report itself
+            numeric_summary: Dict[str, Any] = {}
+            if self.final_report and verified_metrics:
+                try:
+                    from agents.numeric_verifier import verify_report_numbers
+                    numeric_res = verify_report_numbers(self.final_report, verified_metrics)
+                    numeric_summary = {
+                        "is_valid": numeric_res.is_valid,
+                        "total_claims": numeric_res.total_claims_count,
+                        "verified_count": numeric_res.verified_count,
+                        "unverified_count": numeric_res.unverified_count,
+                        "unverified_samples": [c.raw_str for c in numeric_res.unverified_claims[:10]],
+                    }
+                    logfire.info(
+                        "Orchestrator: numeric verification finished",
+                        is_valid=numeric_res.is_valid,
+                        total_claims=numeric_res.total_claims_count,
+                        verified_count=numeric_res.verified_count,
+                        unverified_count=numeric_res.unverified_count,
                     )
+                    if not numeric_res.is_valid:
+                        for c in numeric_res.unverified_claims[:10]:
+                            findings.append({
+                                "severity": "minor",
+                                "code": "unverified_numeric_claim",
+                                "message": f"Numeric claim '{c.raw_str}' in section '{c.section or '?'}' is not grounded in VERIFIED_METRICS (context: \"{c.context[:80]}\").",
+                                "artifacts": ["final_report.md"],
+                                "source": "numeric_verifier",
+                            })
+                except Exception as num_err:
+                    logfire.error("Orchestrator: numeric verification failed", error=str(num_err))
 
-                    # Persist judge output for auditability
+            # 2. Deterministic cross-artifact consistency checks
+            try:
+                consistency_report = run_consistency_checks(
+                    self.current_output_dir,
+                    report_text=self.final_report,
+                    uploaded_files=None,
+                    persist=True,
+                )
+                self.consistency_report = consistency_report
+                findings.extend([asdict(f) for f in consistency_report.findings])
+                logfire.info(
+                    "Orchestrator: consistency checks finished",
+                    is_valid=consistency_report.is_valid,
+                    **consistency_report.counts(),
+                )
+            except Exception as check_err:
+                logfire.error("Orchestrator: consistency checks failed", error=str(check_err))
+
+            # 3. LLM prose-consistency judge
+            if self.enable_consistency_judge and self.final_report:
+                judge = self._get_consistency_judge()
+                if judge is not None:
                     try:
-                        with open(os.path.join(self.current_output_dir, "judge_result.json"), "w", encoding="utf-8") as jf:
-                            json.dump(judge_res.to_dict(), jf, indent=2, default=str)
-                    except Exception:
-                        pass
+                        from agents.consistency_judge import judge_result_to_findings
+                        judge_res = judge.judge_report(
+                            report_text=self.final_report,
+                            verified_metrics=verified_metrics,
+                            consistency_findings=findings,
+                        )
 
-                    findings.extend(judge_result_to_findings(judge_res))
-                    print(f"[Orchestrator] ConsistencyJudge: {len(judge_res.claims)} claim(s) judged, "
-                          f"{len(judge_res.contradicted)} contradicted, {judge_res.discarded_claims} discarded by guardrails")
-                except Exception as judge_err:
-                    print(f"[Orchestrator Notice] consistency judge failed: {judge_err}")
+                        # Persist judge output for auditability
+                        try:
+                            with open(os.path.join(self.current_output_dir, "judge_result.json"), "w", encoding="utf-8") as jf:
+                                json.dump(judge_res.to_dict(), jf, indent=2, default=str)
+                        except Exception:
+                            pass
 
-        self.last_run_findings = findings
-        return {
-            "findings": findings,
-            "verified_metrics": verified_metrics,
-            "numeric": numeric_summary,
-        }
+                        findings.extend(judge_result_to_findings(judge_res))
+                        logfire.info(
+                            "Orchestrator: consistency judge finished",
+                            claims_judged=len(judge_res.claims),
+                            contradicted=len(judge_res.contradicted),
+                            unverifiable=len(judge_res.unverifiable),
+                            discarded_by_guardrails=judge_res.discarded_claims,
+                        )
+                    except Exception as judge_err:
+                        logfire.error("Orchestrator: consistency judge failed", error=str(judge_err))
+                else:
+                    logfire.warn("Orchestrator: consistency judge skipped (judge unavailable)")
+
+            logfire.info(
+                "Orchestrator: final verification pass complete",
+                total_findings=len(findings),
+                critical_findings=sum(1 for f in findings if f.get("severity") == "critical"),
+                minor_findings=sum(1 for f in findings if f.get("severity") == "minor"),
+            )
+
+            self.last_run_findings = findings
+            return {
+                "findings": findings,
+                "verified_metrics": verified_metrics,
+                "numeric": numeric_summary,
+            }
 
     def _repair_final_report(self, verification: Dict[str, Any], files_list: List[str],
                              step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> int:
@@ -297,12 +330,20 @@ class WorkflowOrchestrator:
 
             print(f"[Orchestrator] Report repair attempt {repair_attempt_no}/{self.max_repair_attempts} "
                   f"({len(critical)} critical finding(s))...")
+            logfire.info(
+                "Orchestrator: report repair attempt started",
+                attempt=repair_attempt_no,
+                max_attempts=self.max_repair_attempts,
+                critical_count=len(critical),
+                critical_codes=[f.get("code") for f in critical[:10]],
+            )
 
             try:
                 profile_block = render_dataset_profile_block(
                     build_dataset_profile(self.current_output_dir, files_list, persist=False)
                 )
-            except Exception:
+            except Exception as profile_err:
+                logfire.warn("Orchestrator: could not build dataset profile for repair prompt", error=str(profile_err))
                 profile_block = ""
 
             corrected = self.reporter_agent.repair_report(
@@ -315,6 +356,8 @@ class WorkflowOrchestrator:
             )
 
             if not corrected or corrected == self.final_report:
+                logfire.warn("Orchestrator: repair produced no changed report; stopping repair loop",
+                             attempt=repair_attempt_no)
                 print("[Orchestrator] Repair produced no changed report; stopping repair loop.")
                 break
 
@@ -323,9 +366,14 @@ class WorkflowOrchestrator:
                 with open(os.path.join(self.current_output_dir, "final_report.md"), "w", encoding="utf-8") as rf:
                     rf.write(self.final_report)
             except Exception as write_err:
-                print(f"[Orchestrator Warning] Failed to save repaired report: {write_err}")
+                logfire.warn("Orchestrator: failed to save repaired report", error=str(write_err))
 
             repair_attempts_used += 1
+            logfire.info(
+                "Orchestrator: report repair attempt completed",
+                attempt=repair_attempt_no,
+                report_length=len(self.final_report),
+            )
             _cb("report_repair_completed", {
                 "attempt": repair_attempt_no,
                 "report_length": len(self.final_report),
@@ -372,7 +420,7 @@ class WorkflowOrchestrator:
             status = "completed"
             message = "Workflow execution completed successfully; all verification gates passed."
 
-        return {
+        result = {
             "status": status,
             "message": message,
             "counts": {
@@ -382,6 +430,14 @@ class WorkflowOrchestrator:
                 "tasks_validation_failed": len(validation_failed_tasks),
             },
         }
+
+        logfire.info(
+            "Orchestrator: run status classified",
+            status=status,
+            message=message,
+            **result["counts"],
+        )
+        return result
 
     def _collect_agent_summaries(self, output_dir: str) -> Dict[str, Any]:
         """
@@ -1017,7 +1073,8 @@ class WorkflowOrchestrator:
                                         missing_artifacts=validation_result.missing_artifacts,
                                         fallback_detected=validation_result.fallback_detected,
                                         report_structure_valid=validation_result.report_structure_valid,
-                                        report_structure_issues=validation_result.report_structure_issues
+                                        report_structure_issues=validation_result.report_structure_issues,
+                                        failure_reasons=last_validation_errors
                                     )
 
                                 attempt += 1
