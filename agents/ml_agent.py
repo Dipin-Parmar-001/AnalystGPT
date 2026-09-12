@@ -101,8 +101,8 @@ class MLAgent:
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 7,
         keep_last_tool_pairs: int = 2,
-        stdout_stderr_token_limit: int = 300,
-        max_tokens_before_compact: int = 3000,
+        stdout_stderr_token_limit: int = 1200,
+        max_tokens_before_compact: int = 12000,
     ):
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")

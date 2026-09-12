@@ -389,9 +389,44 @@ class MessageHistoryManager:
             return f"... [truncated from start, showing last ~{limit} tokens]\n" + text[-approx_chars:]
         return text[:approx_chars] + f"\n... [truncated at ~{limit} tokens]"
 
+    def _truncate_keeping_ends(self, text: str, limit: int) -> str:
+        """Truncates by dropping the MIDDLE of the text, keeping head and tail.
+
+        Execution scripts print their diagnostic conclusion (mismatch sets,
+        metric summaries, final assert lines) at the END of stdout, so
+        head-only truncation hides exactly the output the agent needs and
+        causes it to re-run the same probe. stderr keeps tail-only truncation
+        (see clean_tool_result) because tracebacks put the error last.
+        """
+        if not text:
+            return ""
+        total = count_tokens(text)
+        if total <= limit:
+            return text
+        head_limit = max(1, int(limit * 0.4))
+        tail_limit = max(1, limit - head_limit)
+        if HAS_TIKTOKEN and _ENCODING is not None:
+            try:
+                tokens = _ENCODING.encode(text)
+                head = _ENCODING.decode(tokens[:head_limit])
+                tail = _ENCODING.decode(tokens[-tail_limit:])
+            except Exception:
+                approx_chars = limit * 4
+                head = text[: int(approx_chars * 0.4)]
+                tail = text[-int(approx_chars * 0.6):]
+        else:
+            approx_chars = limit * 4
+            head = text[: int(approx_chars * 0.4)]
+            tail = text[-int(approx_chars * 0.6):]
+        return (
+            f"{head}\n"
+            f"... [middle truncated: {total} tokens -> first {head_limit} + last {tail_limit}] ...\n"
+            f"{tail}"
+        )
+
     def clean_tool_result(self, tool_result: Dict[str, Any]) -> Dict[str, Any]:
         if "stdout" in tool_result:
-            tool_result["stdout"] = self._truncate_to_tokens(str(tool_result["stdout"]), self.stdout_stderr_token_limit, truncate_from_start=False)
+            tool_result["stdout"] = self._truncate_keeping_ends(str(tool_result["stdout"]), self.stdout_stderr_token_limit)
         if "stderr" in tool_result:
             tool_result["stderr"] = self._truncate_to_tokens(str(tool_result["stderr"]), self.stdout_stderr_token_limit, truncate_from_start=True)
         if not tool_result.get("success", True):

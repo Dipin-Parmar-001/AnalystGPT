@@ -53,6 +53,31 @@ except ImportError:
     logfire = None
 
 
+def build_post_verification_retry_prompt(unverified_errors: List[str]) -> str:
+    """
+    Retry prompt for post-verification failures on ReporterAgent tasks.
+
+    The failure is about unverified numeric claims in final_report.md, not missing
+    artifacts, so the generic hallucination-warning template would send the agent
+    chasing nonexistent artifact problems. This prompt carries the specific
+    unverified claims and the revision rules from the numeric verifier instead.
+    """
+    return (
+        "⚠️ NUMERIC VERIFICATION WARNING FOR ReporterAgent ⚠️\n"
+        "\n"
+        "The previous draft report FAILED deterministic numeric post-verification.\n"
+        "The following numeric claims DO NOT match the authoritative `VERIFIED_METRICS` ground truth:\n"
+        + "\n".join(f"  - {err}" for err in unverified_errors) + "\n"
+        "\n"
+        "REQUIRED ACTION:\n"
+        "1. Regenerate the final report with these discrepancies fixed.\n"
+        "2. Replace each unverified number with the exact corresponding value from `VERIFIED_METRICS`.\n"
+        "3. If a specific number or metric is NOT present anywhere in `VERIFIED_METRICS`, replace that claim with the phrase \"not verified in current run\".\n"
+        "4. Do NOT compute, invent, or round new numbers.\n"
+        "5. This is NOT a missing-artifact problem: all artifacts already exist. Do NOT re-create or re-save artifacts."
+    )
+
+
 class WorkflowOrchestrator:
     """
     Multi-Agent Workflow Orchestrator.
@@ -100,6 +125,13 @@ class WorkflowOrchestrator:
         self.final_report: str = ""
         self.current_output_dir: str = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token: Optional[CancellationToken] = None
+
+        # Persist model names for later use (e.g. the consistency judge defaults
+        # to reporter_model when judge_model is not set).
+        self.planner_model = planner_model
+        self.analyst_model = analyst_model
+        self.ml_model = ml_model
+        self.reporter_model = reporter_model
 
         # Artifact validation settings
         self.max_validation_retries: int = 2  # Max times to re-prompt agent for missing artifacts
@@ -741,6 +773,7 @@ class WorkflowOrchestrator:
                         validation_passed = False
                         task_validation_failed = False  # True if task exhausted retries without passing
                         last_validation_errors = []  # Errors from the immediately previous attempt
+                        last_failure_kind = None  # "artifact_validation" or "post_verification"
 
                         while attempt <= max_retries and not validation_passed and not task_validation_failed:
                             if attempt > 0:
@@ -787,15 +820,20 @@ class WorkflowOrchestrator:
                                 # Build prompt - add warning if this is a retry
                                 reporter_prompt = query_text
                                 if attempt > 0 and validation_errors:
-                                    reporter_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
-                                        is_valid=False,
-                                        missing_artifacts=[],
-                                        existing_artifacts=[],
-                                        fallback_detected=False,
-                                        hallucination_warnings=validation_errors,
-                                        report_structure_valid=False,
-                                        report_structure_issues=[]
-                                    ), agent_class_name, '', task.description)}\n\nOriginal Query: {query_text}"
+                                    if last_failure_kind == "post_verification":
+                                        # Unverified numeric claims, not missing artifacts — use the
+                                        # numeric-verification retry prompt, not the hallucination template.
+                                        reporter_prompt = f"{build_post_verification_retry_prompt(validation_errors)}\n\nOriginal Query: {query_text}"
+                                    else:
+                                        reporter_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                            is_valid=False,
+                                            missing_artifacts=[],
+                                            existing_artifacts=[],
+                                            fallback_detected=False,
+                                            hallucination_warnings=validation_errors,
+                                            report_structure_valid=False,
+                                            report_structure_issues=[]
+                                        ), agent_class_name, '', task.description)}\n\nOriginal Query: {query_text}"
                                 reporter_prompt = f"{reporter_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
@@ -1055,6 +1093,7 @@ class WorkflowOrchestrator:
                                 else:
                                     failure_kind = "post_verification"
                                     last_validation_errors = post_verification_errors
+                                last_failure_kind = failure_kind
 
                                 print(f"[Orchestrator Validation] Task #{task.task_id} ({agent_class_name}) failed {failure_kind} (attempt {attempt + 1}/{max_retries + 1}):")
                                 for warn in last_validation_errors:
