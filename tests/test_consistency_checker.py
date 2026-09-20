@@ -133,5 +133,130 @@ class TestConsistencyChecker(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "consistency_report.json")))
 
 
+class TestCleaningIntegrityCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _write_raw_and_cleaned(self, raw_col_values, cleaned_col_values):
+        raw = os.path.join(self.tmp, "raw_upload.csv")
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write("customerID,Senior Citizen,tenure\n")
+            for i, v in enumerate(raw_col_values):
+                f.write(f"{i},{v},{i % 5}\n")
+        with open(os.path.join(self.tmp, "cleaned_dataset.csv"), "w", encoding="utf-8") as f:
+            f.write("customerID,Senior Citizen,tenure\n")
+            for i, v in enumerate(cleaned_col_values):
+                f.write(f"{i},{v},{i % 5}\n")
+        return raw
+
+    def test_senior_citizen_style_collapse_is_critical(self):
+        raw = self._write_raw_and_cleaned(
+            ["No", "Yes"] * 10,  # 2 values in raw
+            ["0"] * 20,          # collapsed to constant in cleaned
+        )
+        report = run_consistency_checks(self.tmp, uploaded_files=[raw], persist=False)
+        codes = [f.code for f in report.critical_findings]
+        self.assertIn("column_value_collapse", codes)
+
+    def test_legitimate_binary_mapping_is_not_flagged(self):
+        raw = self._write_raw_and_cleaned(
+            ["No", "Yes"] * 10,
+            [0, 1] * 10,  # explicit map keeps both values
+        )
+        report = run_consistency_checks(self.tmp, uploaded_files=[raw], persist=False)
+        codes = [f.code for f in report.critical_findings]
+        self.assertNotIn("column_value_collapse", codes)
+
+    def test_no_raw_upload_skips_check(self):
+        self._write_raw_and_cleaned(["No", "Yes"] * 10, ["0"] * 20)
+        report = run_consistency_checks(self.tmp, persist=False)
+        self.assertNotIn("column_value_collapse", [f.code for f in report.findings])
+
+
+class TestThresholdAnalysisCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _write_threshold(self, rec_precision, rec_recall, curve_prec, curve_rec):
+        _write_json(os.path.join(self.tmp, "threshold_analysis.json"), {
+            "applicable": True,
+            "default_threshold": 0.5,
+            "default_metrics": {"precision": 0.51, "recall": 0.79, "f1": 0.62},
+            "recommended_threshold": 0.0033,
+            "recommended_metrics": {"precision": rec_precision, "recall": rec_recall, "f1": 0.42},
+            "selection_rationale": "test",
+            "precision_recall_curve": {
+                "precision": curve_prec,
+                "recall": curve_rec,
+                "thresholds": [0.6, 0.32, 0.0033][: len(curve_prec)],
+            },
+        })
+
+    def test_degenerate_all_positive_threshold_is_critical(self):
+        self._write_threshold(
+            rec_precision=0.2654, rec_recall=1.0,
+            curve_prec=[0.45, 0.30, 0.2654], curve_rec=[0.85, 0.95, 1.0],
+        )
+        report = run_consistency_checks(self.tmp, persist=False)
+        codes = [f.code for f in report.critical_findings]
+        self.assertIn("degenerate_threshold_recommendation", codes)
+
+    def test_sane_operating_point_is_not_flagged(self):
+        self._write_threshold(
+            rec_precision=0.45, rec_recall=0.90,
+            curve_prec=[0.45, 0.2654], curve_rec=[0.90, 1.0],
+        )
+        report = run_consistency_checks(self.tmp, persist=False)
+        codes = [f.code for f in report.findings]
+        self.assertNotIn("degenerate_threshold_recommendation", codes)
+        self.assertNotIn("threshold_metrics_mismatch", codes)
+
+    def test_missing_curve_skips_degeneracy_check(self):
+        _write_json(os.path.join(self.tmp, "threshold_analysis.json"), {
+            "applicable": True,
+            "recommended_threshold": 0.0033,
+            "recommended_metrics": {"precision": 0.2654, "recall": 1.0, "f1": 0.42},
+        })
+        report = run_consistency_checks(self.tmp, persist=False)
+        self.assertNotIn("degenerate_threshold_recommendation", [f.code for f in report.findings])
+
+
+class TestVisualizationDescriptionCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_reversed_mapping_description_is_flagged(self):
+        _write_json(os.path.join(self.tmp, "feature_engineering_summary.json"), {
+            "engineered_features": [
+                {"feature": "contract_risk", "formula": "Month-to-month=2, One year=1, Two year=0"},
+            ],
+        })
+        _write_json(os.path.join(self.tmp, "analyst_summary_task_3.json"), {
+            "generated_visualizations": [
+                {"file": "churn_by_contract.png",
+                 "description": "Bar chart of churn rate by contract risk (0=Low/Month-to-month, 1=Medium/One year, 2=High/Two year)"},
+            ],
+        })
+        report = run_consistency_checks(self.tmp, persist=False)
+        mismatches = [f for f in report.findings if f.code == "viz_description_mapping_mismatch"]
+        self.assertTrue(mismatches)
+        self.assertIn("Month-to-month", mismatches[0].message)
+
+    def test_correct_mapping_description_is_not_flagged(self):
+        _write_json(os.path.join(self.tmp, "feature_engineering_summary.json"), {
+            "engineered_features": [
+                {"feature": "contract_risk", "formula": "Month-to-month=2, One year=1, Two year=0"},
+            ],
+        })
+        _write_json(os.path.join(self.tmp, "analyst_summary_task_3.json"), {
+            "generated_visualizations": [
+                {"file": "churn_by_contract.png",
+                 "description": "Bar chart of churn rate (0=Two year, 1=One year, 2=Month-to-month)"},
+            ],
+        })
+        report = run_consistency_checks(self.tmp, persist=False)
+        self.assertNotIn("viz_description_mapping_mismatch", [f.code for f in report.findings])
+
+
 if __name__ == "__main__":
     unittest.main()

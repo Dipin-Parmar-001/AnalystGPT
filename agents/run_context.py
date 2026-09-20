@@ -60,19 +60,31 @@ def _profile_one_csv(path: str) -> Optional[Dict[str, Any]]:
 
 
 def _find_raw_dataset(output_dir: str, uploaded_files: Optional[List[str]]) -> Optional[str]:
-    """Locates the raw uploaded dataset file (not a pipeline-produced artifact)."""
-    pipeline_names = set(DATASET_LIFECYCLE) | {
-        "model_comparison.csv", "tuned_model_comparison.csv", "feature_importance.csv",
-        "predictions.csv", "correlation_matrix.csv",
-    }
+    """
+    Locates the raw uploaded dataset file.
+
+    Only the run's actual upload paths are trusted. The output directory is
+    deliberately NOT scanned: every CSV in there is a pipeline-produced artifact
+    (cleaned/FE datasets, correlation matrices, comparison tables...), and
+    guessing from it has already mis-profiled `corr_matrix.csv` as the raw
+    dataset, which cascaded into false shape-mismatch findings.
+    """
+    pipeline_names = set(DATASET_LIFECYCLE)
     if uploaded_files:
         for f in uploaded_files:
-            if f and os.path.exists(f) and os.path.basename(f).lower() not in pipeline_names:
+            if not f or os.path.basename(f).lower() in pipeline_names:
+                continue
+            if os.path.exists(f):
                 return f
-    if os.path.isdir(output_dir):
-        for fname in sorted(os.listdir(output_dir)):
-            if fname.lower().endswith((".csv", ".xlsx", ".xls")) and fname not in pipeline_names:
-                return os.path.join(output_dir, fname)
+            # Accept bare filenames that resolve in the workspace (uploads/, outputs/, root).
+            try:
+                from sandbox_execution.utils import resolve_file_path
+
+                resolved = resolve_file_path(f)
+                if resolved and os.path.exists(resolved):
+                    return resolved
+            except Exception:
+                pass
     return None
 
 
@@ -102,7 +114,35 @@ def build_dataset_profile(
     if raw_path:
         ext = os.path.splitext(raw_path)[1].lower()
         if ext == ".csv":
-            profile["datasets"]["raw"] = _profile_one_csv(raw_path)
+            raw_profile = _profile_one_csv(raw_path)
+            # Sanity guard: a genuine raw upload can never have fewer rows than
+            # the cleaned dataset (cleaning only removes rows), so a "raw"
+            # profile with fewer rows is a misidentified pipeline artifact
+            # (e.g. a correlation matrix). Profile it as a note instead of as
+            # ground truth for shape claims.
+            _cleaned_probe = None
+            for _name in DATASET_LIFECYCLE:
+                _p = os.path.join(output_dir, _name)
+                if os.path.exists(_p):
+                    _cleaned_probe = _profile_one_csv(_p)
+                    break
+            if (
+                _cleaned_probe
+                and not raw_profile.get("error")
+                and not _cleaned_probe.get("error")
+                and raw_profile.get("rows") is not None
+                and _cleaned_probe.get("rows") is not None
+                and raw_profile["rows"] < _cleaned_probe["rows"]
+            ):
+                profile["notes"].append(
+                    f"Refused to profile '{raw_profile.get('file')}' as the raw dataset: it has "
+                    f"fewer rows ({raw_profile.get('rows')}) than '{_cleaned_probe.get('file')}' "
+                    f"({_cleaned_probe.get('rows')}), so it looks like a derived pipeline "
+                    f"artifact. Raw upload not profiled."
+                )
+            else:
+                raw_profile["path"] = os.path.abspath(raw_path)
+                profile["datasets"]["raw"] = raw_profile
         else:
             profile["datasets"]["raw"] = {"file": os.path.basename(raw_path), "note": "Non-CSV raw upload; profiled by agents during inspection."}
 

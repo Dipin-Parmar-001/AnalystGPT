@@ -9,12 +9,17 @@ Operates deterministically via pure Python code (NO LLM calls).
 VERIFIED_METRICS now includes:
 - Dataset metrics (rows, cols, missing values, numeric/categorical stats)
 - Data quality findings (bound violations, distribution anomalies, near duplicates)
+- Segment statistics (per-category target rates, per-class numeric medians/means,
+  computed generically from the dataset artifacts by compute_segment_stats)
+- Threshold analysis (recommended/default operating points + flagged volumes)
 - Model comparison metrics (Accuracy, Precision, Recall, F1, ROC-AUC, PR-AUC, CV_Mean, CV_Std)
 - Tuned model comparison metrics
 - Hyperparameter tuning summary and best params
 - Model registry entries and champion model pointer
 - Versioned model artifacts (logistic_regression_p0.pkl, random_forest_p1_tuned.pkl, etc.)
 - Feature importance, confusion matrix, baseline score, predictions summary
+
+Delta magnitudes are matchable against signed deltas (|v| is indexed alongside v).
 """
 
 import re
@@ -42,6 +47,7 @@ class NumericClaim:
     line_number: int
     section: str = ""            # report section the claim appears in
     provenance: Optional[str] = None  # VERIFIED_METRICS path that grounded this claim
+    line_text: str = ""          # full source line, for segment-context matching
 
 
 @dataclass
@@ -176,21 +182,30 @@ def extract_numeric_claims(markdown_text: str) -> List[NumericClaim]:
                 context=context_snippet,
                 line_number=line_idx,
                 section=current_section,
+                line_text=stripped,
             ))
 
     return claims
 
 
 def _collect_numbers_from_structure(data: Any, num_pool: Set[float], str_pool: Set[str]):
-    """Recursively traverses arbitrary data structures and collects all numeric values and string representations."""
+    """Recursively traverses arbitrary data structures and collects all numeric values and string representations.
+
+    Both signed and absolute values are indexed: reports legitimately state delta
+    magnitudes ("reduced recall by 0.214") for ground-truth values stored as
+    signed deltas (-0.2139), so |v| must be matchable too.
+    """
     if data is None:
         return
     if isinstance(data, (int, float)):
         if not math.isnan(data) and not math.isinf(data):
             f_val = float(data)
-            num_pool.add(f_val)
-            num_pool.add(round(f_val, 4))
-            num_pool.add(round(f_val, 2))
+            for variant in (f_val, abs(f_val)):
+                num_pool.add(variant)
+                num_pool.add(round(variant, 1))
+                num_pool.add(round(variant, 2))
+                num_pool.add(round(variant, 3))
+                num_pool.add(round(variant, 4))
             str_pool.add(str(data))
             str_pool.add(f"{data:.4f}".rstrip("0").rstrip("."))
             str_pool.add(f"{data:.2f}")
@@ -260,6 +275,59 @@ def _direct_match_tolerance(claim: "NumericClaim") -> float:
     return 1e-3
 
 
+_SEGMENT_SKIP_CATEGORIES = {"0", "1", "<reference>", "no", "yes"}
+_SEGMENT_MIN_LABEL_LEN = 3
+
+
+def _norm_segment_label(s: str) -> str:
+    """Normalizes dashes/whitespace so 'two-year', 'Two year' and 'TwoYear' align."""
+    import re as _re
+    return _re.sub(r"[\s\-\u2013\u2014_]+", " ", (s or "").strip()).lower()
+
+
+def build_segment_context_index(verified_metrics: Dict[str, Any]) -> List[Tuple[str, str, float]]:
+    """
+    Indexes (normalized_label, display_label, rate) from VERIFIED_METRICS.segment_stats.
+    Generic: labels come from whatever categories the uploaded dataset actually
+    contains; nothing domain-specific. The overall target rate is indexed under
+    the label 'overall' so it can be allowed on any category-mentioning line.
+    """
+    index: List[Tuple[str, str, float]] = []
+    seg = (verified_metrics or {}).get("segment_stats") or {}
+    overall = seg.get("overall") or {}
+    try:
+        index.append(("overall", "overall", float(overall.get("rate"))))
+    except (TypeError, ValueError):
+        pass
+    for s in seg.get("rate_by_category") or []:
+        if not isinstance(s, dict):
+            continue
+        category = str(s.get("category", "")).strip()
+        try:
+            rate = float(s.get("rate"))
+        except (TypeError, ValueError):
+            continue
+        if not category or category in _SEGMENT_SKIP_CATEGORIES or len(category) < _SEGMENT_MIN_LABEL_LEN:
+            continue
+        index.append((_norm_segment_label(category), f"{s.get('feature', '')}={category}", rate))
+    return index
+
+
+def mentioned_segment_rates(line_text: str, segment_index: List[Tuple[str, str, float]]) -> List[Tuple[str, float]]:
+    """Returns the (display_label, rate) pairs whose category label appears in the line.
+
+    Uses alphanumeric boundary matching (punctuation like '(' next to a bucket
+    label still matches; 'DSL' inside 'SDSL' does not).
+    """
+    import re as _re
+    norm_line = _norm_segment_label(line_text)
+    hits: List[Tuple[str, float]] = []
+    for norm_label, display, rate in segment_index:
+        if _re.search(rf"(?<![0-9a-z]){ _re.escape(norm_label) }(?![0-9a-z])", norm_line):
+            hits.append((display, rate))
+    return hits
+
+
 class GroundTruthMatcher:
     """Matches candidate numbers against indexed verified ground truth."""
 
@@ -318,6 +386,9 @@ class GroundTruthMatcher:
                     matched_paths.append(path)
                 elif math.isclose(val * 100.0, target, abs_tol=tolerance):
                     matched_paths.append(path)
+                elif math.isclose(val, abs(target), abs_tol=direct_tol):
+                    # Delta magnitude claim ("improved by 0.02") vs signed delta (-0.0201)
+                    matched_paths.append(f"{path} (magnitude)")
             elif isinstance(target_val, str) and target_val.strip() in {raw, raw.replace(",", "")}:
                 matched_paths.append(path)
             if len(matched_paths) >= 3:
@@ -346,12 +417,30 @@ def verify_report_numbers(report_text: str, verified_metrics: Dict[str, Any]) ->
     with span_ctx:
         claims = extract_numeric_claims(report_text)
         matcher = GroundTruthMatcher(verified_metrics)
+        segment_index = build_segment_context_index(verified_metrics)
 
         verified_list: List[NumericClaim] = []
         unverified_list: List[NumericClaim] = []
         provenance_map: Dict[str, List[str]] = {}
 
         for c in claims:
+            # Segment-context rule: when the claim's own line names categories from
+            # the dataset's segment stats, the percentage is grounded ONLY by one of
+            # those categories' rates (plus the overall rate). This prevents pool
+            # saturation, where a fabricated rate coincidentally equals an unrelated
+            # pool value (a skewness, a dummy-column mean, another segment's rate).
+            if c.is_percentage and 0 < c.num_val < 100 and segment_index and c.line_text:
+                mentioned = mentioned_segment_rates(c.line_text, segment_index)
+                category_rates = [r for d, r in mentioned if d != "overall"]
+                if category_rates:
+                    overall_rate = next((r for d, _, r in segment_index if d == "overall"), None)
+                    allowed = list(category_rates) + ([overall_rate] if overall_rate is not None else [])
+                    tol = _pct_conversion_tolerance(c)
+                    if not any(math.isclose(c.num_val / 100.0, r, abs_tol=tol) for r in allowed):
+                        c.provenance = None
+                        unverified_list.append(c)
+                        continue
+
             matched_paths = matcher.find_matches(c)
             if matched_paths:
                 c.provenance = matched_paths[0]

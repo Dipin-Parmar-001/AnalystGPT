@@ -12,6 +12,11 @@ run_20260906_090233 that artifact existence validation cannot see:
 - Mislabeled tuned-comparison rows (e.g. "XGBoost (parent)" vs actual artifact)
 - Byte-identical duplicate summaries across tasks
 - Report references to artifacts that were never generated
+- Fabricated segment statistics: report sentences that mention a real dataset
+  category together with a rate that contradicts the recomputed ground truth
+  (dataset-driven — works for any uploaded dataset's vocabulary)
+- Drift between the machine-computed `stats_findings.json` and a fresh
+  recomputation from the dataset artifacts
 
 Every finding carries a severity ("critical" or "minor") so the orchestrator can
 apply the severity-based failure policy.
@@ -135,10 +140,11 @@ def check_dataset_shape_claims(output_dir: str, profile: Dict[str, Any]) -> List
     """
     Reconciles every shape claim in summary JSONs against the profiled datasets.
 
-    Lifecycle-stage ambiguity is handled by match-any semantics: a processed-shape
-    claim is only wrong if it matches NO dataset artifact on disk (e.g. claiming
-    54 columns when raw/cleaned/FE have 33/44/50). initial_shape claims are
-    compared strictly against the raw dataset when one is profiled.
+    Match-any semantics for BOTH initial and processed shapes: a claim is only a
+    hallucination when it matches NO dataset artifact on disk (raw upload,
+    cleaned, or FE). 'initial' is task-relative — the raw upload for the cleaning
+    task but cleaned/FE for downstream tasks — so a strict raw comparison would
+    false-positive on legitimate downstream input shapes.
     """
     findings: List[Finding] = []
     datasets = profile.get("datasets", {})
@@ -153,24 +159,6 @@ def check_dataset_shape_claims(output_dir: str, profile: Dict[str, Any]) -> List
                 return True
         return False
 
-    def _compare(claimed: Tuple[Optional[int], Optional[int]], actual_key: str, source: str, label: str):
-        actual = datasets.get(actual_key)
-        if not actual or actual.get("error"):
-            return
-        c_rows, c_cols = claimed
-        if c_rows is not None and actual.get("rows") is not None and c_rows != actual["rows"]:
-            findings.append(Finding(
-                SEVERITY_CRITICAL, "shape_mismatch",
-                f"{source}: claimed {label} has {c_rows} rows, but '{actual['file']}' actually has {actual['rows']} rows.",
-                [source, actual["file"]],
-            ))
-        if c_cols is not None and actual.get("cols") is not None and c_cols != actual["cols"]:
-            findings.append(Finding(
-                SEVERITY_CRITICAL, "shape_mismatch",
-                f"{source}: claimed {label} has {c_cols} columns, but '{actual['file']}' actually has {actual['cols']} columns.",
-                [source, actual["file"]],
-            ))
-
     for summary_path in sorted(glob.glob(os.path.join(output_dir, "*summary*.json"))):
         if os.path.basename(summary_path) == "dataset_profile.json":
             continue
@@ -183,18 +171,21 @@ def check_dataset_shape_claims(output_dir: str, profile: Dict[str, Any]) -> List
             shape = _shape_like(value)
             if shape is None:
                 continue
-            if ".initial_shape" in jpath or jpath.startswith("initial_shape"):
-                _compare(shape, "raw", src, f"initial shape ({jpath})")
-            else:
-                if not _matches_any(shape):
-                    actual_desc = "; ".join(
-                        f"{ds['file']}={ds['rows']}x{ds['cols']}" for ds in ds_entries if ds.get("rows")
-                    ) or "no dataset artifacts profiled"
-                    findings.append(Finding(
-                        SEVERITY_CRITICAL, "shape_mismatch",
-                        f"{src}: claimed shape ({jpath}) {shape[0] or '?'} rows x {shape[1] or '?'} columns matches NO dataset artifact on disk ({actual_desc}).",
-                        [src],
-                    ))
+            # 'initial' is task-relative: the raw upload for the cleaning task but
+            # cleaned/FE for downstream tasks — so both initial and processed shape
+            # claims use match-any semantics. A claim is only a hallucination when
+            # it matches NO dataset artifact on disk (uploads included).
+            is_initial = ".initial_shape" in jpath or jpath.startswith("initial_shape")
+            if not _matches_any(shape):
+                actual_desc = "; ".join(
+                    f"{ds['file']}={ds['rows']}x{ds['cols']}" for ds in ds_entries if ds.get("rows")
+                ) or "no dataset artifacts profiled"
+                label = "initial shape" if is_initial else "shape"
+                findings.append(Finding(
+                    SEVERITY_CRITICAL, "shape_mismatch",
+                    f"{src}: claimed {label} ({jpath}) {shape[0] or '?'} rows x {shape[1] or '?'} columns matches NO dataset artifact on disk ({actual_desc}).",
+                    [src],
+                ))
 
     # Engineered-feature claims must be a subset of the real engineered set
     # (columns added by FE relative to the cleaned dataset).
@@ -434,9 +425,508 @@ def check_duplicate_summaries(output_dir: str) -> List[Finding]:
     return findings
 
 
+# ------------------------------------------------------ cleaning integrity check
+
+def _load_csv_bounded(path: str):
+    """Loads a CSV with pandas, or returns None if unreadable."""
+    try:
+        import pandas as pd
+
+        return pd.read_csv(path, nrows=200000)
+    except Exception:
+        return None
+
+
+def check_cleaning_integrity(output_dir: str, profile: Dict[str, Any]) -> List[Finding]:
+    """
+    Compares shared columns between the raw upload and cleaned_dataset.csv.
+
+    Catches silent data corruption such as a 'Yes'/'No' column coerced with
+    pd.to_numeric(errors='coerce') and then filled with 0: every value becomes
+    the same constant and the column's signal is destroyed. A shared column
+    whose unique-value count collapses (>= 2 raw values -> 1 cleaned value) is
+    flagged critical; a > 50% cardinality drop is flagged minor for review.
+    """
+    findings: List[Finding] = []
+    raw_entry = profile.get("datasets", {}).get("raw")
+    cleaned_entry = profile.get("datasets", {}).get("cleaned")
+    if not raw_entry or not cleaned_entry or raw_entry.get("error") or cleaned_entry.get("error"):
+        return findings
+    raw_path = raw_entry.get("path") or os.path.join(output_dir, raw_entry.get("file", ""))
+    if not os.path.exists(raw_path):
+        raw_path = raw_entry.get("file", "")
+    cleaned_path = os.path.join(output_dir, cleaned_entry.get("file", ""))
+    if not os.path.exists(cleaned_path):
+        cleaned_path = cleaned_entry.get("file", "")
+    raw_df = _load_csv_bounded(raw_path)
+    cleaned_df = _load_csv_bounded(cleaned_path)
+    if raw_df is None or cleaned_df is None:
+        return findings
+
+    shared = [c for c in raw_df.columns if c in cleaned_df.columns]
+    collapsed: List[str] = []
+    dropped: List[str] = []
+    for col in shared:
+        try:
+            raw_n = int(raw_df[col].nunique(dropna=True))
+            clean_n = int(cleaned_df[col].nunique(dropna=True))
+        except Exception:
+            continue
+        if raw_n >= 2 and clean_n == 1:
+            collapsed.append(f"'{col}' ({raw_n} values -> 1)")
+        elif raw_n >= 4 and clean_n >= 1 and clean_n <= raw_n / 2:
+            dropped.append(f"'{col}' ({raw_n} values -> {clean_n})")
+
+    if collapsed:
+        findings.append(Finding(
+            SEVERITY_CRITICAL, "column_value_collapse",
+            "Cleaned dataset destroyed the variance of shared column(s): "
+            + "; ".join(collapsed)
+            + ". This usually means a non-numeric text column was coerced with "
+            "pd.to_numeric(errors='coerce') and then filled with a constant. Map binary text "
+            "columns explicitly (e.g. .map({'No': 0, 'Yes': 1})) and never impute a fully-coerced "
+            "column with a constant.",
+            [cleaned_entry.get("file", "cleaned_dataset.csv")],
+        ))
+    if dropped:
+        findings.append(Finding(
+            SEVERITY_MINOR, "column_cardinality_drop",
+            "Shared column(s) lost more than half their unique values during cleaning: "
+            + "; ".join(dropped)
+            + ". If this is an intentional merge/binning, document it in cleaning_summary.json.",
+            [cleaned_entry.get("file", "cleaned_dataset.csv")],
+        ))
+    return findings
+
+
+# ------------------------------------------------------- threshold sanity check
+
+def check_threshold_analysis(output_dir: str) -> List[Finding]:
+    """
+    Validates the recommended operating point in threshold_analysis.json.
+
+    A recommendation whose recall is ~1.0 only because precision collapsed to
+    the class base rate flags (nearly) every customer and has no targeting
+    value; when the stored curve contains a better operating point (recall
+    >= 0.90 with materially higher precision), that is flagged critical.
+    Also cross-checks the claimed recommended metrics against the curve.
+    """
+    findings: List[Finding] = []
+    ta = _load_json_safe(os.path.join(output_dir, "threshold_analysis.json"))
+    if not isinstance(ta, dict) or ta.get("applicable") is not True:
+        return findings
+
+    rec_metrics = ta.get("recommended_metrics") or {}
+    rec_recall = rec_metrics.get("recall")
+    rec_precision = rec_metrics.get("precision")
+    curve = ta.get("precision_recall_curve") or {}
+    precisions = curve.get("precision") or []
+    recalls = curve.get("recall") or []
+
+    base_rate = None
+    if precisions and recalls and len(precisions) == len(recalls):
+        try:
+            max_recall_idx = max(range(len(recalls)), key=lambda i: recalls[i])
+            base_rate = float(precisions[max_recall_idx])
+        except Exception:
+            base_rate = None
+
+    def _better_operating_point(min_recall: float = 0.90) -> Optional[Tuple[float, float, float]]:
+        """Returns (threshold, precision, recall) maximizing precision s.t. recall >= min_recall."""
+        thresholds = curve.get("thresholds") or []
+        best = None
+        for i, r in enumerate(recalls):
+            try:
+                r_f = float(r)
+                p_f = float(precisions[i])
+            except Exception:
+                continue
+            if r_f >= min_recall:
+                t_f = float(thresholds[i]) if i < len(thresholds) else 0.0
+                if best is None or p_f > best[1]:
+                    best = (t_f, p_f, r_f)
+        return best
+
+    is_degenerate = (
+        rec_recall is not None
+        and rec_precision is not None
+        and float(rec_recall) >= 0.999
+        and base_rate is not None
+        and float(rec_precision) <= base_rate * 1.02 + 1e-9
+    )
+    if is_degenerate:
+        alt = _better_operating_point()
+        alt_txt = ""
+        if alt:
+            alt_txt = (
+                f" A better operating point exists in the stored curve: threshold ~{alt[0]:.3f} "
+                f"(precision={alt[1]:.3f}, recall={alt[2]:.3f})."
+            )
+        findings.append(Finding(
+            SEVERITY_CRITICAL, "degenerate_threshold_recommendation",
+            f"threshold_analysis.json recommends a degenerate operating point: recall="
+            f"{rec_recall} with precision={rec_precision}, which equals the class base rate — "
+            f"i.e. predict positive for every customer. That has no targeting value."
+            f"{alt_txt} Recommend max precision subject to a recall constraint (or max F-beta) "
+            f"instead, and state the flagged-customer volume.",
+            ["threshold_analysis.json"],
+        ))
+
+    # Cross-check claimed recommended metrics against the stored curve.
+    if precisions and recalls and rec_recall is not None and rec_precision is not None:
+        try:
+            tol = 0.02
+            match_found = any(
+                abs(float(precisions[i]) - float(rec_precision)) <= tol
+                and abs(float(recalls[i]) - float(rec_recall)) <= tol
+                for i in range(min(len(precisions), len(recalls)))
+            )
+            if not match_found:
+                findings.append(Finding(
+                    SEVERITY_MINOR, "threshold_metrics_mismatch",
+                    "threshold_analysis.json recommended_metrics (precision="
+                    f"{rec_precision}, recall={rec_recall}) do not match any point on its own "
+                    "stored precision_recall_curve.",
+                    ["threshold_analysis.json"],
+                ))
+        except Exception:
+            pass
+    return findings
+
+
+# --------------------------------------------- visualization description check
+
+def _normalize_label(text: str) -> str:
+    """Normalizes a category label for fuzzy comparison."""
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+
+def check_visualization_descriptions(output_dir: str) -> List[Finding]:
+    """
+    Cross-checks ordinal-mapping claims in chart descriptions (e.g.
+    '0=Month-to-month, 2=Two year') against the canonical mappings declared in
+    feature_engineering_summary.json. Reversed mappings mislead anyone reading
+    the summary JSON without the chart.
+    """
+    import re
+
+    findings: List[Finding] = []
+    fe = _load_json_safe(os.path.join(output_dir, "feature_engineering_summary.json"))
+    if not isinstance(fe, dict):
+        return findings
+
+    # Canonical mappings from engineered-feature formulas: normalized label -> (raw label, value).
+    canonical: Dict[str, Tuple[str, int]] = {}
+    for feat in fe.get("engineered_features", []) or []:
+        if not isinstance(feat, dict):
+            continue
+        formula = str(feat.get("formula", ""))
+        if "=" not in formula or not re.search(r"=\s*\d+", formula):
+            continue
+        for match in re.finditer(r"([A-Za-z][\w\s\-()']*?)\s*=\s*(-?\d+)", formula):
+            label_raw = match.group(1).strip().rstrip(",")
+            try:
+                value = int(match.group(2))
+            except ValueError:
+                continue
+            if label_raw:
+                canonical[_normalize_label(label_raw)] = (label_raw, value)
+    if not canonical:
+        return findings
+
+    for path in sorted(glob.glob(os.path.join(output_dir, "analyst_summary*.json"))):
+        summary = _load_json_safe(path)
+        if not isinstance(summary, dict):
+            continue
+        src = os.path.basename(path)
+        for viz in summary.get("generated_visualizations", []) or []:
+            if not isinstance(viz, dict):
+                continue
+            description = str(viz.get("description", ""))
+            # Claims like "0=Low/Month-to-month" or "2 = High/Two year".
+            for match in re.finditer(r"(\d+)\s*=\s*([A-Za-z][\w\s/\-()']*)", description):
+                try:
+                    claimed_value = int(match.group(1))
+                except ValueError:
+                    continue
+                for part in re.split(r"[/,]", match.group(2)):
+                    norm = _normalize_label(part)
+                    if len(norm) < 3:
+                        continue
+                    hit = canonical.get(norm)
+                    if hit and hit[1] != claimed_value:
+                        findings.append(Finding(
+                            SEVERITY_MINOR, "viz_description_mapping_mismatch",
+                            f"{src} describes a chart with mapping '{claimed_value}={part.strip()}' "
+                            f"for an engineered feature, but feature_engineering_summary.json "
+                            f"defines '{hit[0]}={hit[1]}'. Fix the description (or the chart) so "
+                            f"the stated mapping matches the actual encoding.",
+                            [src, "feature_engineering_summary.json"],
+                        ))
+    return findings
+
+
+# ------------------------------------------------------------ segment claims
+
+_SEGMENT_SKIP_CATEGORIES = {"0", "1", "<reference>", "no", "yes"}
+_RATE_MATCH_TOL_PCT = 0.5  # percentage points; covers 1-decimal rounding of true rates
+
+
+def _load_segment_frame(output_dir: str):
+    """Loads the dataset artifact used for segment grounding (FE preferred over cleaned)."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return None, None
+    for name in ("feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"):
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            try:
+                return pd.read_csv(path), name
+            except Exception:
+                continue
+    return None, None
+
+
+def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Recomputes ground-truth segment statistics from the run's dataset artifacts.
+
+    Falls back to a name-based segment recomputation from the dataset artifacts when no
+    raw uploads are available; raw uploads are merged in so one-hot reference categories
+    keep their real names.
+    """
+    from pathlib import Path
+    from sandbox_execution.verification_script import compute_segment_stats, declared_target_column
+
+    df, source = _load_segment_frame(output_dir)
+    if df is None:
+        return None
+    try:
+        declared = declared_target_column(Path(output_dir))
+    except Exception:
+        declared = None
+    try:
+        stats = compute_segment_stats(df, declared_target=declared)
+    except Exception:
+        return None
+    if not isinstance(stats, dict):
+        return None
+    stats["source_file"] = source
+
+    # Merge named segments from raw uploads (see build_verified_metrics).
+    import pandas as _pd
+    for up in uploaded_files or []:
+        try:
+            if not up or not str(up).lower().endswith(".csv") or not os.path.exists(up):
+                continue
+            raw_df = _pd.read_csv(up, nrows=500_000)
+            if declared not in raw_df.columns:
+                continue
+            raw_stats = compute_segment_stats(raw_df, declared_target=declared)
+            if not raw_stats:
+                continue
+            by_key = {
+                (str(s["feature"]).lower(), str(s["category"]).lower()): s
+                for s in stats["rate_by_category"]
+            }
+            for s in raw_stats.get("rate_by_category", []):
+                by_key[(str(s["feature"]).lower(), str(s["category"]).lower())] = s
+            stats["rate_by_category"] = list(by_key.values())
+            stats["raw_source_file"] = os.path.basename(up)
+        except Exception:
+            continue
+    return stats
+
+
+def _norm_segment_label(s: str) -> str:
+    """Collapses dashes/underscores/whitespace so 'two-year', 'Two year' and '49–72' align."""
+    import re as _re
+    return _re.sub(r"[\s\-\u2013\u2014_]+", " ", (s or "").strip()).lower()
+
+
+def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Optional[List[str]] = None) -> List[Finding]:
+    """
+    Dataset-driven guard against fabricated segment statistics.
+
+    For every category that actually exists in the run's dataset artifacts (any
+    categorical level, one-hot dummy level, or tenure-style bucket — whatever the
+    uploaded data contains), scans the report for sentences that mention that
+    category together with a percentage. If the quoted percentage matches none of
+    the rates of the categories named in that same sentence, it is fabricated
+    -> critical.
+
+    Matching is deliberately scoped to the categories mentioned in the sentence:
+    a fabricated rate must not be excused by colliding with some *other*
+    segment's true rate (pool saturation). Fully generic — the vocabulary checked
+    comes from the dataset itself, not from any domain-specific word list.
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    findings: List[Finding] = []
+    if not report_text:
+        return findings
+    stats = _recompute_segment_stats(output_dir, uploaded_files)
+    if not stats:
+        return findings
+
+    # Index named segments by normalized category label.
+    by_label: Dict[str, List[Dict[str, Any]]] = {}
+    for seg in stats.get("rate_by_category", []):
+        category = str(seg.get("category", "")).strip()
+        try:
+            float(seg["rate"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not category or category in _SEGMENT_SKIP_CATEGORIES or len(category) < 3:
+            continue
+        by_label.setdefault(_norm_segment_label(category), []).append(seg)
+
+    def _norm(s: str) -> str:
+        return _norm_segment_label(s)
+
+    text = _re.sub(r"```.*?```", " ", report_text or "", flags=_re.DOTALL)
+    sentences = [s.strip() for s in _re.split(r"(?<=[.!?])\s+|\n", text) if s.strip()]
+    pct_re = _re.compile(r"(\d+(?:\.\d+)?)\s*%")
+    seen: set = set()
+
+    # Label-boundary matcher: alphanumerics around the label defeat the match
+    # (so 'DSL' is not found inside 'SDSL'), while punctuation like '(' next to
+    # a bucket label ('(0-12') still matches.
+    def _label_in(low: str, label: str) -> bool:
+        return _re.search(rf"(?<![0-9a-z]){ _re.escape(label) }(?![0-9a-z])", low) is not None
+
+    for sentence in sentences:
+        low = _norm(sentence)
+        mentioned: List[Tuple[str, List[Dict[str, Any]]]] = [
+            (label, segs) for label, segs in by_label.items() if _label_in(low, label)
+        ]
+        if not mentioned:
+            continue
+        mentioned_rates = [float(seg["rate"]) for _, segs in mentioned for seg in segs]
+        # The overall target rate is a legitimate referent on a category line.
+        try:
+            mentioned_rates.append(float(stats["overall"]["rate"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        for m in pct_re.finditer(sentence):
+            claimed = float(m.group(1))
+            if any(abs(claimed / 100.0 - r) * 100 <= _RATE_MATCH_TOL_PCT for r in mentioned_rates):
+                continue
+            key = (tuple(sorted(l for l, _ in mentioned)), claimed)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs = "; ".join(
+                f"'{segs[0]['feature']}'='{segs[0]['category']}'={float(segs[0]['rate']) * 100:.1f}% "
+                f"({segs[0]['positives']}/{segs[0]['count']})"
+                for _, segs in mentioned[:3]
+            )
+            findings.append(Finding(
+                SEVERITY_CRITICAL, "segment_rate_mismatch",
+                f"Report quotes {claimed:g}% in a sentence about segments that actually have: {refs}. "
+                f"Recompute from the dataset artifacts and correct the claim.",
+                ["final_report.md", stats.get("source_file") or "dataset"],
+            ))
+            if len(findings) >= 10:
+                return findings
+    return findings
+
+
+def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[List[str]] = None) -> List[Finding]:
+    """
+    Diffs the machine-computed `stats_findings.json` (which the analyst's sandbox
+    script is required to emit) against a fresh recomputation from the dataset
+    artifacts. Any drift proves a summary number did not come from the executing
+    code. No-op for runs that predate the stats_findings.json contract.
+    """
+    findings: List[Finding] = []
+    sf = _load_json_safe(os.path.join(output_dir, "stats_findings.json"))
+
+    # Contract-compliance signal: a stats-and-viz task ran (analyst summary with
+    # generated visualizations) but the required stats artifact was never written.
+    if not isinstance(sf, dict):
+        for summary_path in sorted(glob.glob(os.path.join(output_dir, "analyst_summary*.json"))):
+            summary = _load_json_safe(summary_path)
+            if isinstance(summary, dict) and summary.get("generated_visualizations"):
+                findings.append(Finding(
+                    SEVERITY_MINOR, "stats_findings_missing",
+                    f"{os.path.basename(summary_path)} reports generated visualizations but required "
+                    f"`stats_findings.json` (computed statistics artifact) is absent — segment-rate claims "
+                    f"cannot be grounded for this run.",
+                    [os.path.basename(summary_path)],
+                ))
+                break
+        return findings
+
+    stats = _recompute_segment_stats(output_dir, uploaded_files)
+    if not stats:
+        return findings
+
+    recomputed = {}
+    for seg in stats.get("rate_by_category", []):
+        recomputed[(str(seg.get("feature", "")).lower(), str(seg.get("category", "")).lower())] = seg
+    recomputed_overall = stats.get("overall") or {}
+
+    sf_overall = sf.get("overall")
+    if isinstance(sf_overall, dict) and recomputed_overall:
+        for field in ("count", "positives"):
+            sf_v, rc_v = sf_overall.get(field), recomputed_overall.get(field)
+            if isinstance(sf_v, (int, float)) and rc_v is not None and int(sf_v) != int(rc_v):
+                findings.append(Finding(
+                    SEVERITY_CRITICAL, "segment_count_mismatch",
+                    f"stats_findings.json overall {field}={sf_v} but the dataset artifacts give {int(rc_v)}. "
+                    f"The stats artifact was not produced from the loaded data.",
+                    ["stats_findings.json", stats.get("source_file") or "dataset"],
+                ))
+        sf_rate, rc_rate = sf_overall.get("rate"), recomputed_overall.get("rate")
+        if isinstance(sf_rate, (int, float)) and rc_rate is not None and abs(float(sf_rate) - float(rc_rate)) > 0.005:
+            findings.append(Finding(
+                SEVERITY_CRITICAL, "segment_rate_mismatch",
+                f"stats_findings.json overall rate={sf_rate} but the dataset artifacts give {rc_rate}.",
+                ["stats_findings.json", stats.get("source_file") or "dataset"],
+            ))
+
+    for seg in sf.get("rate_by_category", []) or []:
+        if not isinstance(seg, dict):
+            continue
+        key = (str(seg.get("feature", "")).lower(), str(seg.get("category", "")).lower())
+        rc = recomputed.get(key)
+        if rc is None:
+            findings.append(Finding(
+                SEVERITY_MINOR, "stats_findings_unmatched_segment",
+                f"stats_findings.json references segment '{seg.get('feature')}'='{seg.get('category')}' which "
+                f"does not exist in the dataset artifacts (check for typos or invented categories).",
+                ["stats_findings.json"],
+            ))
+            continue
+        sf_rate, rc_rate = seg.get("rate"), rc.get("rate")
+        if isinstance(sf_rate, (int, float)) and rc_rate is not None and abs(float(sf_rate) - float(rc_rate)) > 0.005:
+            findings.append(Finding(
+                SEVERITY_CRITICAL, "segment_rate_mismatch",
+                f"stats_findings.json: rate for '{seg.get('feature')}'='{seg.get('category')}' is {sf_rate} but the "
+                f"dataset artifacts give {rc_rate} ({rc.get('positives')}/{rc.get('count')}).",
+                ["stats_findings.json", stats.get("source_file") or "dataset"],
+            ))
+        for field in ("count", "positives"):
+            sf_v, rc_v = seg.get(field), rc.get(field)
+            if isinstance(sf_v, (int, float)) and rc_v is not None and int(sf_v) != int(rc_v):
+                findings.append(Finding(
+                    SEVERITY_CRITICAL, "segment_count_mismatch",
+                    f"stats_findings.json: {field} for '{seg.get('feature')}'='{seg.get('category')}' is {int(sf_v)} "
+                    f"but the dataset artifacts give {int(rc_v)}.",
+                    ["stats_findings.json", stats.get("source_file") or "dataset"],
+                ))
+    return findings
+
+
 # ------------------------------------------------------------ report references
 
-def check_report_artifact_references(output_dir: str, report_text: str) -> List[Finding]:
+def check_report_artifact_references(
+    output_dir: str,
+    report_text: str,
+    uploaded_files: Optional[List[str]] = None,
+) -> List[Finding]:
     """Flags artifact files referenced in the final report that were never generated."""
     import re
     findings: List[Finding] = []
@@ -445,6 +935,10 @@ def check_report_artifact_references(output_dir: str, report_text: str) -> List[
     referenced = set(re.findall(r"\b[\w\-.]+\.(?:png|csv|json|pkl|md)\b", report_text))
     referenced = {r for r in referenced if r != "final_report.md"}
     on_disk = set(os.listdir(output_dir)) if os.path.isdir(output_dir) else set()
+    # Raw uploads live outside the run dir; referencing them is legitimate.
+    for f in uploaded_files or []:
+        if f:
+            on_disk.add(os.path.basename(f))
     missing = sorted(r for r in referenced if r not in on_disk)
     if missing:
         findings.append(Finding(
@@ -474,9 +968,14 @@ def run_consistency_checks(
         ("dataset_shape_claims", lambda: check_dataset_shape_claims(output_dir, profile)),
         ("phantom_columns", lambda: check_phantom_columns(output_dir, profile)),
         ("missing_values_consistency", lambda: check_missing_values_consistency(output_dir, profile)),
+        ("cleaning_integrity", lambda: check_cleaning_integrity(output_dir, profile)),
+        ("threshold_analysis", lambda: check_threshold_analysis(output_dir)),
+        ("viz_descriptions", lambda: check_visualization_descriptions(output_dir)),
         ("model_artifact_consistency", lambda: check_model_artifact_consistency(output_dir)),
         ("duplicate_summaries", lambda: check_duplicate_summaries(output_dir)),
-        ("report_artifact_references", lambda: check_report_artifact_references(output_dir, report_text or "")),
+        ("segment_claims", lambda: check_segment_claims(output_dir, report_text or "", uploaded_files)),
+        ("stats_findings_consistency", lambda: check_stats_findings_consistency(output_dir, uploaded_files)),
+        ("report_artifact_references", lambda: check_report_artifact_references(output_dir, report_text or "", uploaded_files)),
     )
 
     span_ctx = logfire.span(

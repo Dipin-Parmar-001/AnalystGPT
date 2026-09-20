@@ -100,3 +100,7 @@ people.csv
 sample.png
 temp.py
 temp.txt
+
+# Observability local run logs (mirrored from Logfire)
+logs/*
+!logs/.gitkeep

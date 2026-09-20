@@ -132,6 +132,10 @@ class DataAnalystAgent:
             except Exception as e:
                 logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
 
+        # Local observability: per-call latency, served model, token metrics
+        from agents.observability import instrument_openai_client
+        instrument_openai_client(self.client, agent_name="DataAnalystAgent (Legacy)")
+
         # Tool execution workflow manager
         self.tool_manager = tool_manager or ToolManager()
 

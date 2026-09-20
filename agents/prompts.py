@@ -437,6 +437,20 @@ when a processed one is listed, and never a processed file your task's `inputs` 
 3. Missing Value Imputation:
    - Numerical columns: Impute with median (or mean).
    - Categorical columns: Impute with most frequent value or 'missing' placeholder.
+3a. Categorical Value Preservation (CRITICAL — silent data corruption guard):
+   - NEVER call `pd.to_numeric(..., errors='coerce')` (or astype(int)) on a column that contains
+     non-numeric text such as 'Yes'/'No' labels. Coercion turns EVERY row into NaN, and filling
+     that NaN with 0 or any constant silently destroys the column's signal.
+   - Convert binary text columns with an explicit value map instead, e.g.
+     `df['Senior Citizen'] = df['Senior Citizen'].map({'No': 0, 'Yes': 1})`.
+   - Sanity check after ANY coercion: if the resulting NaN count equals the column length (or the
+     column's unique-value count collapsed), STOP — treat the column as categorical and map it
+     explicitly; never impute a fully-coerced column with a constant.
+   - After cleaning, verify per column that `nunique()` did not collapse vs the raw data (e.g.
+     {'No','Yes'} -> {0}). A column that lost its variance fails validation and the task will
+     be retried.
+   - Record every dtype conversion in `cleaning_summary.json` under
+     `dtype_conversions`: [{"column", "dtype_before", "dtype_after", "value_map"}].
 4. Categorical Feature Encoding (for EDA / Modeling prep):
    - For nominal/categorical features: Use One-Hot Encoding (`pd.get_dummies(..., drop_first=True)` or `OneHotEncoder`). Explicitly document the encoding method.
    - NEVER apply LabelEncoder to nominal feature columns.
@@ -571,7 +585,7 @@ In addition to saving plots as PNG files (e.g. `plt.savefig("chart.png", bbox_in
       }
     },
     "key_insights": [
-      "Key insight 1 with exact sample counts (e.g. churn rate 26.5%, n=265)",
+      "Key insight 1 quoting exact stats_findings.json values with counts (e.g. 'leaves at 26.5% rate, 265/1000')",
       "Key insight 2"
     ]
   },
@@ -585,6 +599,63 @@ In addition to saving plots as PNG files (e.g. `plt.savefig("chart.png", bbox_in
 Note: the `data_cleaning` block here reports on cleaning that already happened upstream (read
 from `cleaning_summary.json` / the loaded file's known history) — a `stats_and_viz` task does
 NOT redo cleaning or re-export `cleaned_dataset.csv`; it only reports and analyzes.
+
+### Visualization Standards (REQUIRED):
+- Every categorical/ordinal axis must show REAL category names, not bare codes. If you plot an
+  ordinal feature like `contract_risk` (Month-to-month=2, One year=1, Two year=0), label the
+  ticks 'Month-to-month' / 'One year' / 'Two year' (or annotate them in the axis title) — a
+  reader must never need the JSON sidecar to decode a chart.
+- Use ONE consistent color semantics for the target class across ALL charts in this run
+  (e.g. churn = red/orange, no-churn = green/blue). Never swap the meaning of a color between
+  two charts.
+- A chart `description` in `generated_visualizations` MUST match the actual encoding/formula
+  used (see `feature_engineering_summary.json`). Stating a reversed ordinal mapping in a
+  description (e.g. '0=Month-to-month' when the formula defines Month-to-month=2) fails
+  consistency validation — describe the mapping exactly as implemented.
+
+### COMPUTED STATISTICS ARTIFACT (MANDATORY — stats_findings.json)
+In the SAME script that computes statistics and renders charts, compute every headline
+number programmatically and dump them to `stats_findings.json`. This file is the ONLY
+acceptable source for segment-rate, group-median, and correlation claims in
+`key_insights`, chart `description`s, and your final prose. The consistency layer
+recomputes these values from the saved dataset and diffs them against this file — a
+mismatch proves the number was not produced by your code and fails the run.
+
+Required schema (exact keys):
+```json
+{
+  "target_column": "<declared target column>",
+  "overall": {"count": 0, "positives": 0, "rate": 0.0},
+  "rate_by_category": [
+    {"feature": "<categorical column>", "category": "<level>", "count": 0, "positives": 0, "rate": 0.0}
+  ],
+  "numeric_by_class": [
+    {"column": "<numeric column>", "class": 0, "median": 0.0, "mean": 0.0}
+  ],
+  "correlations": [{"column": "<column>", "pearson_r": 0.0}]
+}
+```
+Construction rules:
+1. Every value must be computed with pandas in the executing script (`groupby`, `mean`,
+   `median`, `corr`) and inserted from a Python variable. NEVER type a rate, median, or
+   correlation into this JSON, into `key_insights`, or into a chart description from
+   memory — a fabricated segment statistic is the single most damaging failure this
+   pipeline can produce, because downstream agents quote it as fact.
+2. `rate_by_category` MUST cover every segment you describe anywhere in your output: all
+   levels of each low-cardinality categorical column, each level of one-hot dummy groups
+   (reconstruct the parent category from its dummies; the all-zeros rows are the reference
+   category), and each numeric bucket (e.g. tenure bands) you discuss.
+3. Every segment entry carries `count` AND `positives` so each claimed rate is checkable
+   (`rate == positives / count`).
+4. If you reconstruct categorical columns from one-hot dummies for analysis, save the
+   analysis frame as `analysis_dataset.csv` and take `processed_shape` from THAT SAVED
+   FILE (reload and assert) — never from a temporary in-memory frame that has extra
+   columns nothing on disk contains.
+5. `key_insights` sentences must quote the exact values from this file and embed the
+   sample counts, e.g. "Customers on <category> leave at 42.7% (1655/3875) vs 2.8%
+   (48/1695) for <reference category>". Never restate a rate you did not put in this file.
+6. Before finishing, reload and assert:
+   `sf = json.load(open("stats_findings.json")); assert sf["overall"]["count"] == len(df)`.
 
 ===============================================================================
 # MANDATORY SELF-VERIFICATION BEFORE REPORTING (ANTI-HALLUCINATION — APPLIES TO EVERY TASK TYPE)
@@ -1247,9 +1318,19 @@ skipped — do not skip it silently.
    precision floor was given). If the Planner/task specifies a concrete constraint (e.g. "recall
    >= 80%" or "precision >= 40%"), select the threshold that satisfies it; otherwise pick and
    justify a defensible one and say so explicitly.
+   DEGENERATE OPERATING POINTS ARE FORBIDDEN: never recommend a threshold whose only virtue is
+   recall ≈ 1.0 achieved by predicting positive for (nearly) every customer — at that point
+   precision collapses to the class base rate and the model has no targeting value. When
+   maximizing recall, constrain the search to thresholds whose precision stays meaningfully
+   above the base rate (e.g. >= 1.5× base rate); otherwise select the threshold that maximizes
+   precision subject to recall >= the business target (default 0.90 when unspecified). A
+   degenerate recommendation fails consistency validation and the task will be retried.
 3. Report BOTH the default-threshold and the recommended-threshold metrics side by side — never
    replace the default-threshold numbers, only add the alternative alongside them. State the
-   exact recall/precision/F1 gained or lost by moving the threshold.
+   exact recall/precision/F1 gained or lost by moving the threshold. For every threshold you
+   present, also state the flagged volume: how many of the N test customers are predicted
+   positive (count and %) and how many customers are contacted per true positive caught
+   (N_flagged / TP).
 4. Save `threshold_analysis.json` with, at minimum: `default_threshold`, `default_metrics`,
    `recommended_threshold`, `recommended_metrics`, `selection_rationale`, and the full
    `precision_recall_curve` sample points used to choose it (or a reference to
@@ -2213,7 +2294,12 @@ Selection, Selected Best Model Performance, Key Predictive Drivers & Directional
 all figures quoted verbatim from `VERIFIED_METRICS`. If `ml_summary.json` contains a
 `threshold_analysis` block with `applicable: true`, report BOTH the default-threshold and
 recommended-threshold metrics side by side (never only the default) and state the
-`selection_rationale` verbatim from that block. If `applicable: false`, don't mention threshold
+`selection_rationale` verbatim from that block. For every threshold presented, also state the
+flagged volume (how many customers would be flagged for outreach, and how many contacts per
+true positive caught) — never present an operating point that flags (nearly) all customers as
+"maintaining reasonable precision"; if the recommended threshold's precision equals the class
+base rate, say plainly that it is equivalent to contacting everyone. If `applicable: false`,
+don't mention threshold
 analysis at all — omitted-and-explained is not the same as a finding to report.
 
 ## Operational Caveats & Limitations

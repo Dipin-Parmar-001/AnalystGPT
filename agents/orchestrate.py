@@ -13,6 +13,7 @@ Coordinates the multi-agent workflow:
 import os
 import sys
 import json
+import time
 import traceback
 from typing import List, Dict, Any, Optional, Union, Callable
 from dataclasses import asdict
@@ -45,6 +46,12 @@ from agents.artifact_validator import (
 )
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
 from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
+from agents.observability import (
+    get_recorder,
+    set_task_context,
+    reset_task_context,
+    task_context,
+)
 
 
 try:
@@ -155,6 +162,10 @@ class WorkflowOrchestrator:
         self.last_run_manifest: Dict[str, Any] = {}
         self.consistency_report: Optional[Any] = None
         self.repair_attempts_used: int = 0
+        # Basenames of the user's uploaded files, set at execute_plan start so the
+        # final verification pass can resolve report references to raw uploads
+        # (they live outside the run output dir).
+        self.uploaded_files: List[str] = []
 
     def reset(self, keep_sandbox: bool = False):
         """Resets orchestrator state, memory, and optionally global sandbox."""
@@ -272,7 +283,10 @@ class WorkflowOrchestrator:
                 consistency_report = run_consistency_checks(
                     self.current_output_dir,
                     report_text=self.final_report,
-                    uploaded_files=None,
+                    # Raw uploads live outside the run dir; the checker must know
+                    # them so referencing the source dataset isn't flagged as a
+                    # missing artifact.
+                    uploaded_files=self.uploaded_files or None,
                     persist=True,
                 )
                 self.consistency_report = consistency_report
@@ -305,8 +319,22 @@ class WorkflowOrchestrator:
                             pass
 
                         findings.extend(judge_result_to_findings(judge_res))
+                        if not judge_res.parse_ok:
+                            # A judge that produced no verdict must be visible in
+                            # the run findings — silently skipping it makes the
+                            # hybrid stack look like it verified prose when it didn't.
+                            findings.append({
+                                "severity": "minor",
+                                "code": "judge_failed",
+                                "message": f"LLM consistency judge produced no parsable verdict ({judge_res.error}); "
+                                           f"prose-level report claims were NOT judged this run. Only the deterministic "
+                                           f"numeric and consistency gates ran.",
+                                "artifacts": ["final_report.md", "judge_result.json"],
+                                "source": "consistency_judge",
+                            })
                         logfire.info(
                             "Orchestrator: consistency judge finished",
+                            parse_ok=judge_res.parse_ok,
                             claims_judged=len(judge_res.claims),
                             contradicted=len(judge_res.contradicted),
                             unverifiable=len(judge_res.unverifiable),
@@ -354,6 +382,13 @@ class WorkflowOrchestrator:
                 break
 
             repair_attempt_no = repair_attempts_used + 1
+            get_recorder().increment("repair.attempts")
+            get_recorder().log_event(
+                "report_repair_attempt",
+                attempt=repair_attempt_no,
+                max_attempts=self.max_repair_attempts,
+                critical_count=len(critical),
+            )
             _cb("report_repair_started", {
                 "attempt": repair_attempt_no,
                 "max_attempts": self.max_repair_attempts,
@@ -571,13 +606,28 @@ class WorkflowOrchestrator:
         if step_callback:
             step_callback("planning_started", {"user_query": user_query, "files": files})
 
-        plan = self.planner_agent.create_plan(
-            user_query=user_query,
-            dataset_context=dataset_context,
-            max_tool_calls_per_task=max_tool_calls_per_task,
-            cancellation_token=cancellation_token
-        )
+        rec = get_recorder()
+        rec.ensure_run(source="create_plan")
+
+        # Global counter: total time to create the plan.
+        plan_t0 = time.perf_counter()
+        with task_context(agent="PlannerAgent", phase="planning"):
+            with rec.step_timer("plan_creation"):
+                plan = self.planner_agent.create_plan(
+                    user_query=user_query,
+                    dataset_context=dataset_context,
+                    max_tool_calls_per_task=max_tool_calls_per_task,
+                    cancellation_token=cancellation_token
+                )
+        rec.add_duration("plan_creation_time_s", time.perf_counter() - plan_t0)
         self.current_plan = plan
+        rec.log_event(
+            "plan_created",
+            plan_id=plan.plan_id,
+            task_count=len(plan.tasks),
+            selected_agents=plan.selected_agents,
+            plan_duration_s=round(time.perf_counter() - plan_t0, 6),
+        )
 
         if step_callback:
             step_callback("plan_created", {
@@ -607,11 +657,14 @@ class WorkflowOrchestrator:
         if not target_plan:
             raise ValueError("No active plan to modify.")
 
-        updated_plan = self.planner_agent.modify_plan(
-            target_plan,
-            modification_prompt,
-            cancellation_token=cancellation_token
-        )
+        get_recorder().ensure_run(source="modify_plan")
+        with task_context(agent="PlannerAgent", phase="plan_modification"):
+            with get_recorder().step_timer("plan_modification"):
+                updated_plan = self.planner_agent.modify_plan(
+                    target_plan,
+                    modification_prompt,
+                    cancellation_token=cancellation_token
+                )
         self.current_plan = updated_plan
 
         if step_callback:
@@ -670,6 +723,11 @@ class WorkflowOrchestrator:
 
         query_text = user_query or active_plan.query
         files_list = files or []
+        self.uploaded_files = list(files_list)
+
+        # One run = one JSONL file in logs/. If create_plan already started the
+        # run (normal flow), this reuses it.
+        get_recorder().ensure_run(source="execute_plan")
 
         # Setup cancellation token
         self.cancellation_token = cancellation_token or CancellationToken()
@@ -747,6 +805,12 @@ class WorkflowOrchestrator:
 
                     task.status = "in_progress"
 
+                    # Per-task latency + LLM/tool event attribution
+                    task_t0 = time.perf_counter()
+                    task_ctx_token = set_task_context(
+                        task_id=task.task_id, agent=agent_class_name, phase="task", title=task.title
+                    )
+
                     def _execute_task():
                         nonlocal has_reporter_task
                         nonlocal agent_class_name
@@ -776,10 +840,20 @@ class WorkflowOrchestrator:
                         last_failure_kind = None  # "artifact_validation" or "post_verification"
 
                         while attempt <= max_retries and not validation_passed and not task_validation_failed:
+                            _attempt_t0 = time.perf_counter()
                             if attempt > 0:
                                 # Re-prompt: set status back to pending and add hallucination warning
                                 task.status = "pending"
                                 print(f"[Orchestrator] Retry attempt {attempt}/{max_retries} for Task #{task.task_id} ({agent_class_name})")
+
+                                get_recorder().log_event(
+                                    "task_retry",
+                                    task_id=task.task_id,
+                                    title=task.title,
+                                    agent=agent_class_name,
+                                    attempt=attempt,
+                                )
+                                get_recorder().increment("retries.validation")
 
                                 if HAS_LOGFIRE:
                                     logfire.info(
@@ -810,7 +884,7 @@ class WorkflowOrchestrator:
                                 has_reporter_task = True
                                 summaries = self._collect_agent_summaries(self.current_output_dir)
                                 try:
-                                    verified_metrics = build_verified_metrics(self.current_output_dir)
+                                    verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
                                     if "verified_metrics.json" not in self.generated_artifacts:
                                         self.generated_artifacts.append("verified_metrics.json")
                                 except Exception as vm_err:
@@ -880,6 +954,22 @@ class WorkflowOrchestrator:
                                     if full_cand_path not in ml_files and current_dataset_file not in ml_files:
                                         ml_files.insert(0, full_cand_path)
 
+                                # Surface ground-truth verified metrics inside the sandbox as soon
+                                # as ML artifacts exist, so agents can load them directly instead
+                                # of burning tool calls searching for metric files.
+                                vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
+                                if not os.path.exists(vm_path) and os.path.exists(
+                                    os.path.join(self.current_output_dir, "model_comparison.csv")
+                                ):
+                                    try:
+                                        build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
+                                        if "verified_metrics.json" not in self.generated_artifacts:
+                                            self.generated_artifacts.append("verified_metrics.json")
+                                    except Exception as vm_err:
+                                        print(f"[Orchestrator Notice] early build_verified_metrics error: {vm_err}")
+                                if os.path.exists(vm_path) and vm_path not in ml_files and "verified_metrics.json" not in ml_files:
+                                    ml_files.append(vm_path)
+
                                 # Check if this is a Hyperparameter Tuning task
                                 is_hpt_task = (
                                     getattr(task, "task_type", None) == "hyperparameter_tuning"
@@ -929,6 +1019,13 @@ class WorkflowOrchestrator:
                                     main_name = os.path.basename(files_list[0]) if files_list else "dataset.csv"
                                     data_context_note = f"\n[INPUT DATASET CONTEXT]: Main dataset is available as '{main_name}'. Note: No pre-cleaned dataset artifact was produced; proceed directly with this main dataset."
 
+                                if os.path.exists(vm_path):
+                                    data_context_note += (
+                                        "\n[VERIFIED METRICS]: 'verified_metrics.json' is in FILE_REGISTRY — the "
+                                        "authoritative ground-truth metrics for this run. Load it directly via "
+                                        "json.load('verified_metrics.json'); do not search for metric files."
+                                    )
+
                                 # Build prompt - add warning if this is a retry
                                 ml_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}{data_context_note}"
                                 if attempt > 0 and validation_errors:
@@ -962,6 +1059,11 @@ class WorkflowOrchestrator:
                                     cand_path = os.path.join(self.current_output_dir, cand)
                                     if (cand in self.generated_artifacts or os.path.exists(cand_path)) and cand_path not in analyst_files and cand not in analyst_files:
                                         analyst_files.insert(0, cand_path)
+
+                                # Expose verified metrics to the sandbox once they exist.
+                                vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
+                                if os.path.exists(vm_path) and vm_path not in analyst_files and "verified_metrics.json" not in analyst_files:
+                                    analyst_files.append(vm_path)
 
                                 # Build prompt - add warning if this is a retry
                                 analyst_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}"
@@ -1032,6 +1134,12 @@ class WorkflowOrchestrator:
                                 agent_name=agent_class_name,
                                 task_type=task_type
                             )
+
+                            # Global counters: per-attempt latency, retry latency
+                            _attempt_dt = time.perf_counter() - _attempt_t0
+                            if attempt > 0:
+                                get_recorder().add_duration("retries.latency_s", _attempt_dt)
+                            get_recorder().add_duration("task_attempt.latency_s", _attempt_dt)
 
                             post_verification_failed = False
                             post_verification_errors: list = []
@@ -1193,6 +1301,26 @@ class WorkflowOrchestrator:
                     else:
                         _execute_task()
 
+                    # Global counters: per-task latency, status, retries
+                    task_duration = time.perf_counter() - task_t0
+                    task_result_entry = next(
+                        (r for r in reversed(self.completed_task_results)
+                         if r.get("task_id") == task.task_id and "duration_s" not in r),
+                        None,
+                    )
+                    if task_result_entry is not None:
+                        task_result_entry["duration_s"] = round(task_duration, 3)
+                    get_recorder().log_event(
+                        "task_completed",
+                        task_id=task.task_id,
+                        title=task.title,
+                        agent=agent_class_name,
+                        status=task.status,
+                        duration_s=round(task_duration, 3),
+                        retries=(task_result_entry or {}).get("validation_retries", 0),
+                    )
+                    reset_task_context(task_ctx_token)
+
                     # Check cancellation after task execution
                     self.cancellation_token.check_cancelled(
                         step_name=f"After Task #{task.task_id}: {task.title}",
@@ -1219,7 +1347,7 @@ class WorkflowOrchestrator:
                         try:
                             summaries = self._collect_agent_summaries(self.current_output_dir)
                             try:
-                                verified_metrics = build_verified_metrics(self.current_output_dir)
+                                verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
                                 if "verified_metrics.json" not in self.generated_artifacts:
                                     self.generated_artifacts.append("verified_metrics.json")
                             except Exception as vm_err:
@@ -1250,11 +1378,13 @@ class WorkflowOrchestrator:
                                 parts.append("")
                             self.final_report = "\n".join(parts)
 
-                    if HAS_LOGFIRE:
-                        with logfire.span("ReporterAgent: Synthesize Final Report", task_count=len(self.completed_task_results)):
-                            _do_reporter_synthesis()
-                    else:
-                        _do_reporter_synthesis()
+                    with task_context(agent="ReporterAgent", phase="report_synthesis"):
+                        with get_recorder().step_timer("report_synthesis"):
+                            if HAS_LOGFIRE:
+                                with logfire.span("ReporterAgent: Synthesize Final Report", task_count=len(self.completed_task_results)):
+                                    _do_reporter_synthesis()
+                            else:
+                                _do_reporter_synthesis()
 
                     # Validate the synthesized final report
                     if self.final_report:
@@ -1331,13 +1461,17 @@ class WorkflowOrchestrator:
                 has_fatal_failures = len(failed_tasks) > 0
 
                 _safe_callback("final_verification_started", {"output_dir": self.current_output_dir})
-                verification = self._run_final_verification(query_text, active_plan)
+                with task_context(agent="VerificationStack", phase="verification"):
+                    with get_recorder().step_timer("final_verification"):
+                        verification = self._run_final_verification(query_text, active_plan)
 
                 # Post-report repair loop: while critical findings remain, combine
                 # ALL findings (numeric + consistency + judge) into one correction
                 # prompt and repair (max max_repair_attempts, 5 dedicated sandbox
                 # calls per attempt), re-verifying with all methods after each.
-                self._repair_final_report(verification, files_list, step_callback=step_callback)
+                with task_context(agent="ReporterAgent", phase="repair"):
+                    with get_recorder().step_timer("report_repair"):
+                        self._repair_final_report(verification, files_list, step_callback=step_callback)
                 findings = verification["findings"]
 
                 classification = self._classify_run_status(findings)
@@ -1399,6 +1533,7 @@ class WorkflowOrchestrator:
                             "title": tr.get("title"),
                             "agent": tr.get("agent"),
                             "status": tr.get("status"),
+                            "duration_s": tr.get("duration_s"),
                             "validation_retries": tr.get("validation_retries", 0),
                         }
                         for tr in self.completed_task_results
@@ -1553,11 +1688,23 @@ class WorkflowOrchestrator:
                     "output_dir": self.current_output_dir
                 }
 
-        if HAS_LOGFIRE:
-            with logfire.span(f"Multi-Agent Execution: {query_text[:100]}", plan_id=active_plan.plan_id, total_tasks=len(active_plan.tasks)):
-                return _execute_workflow()
-        else:
-            return _execute_workflow()
+        rec = get_recorder()
+        workflow_result: Optional[Dict[str, Any]] = None
+        try:
+            with rec.step_timer("total_workflow"):
+                if HAS_LOGFIRE:
+                    with logfire.span(f"Multi-Agent Execution: {query_text[:100]}", plan_id=active_plan.plan_id, total_tasks=len(active_plan.tasks)):
+                        workflow_result = _execute_workflow()
+                else:
+                    workflow_result = _execute_workflow()
+            return workflow_result
+        finally:
+            # Close the run: writes the run_summary event + run_metrics.json.
+            try:
+                status = workflow_result.get("status") if isinstance(workflow_result, dict) else "failed"
+                rec.finalize(status=status)
+            except Exception:
+                pass
 
     def run(
         self,

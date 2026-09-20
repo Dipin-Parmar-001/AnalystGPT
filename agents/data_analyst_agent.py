@@ -136,6 +136,10 @@ class DataAnalystAgent:
             except Exception as e:
                 logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
 
+        # Local observability: per-call latency, served model, token metrics
+        from agents.observability import instrument_openai_client
+        instrument_openai_client(self.client, agent_name="DataAnalystAgent")
+
         self.model_name = model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
@@ -377,8 +381,13 @@ class DataAnalystAgent:
                 f"2. Load the input dataset named in your task inputs (e.g. `feature_engineered_dataset.csv` or `cleaned_dataset.csv`).\n"
                 f"3. Compute summary statistics, correlations, and grouped aggregations.\n"
                 f"4. Generate ONLY the specific charts requested in the task description and save as PNG files.\n"
-                f"5. MANDATORY SUMMARY: Save your own task summary as `analyst_summary_task_{task_id_val}.json` AND `analyst_summary.json` with complete metric breakdowns.\n"
-                f"6. Provide a comprehensive summary of key statistical insights and findings."
+                f"5. COMPUTED STATS ARTIFACT (MANDATORY): in the same script, dump every segment rate, per-class "
+                f"median/mean, and correlation you will report to `stats_findings.json` — each segment entry with "
+                f"`feature`, `category`, `count`, `positives`, `rate`. Every number in `key_insights` and every chart "
+                f"description MUST come from that file, never retyped. If you reconstruct categorical columns from "
+                f"one-hot dummies, save the analysis frame as `analysis_dataset.csv` and claim ITS saved shape.\n"
+                f"6. MANDATORY SUMMARY: Save your own task summary as `analyst_summary_task_{task_id_val}.json` AND `analyst_summary.json` with complete metric breakdowns.\n"
+                f"7. Provide a comprehensive summary of key statistical insights and findings."
             )
         else:
             task_specific_instructions = (

@@ -11,8 +11,9 @@ never replaces — the deterministic gates.
 
 Guardrails so the judge cannot introduce new hallucinations:
 1. Temperature 0 and a JSON-only output contract.
-2. Robust JSON extraction + strict schema validation; unparsable output => no
-   findings (fail-open to deterministic gates, never fail-closed on parse errors).
+2. Robust JSON extraction + strict schema validation; one strict retry on an
+   unparsable response, after which the orchestrator emits a visible
+   `judge_failed` finding (the run is never silently left unjudged).
 3. Anti-fabrication filter: every returned claim's `quote` must appear verbatim
    (whitespace-normalized) in the report. Claims quoting text absent from the
    report are discarded as judge hallucinations.
@@ -148,6 +149,10 @@ class ConsistencyJudge:
 
         self.model_name = model_name
 
+        # Local observability: per-call latency, served model, token metrics
+        from agents.observability import instrument_openai_client
+        instrument_openai_client(self.client, agent_name="ConsistencyJudge")
+
     def _call_llm(self, user_content: str) -> str:
         response = self.client.chat.completions.create(
             model=self.model_name,
@@ -181,7 +186,8 @@ class ConsistencyJudge:
             for key in ("dataset", "best_model", "model_metrics", "tuned_model_metrics",
                         "baseline_score", "confusion_matrix", "predictions_summary",
                         "top_features", "hyperparameter_tuning_summary", "best_params",
-                        "champion_model", "versioned_model_artifacts"):
+                        "champion_model", "versioned_model_artifacts",
+                        "segment_stats", "threshold_analysis"):
                 if key in verified_metrics:
                     gt_digest[key] = verified_metrics[key]
             ds = gt_digest.get("dataset")
@@ -215,9 +221,26 @@ class ConsistencyJudge:
 
         parsed = _extract_json_object(raw)
         if parsed is None:
-            if HAS_LOGFIRE:
-                logfire.warn("ConsistencyJudge returned unparsable output; ignoring judge findings")
-            return JudgeResult(parse_ok=False, raw_response=raw[:2000], error="unparsable_json")
+            # One strict retry: an unparsable judge response must not silently
+            # zero out the entire prose-verification layer.
+            repair_suffix = (
+                "\n\nYour previous response was not parsable as JSON. Respond AGAIN with "
+                "ONLY the raw JSON object with keys 'overall_assessment' and 'claims' — "
+                "no prose, no markdown fences, no commentary."
+            )
+            try:
+                raw = self._call_llm("\n\n".join(user_parts) + repair_suffix)
+            except Exception as e:
+                if HAS_LOGFIRE:
+                    logfire.warn("ConsistencyJudge retry LLM call failed", error=str(e))
+                return JudgeResult(parse_ok=False, raw_response=raw[:2000],
+                                   error=f"unparsable_json (retry LLM call failed: {e})")
+            parsed = _extract_json_object(raw)
+            if parsed is None:
+                if HAS_LOGFIRE:
+                    logfire.warn("ConsistencyJudge returned unparsable output after one retry; ignoring judge findings")
+                return JudgeResult(parse_ok=False, raw_response=raw[:2000],
+                                   error="unparsable_json (after 1 retry)")
 
         norm_report = _normalize_ws(report_text)
         claims: List[JudgedClaim] = []

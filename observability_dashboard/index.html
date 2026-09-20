@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AnalystGPT · Observability</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📊</span>
+      <div>
+        <h1>AnalystGPT <span class="muted">Observability</span></h1>
+        <div class="subtitle">Unified run metrics · local JSONL logs · separate from the app frontend</div>
+      </div>
+    </div>
+    <div class="controls">
+      <label for="run-select">Run</label>
+      <select id="run-select"></select>
+      <button id="refresh-btn" class="btn" title="Reload run data">↻ Refresh</button>
+      <label class="toggle">
+        <input type="checkbox" id="live-toggle" checked />
+        <span>Live (3s)</span>
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <section id="status-strip" class="status-strip hidden">
+      <span id="run-status-badge" class="badge">—</span>
+      <span id="run-meta" class="muted"></span>
+    </section>
+
+    <section class="kpis" id="kpi-grid"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Workflow Timeline</h2>
+        <label class="toggle"><input type="checkbox" id="show-spans" /> <span>include nested spans</span></label>
+      </div>
+      <div id="timeline" class="timeline"></div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2>LLM Calls — by Agent</h2>
+        <div id="llm-by-agent"></div>
+      </div>
+      <div class="panel">
+        <h2>LLM Calls — by Task</h2>
+        <div id="llm-by-task"></div>
+      </div>
+      <div class="panel">
+        <h2>LLM Calls — by Served Model</h2>
+        <div id="llm-by-model"></div>
+      </div>
+      <div class="panel">
+        <h2>Token Usage</h2>
+        <div id="tokens"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Tool Calls</h2>
+      <div id="tools-summary"></div>
+      <h3 class="subhead">Per-tool breakdown</h3>
+      <div id="tools-by-tool"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Tasks</h2>
+      <div id="tasks-table"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Tool Execution Log <span class="muted small">(full code / stdout / stderr, middle-chunked &gt;15k tokens)</span></h2>
+      <div id="tool-calls"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Recent LLM Calls</h2>
+      <div id="llm-calls"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Errors &amp; Findings</h2>
+      <div id="errors"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Event Log</h2>
+        <div class="filters">
+          <select id="filter-level">
+            <option value="">all levels</option>
+            <option value="info">info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+            <option value="debug">debug</option>
+          </select>
+          <input type="text" id="filter-event" placeholder="event name (e.g. llm_call)" />
+          <input type="text" id="filter-q" placeholder="search text..." />
+          <button id="filter-apply" class="btn">Apply</button>
+        </div>
+      </div>
+      <div id="events"></div>
+      <div class="center">
+        <button id="events-more" class="btn">Load more</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -136,6 +136,10 @@ class ReporterAgent:
             except Exception as e:
                 logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
 
+        # Local observability: per-call latency, served model, token metrics
+        from agents.observability import instrument_openai_client
+        instrument_openai_client(self.client, agent_name="ReporterAgent")
+
         self.model_name = model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
@@ -361,6 +365,7 @@ class ReporterAgent:
         user_content_parts.append(
             "Instructions:\n"
             "1. You have access to `execute_python` in the shared stateful Modal Cloud Sandbox containing ALL generated artifacts.\n"
+            "1a. `verified_metrics.json` — the same ground truth as the VERIFIED_METRICS block above — is available inside the sandbox. Load it directly with `json.load(open('verified_metrics.json'))`; do NOT waste tool calls searching for metric files.\n"
             f"2. You have a budget of up to {effective_max_calls} tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently.\n"
             "3. STRICT GROUNDING: Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim. Do not compute, round, or estimate any number yourself. If a number the report needs isn't present in `VERIFIED_METRICS`, write \"not verified in current run\" instead of guessing.\n"
             "4. On contradiction: `VERIFIED_METRICS` is authoritative. Note any upstream discrepancies in Operational Caveats.\n"
@@ -458,7 +463,7 @@ class ReporterAgent:
                     "max_tool_calls": effective_max_calls
                 })
 
-                exec_result = self.tool_manager.execute_tool_call(tool_call=tc)
+                exec_result = self.tool_manager.execute_tool_call(tool_call=tc, files=self._sandbox_seed_files())
 
                 if cancellation_token:
                     cancellation_token.check_cancelled(step_name=f"{self.agent_name} after tool {fn_name}")
@@ -659,6 +664,15 @@ class ReporterAgent:
             return raw_output_dir
         return os.path.join(workspace_root, raw_output_dir or "outputs")
 
+    def _sandbox_seed_files(self) -> Optional[List[str]]:
+        """
+        Files uploaded alongside every sandbox tool call. verified_metrics.json is
+        built on the host and never enters the stateful container unless explicitly
+        shipped; without this the model burns tool calls trying to read it there.
+        """
+        vm_path = os.path.join(self._report_output_dir(), "verified_metrics.json")
+        return [vm_path] if os.path.exists(vm_path) else None
+
     def repair_report(
         self,
         current_report: str,
@@ -761,7 +775,7 @@ class ReporterAgent:
                     continue
 
                 tool_calls_count += 1
-                exec_result = self.tool_manager.execute_tool_call(tool_call=tc)
+                exec_result = self.tool_manager.execute_tool_call(tool_call=tc, files=self._sandbox_seed_files())
                 memory_manager.append_tool_result(tool_call_id=tc_id, name=fn_name, tool_result=exec_result)
 
                 if HAS_LOGFIRE:

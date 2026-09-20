@@ -127,6 +127,28 @@ def execute_python(
 
         stdout_str = result.get("stdout", "")
         stderr_str = result.get("stderr", "")
+
+        # Local observability: record the FULL stdout/stderr (smart-chunked at
+        # 15k tokens) BEFORE the agent-bound truncation below. Deferred import
+        # avoids a circular import with the agents package.
+        try:
+            from agents.observability import get_recorder
+            rec = get_recorder()
+            if rec.is_active():
+                rec.record_tool_call(
+                    fn_name="execute_python",
+                    tool_call_id=None,
+                    success=result.get("status", False),
+                    duration_s=result.get("execution_time", 0.0),
+                    code=code,
+                    stdout=stdout_str,
+                    stderr=stderr_str,
+                    returned_files=returned_file_names,
+                    error="" if result.get("status", False) else (result.get("error") or stderr_str or "sandbox execution failed"),
+                )
+        except Exception:
+            pass
+
         if len(stdout_str) > 4000:
             stdout_str = stdout_str[:4000] + "\n... [stdout truncated at 4000 characters limit]"
         if len(stderr_str) > 2000:
@@ -350,6 +372,30 @@ class ToolManager:
                 )
             else:
                 print(f"[Tool Result]: status={'SUCCESS' if is_success else 'FAILED'} (time: {exec_time}s)", flush=True)
+
+            # Local observability for dispatch-level outcomes. execute_python
+            # records its own full-content event before stdout/stderr truncation;
+            # this covers unknown tools, raised exceptions, and custom tools
+            # (identified by a result without an execution_time field).
+            if fn_name != "execute_python" or tool_res.get("execution_time") is None:
+                try:
+                    from agents.observability import get_recorder
+                    rec = get_recorder()
+                    if rec.is_active():
+                        rec.record_tool_call(
+                            fn_name=fn_name,
+                            tool_call_id=tool_call_id,
+                            success=is_success,
+                            duration_s=exec_time,
+                            code=fn_args.get("code") if isinstance(fn_args, dict) else None,
+                            stdout=stdout_str,
+                            stderr=stderr_str,
+                            returned_files=returned_files,
+                            error=tool_res.get("error"),
+                            parse_error=parse_error,
+                        )
+                except Exception:
+                    pass
 
             return tool_res
 

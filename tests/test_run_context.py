@@ -72,5 +72,37 @@ class TestDatasetProfile(unittest.TestCase):
         self.assertEqual(compare_profile_claims(profile, claimed_cols=6, dataset_key="feature_engineered"), [])
 
 
+class TestRawDatasetResolution(unittest.TestCase):
+    """The raw profile must come only from real uploads — never guessed from output artifacts."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        _write_csv(os.path.join(self.tmp, "cleaned_dataset.csv"),
+                   ["customerID", "tenure", "MonthlyCharges", "Churn Value"], n_rows=10)
+        # A correlation-matrix-style artifact that previously got mis-profiled as "raw".
+        _write_csv(os.path.join(self.tmp, "corr_matrix.csv"),
+                   ["Count", "Tenure Months", "Churn Value"], n_rows=3)
+
+    def test_output_dir_artifacts_are_never_taken_as_raw(self):
+        profile = build_dataset_profile(self.tmp, persist=False)
+        self.assertNotIn("raw", profile["datasets"])
+
+    def test_uploaded_file_is_profiled_as_raw(self):
+        raw = os.path.join(self.tmp, "raw_upload.csv")
+        _write_csv(raw, ["customerID", "tenure"], n_rows=12)
+        profile = build_dataset_profile(self.tmp, uploaded_files=[raw], persist=False)
+        self.assertEqual(profile["datasets"]["raw"]["file"], "raw_upload.csv")
+        self.assertEqual(profile["datasets"]["raw"]["rows"], 12)
+
+    def test_suspicious_upload_is_refused_as_raw(self):
+        # Fewer rows than the cleaned dataset and a strict column subset -> a
+        # derived artifact, not an upload.
+        tiny = os.path.join(self.tmp, "tiny.csv")
+        _write_csv(tiny, ["customerID", "tenure", "MonthlyCharges"], n_rows=3)
+        profile = build_dataset_profile(self.tmp, uploaded_files=[tiny], persist=False)
+        self.assertNotIn("raw", profile["datasets"])
+        self.assertTrue(any("Refused" in n for n in profile["notes"]), profile["notes"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -507,6 +507,10 @@ class PlannerAgent:
             default_headers=headers
         )
 
+        # Local observability: per-call latency, served model, token metrics
+        from agents.observability import instrument_openai_client
+        instrument_openai_client(self.client, agent_name="PlannerAgent")
+
         self.available_agents = available_agents or DEFAULT_AVAILABLE_AGENTS
         self.model_name = model_name
         self.max_tool_calls_per_task = max_tool_calls_per_task

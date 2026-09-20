@@ -30,14 +30,225 @@ def safe_float(val: Any) -> Optional[float]:
         return None
 
 
-def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Generic segment-statistics grounding (dataset-agnostic).
+#
+# The goal: for ANY uploaded dataset, deterministically compute the per-category
+# target rates and per-class numeric summaries that reports typically claim, so
+# the verifier can prove or refute claims like "category X churns at Y%" without
+# knowing anything about the domain in advance.
+#
+# Design rules (no domain keyword lists anywhere):
+# - The target column is taken from what the pipeline itself declared
+#   (`target_column` in the run's summary/registry JSONs); structural fallback:
+#   if the frame has exactly ONE binary column, use it, otherwise refuse to
+#   guess (no grounding beats wrong grounding).
+# - Segments are structural: non-numeric columns with few unique values; 0/1
+#   dummy columns grouped by their shared prefix (standard one-hot naming);
+#   all-zero rows of a dummy group form the reference category.
+# - The positive class is the minority class (generic for churn / fraud /
+#   default / attrition style targets).
+# - High-cardinality columns (IDs, free text, geo) are excluded structurally by
+#   unique-count thresholds, never by name.
+# ---------------------------------------------------------------------------
+
+SEGMENT_MAX_CATEGORIES = 12          # skip categoricals wider than this (IDs, free text)
+SEGMENT_MIN_CATEGORY_ROWS = 5        # skip tiny segments (noise / near-unique values)
+SEGMENT_MAX_NUMERIC_BY_CLASS = 15    # cap per-class numeric stats to top-K by |corr|
+SEGMENT_MAX_ENTRIES = 200            # hard cap on rate_by_category size
+
+
+def declared_target_column(run_path: Path) -> Optional[str]:
+    """
+    Resolves the target column the pipeline itself declared in this run's
+    summary/registry JSONs (analyst summaries carry dataset_overview.target_column;
+    ML summaries and model_registry carry target_column). Returns the most common
+    declared value, or None if nothing declared it.
+    """
+    import json as _json
+    from collections import Counter
+
+    votes: Counter = Counter()
+    candidates = list(run_path.glob("*summary*.json")) + list(run_path.glob("model_registry.json"))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = _json.load(f)
+        except Exception:
+            continue
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                v = node.get("target_column")
+                if isinstance(v, str) and v.strip():
+                    votes[v.strip()] += 1
+                for vv in node.values():
+                    _walk(vv)
+            elif isinstance(node, list):
+                for vv in node:
+                    _walk(vv)
+
+        _walk(data)
+    return votes.most_common(1)[0][0] if votes else None
+
+
+def detect_target_column(df: "pd.DataFrame", declared_target: Optional[str] = None) -> Optional[str]:
+    """
+    Picks the binary target column. Prefers the pipeline-declared target; the only
+    structural fallback is a frame with exactly one binary column. Never guesses
+    among multiple binary columns.
+    """
+    if declared_target is not None:
+        for c in df.columns:
+            if str(c) == str(declared_target) and df[c].nunique(dropna=True) == 2:
+                return c
+    binary_cols = [c for c in df.columns if df[c].nunique(dropna=True) == 2]
+    if len(binary_cols) == 1:
+        return binary_cols[0]
+    return None
+
+
+def compute_segment_stats(df: "pd.DataFrame", declared_target: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Computes ground-truth segment statistics from a dataset artifact (works for
+    any dataset; see the module block above for the generic design rules).
+
+    Returns None when no binary target can be identified (e.g. regression runs,
+    or frames with several equally-plausible binary columns).
+    """
+    import pandas as pd
+    import numpy as np
+
+    if df is None or len(df) == 0:
+        return None
+    target = detect_target_column(df, declared_target)
+    if target is None:
+        return None
+
+    y_raw = df[target]
+    if pd.api.types.is_numeric_dtype(y_raw):
+        y = pd.to_numeric(y_raw, errors="coerce")
+        pos_label = 1 if 1 in set(y.dropna().unique()) else sorted(y.dropna().unique())[-1]
+    else:
+        y = y_raw.astype(str)
+        vc = y.value_counts()
+        pos_label = vc.index[-1] if len(vc) else None  # minority class
+    if pos_label is None or y.notna().sum() == 0:
+        return None
+
+    valid = y.notna()
+    yv = y[valid]
+    stats: Dict[str, Any] = {
+        "target_column": str(target),
+        "positive_class": int(pos_label) if isinstance(pos_label, (int, np.integer)) else str(pos_label),
+        "overall": {
+            "count": int(valid.sum()),
+            "positives": int((yv == pos_label).sum()),
+            "rate": round(float((yv == pos_label).mean()), 4),
+        },
+        "rate_by_category": [],
+        "numeric_by_class": [],
+        "notes": [
+            "rate_by_category covers plain categorical columns, one-hot dummy groups "
+            "(including the all-zeros '<reference>' category), and standalone 0/1 columns.",
+            "Positive class is the minority class of the target.",
+        ],
+    }
+
+    def _rate_for(mask: "pd.Series", feature: str, category: str) -> None:
+        if len(stats["rate_by_category"]) >= SEGMENT_MAX_ENTRIES:
+            return
+        m = (mask & valid) if mask.dtype == bool else None
+        if m is None:
+            return
+        n = int(m.sum())
+        if n < SEGMENT_MIN_CATEGORY_ROWS:
+            return
+        pos = int((y[m] == pos_label).sum())
+        stats["rate_by_category"].append({
+            "feature": feature,
+            "category": category,
+            "count": n,
+            "positives": pos,
+            "rate": round(float(pos / n), 4),
+        })
+
+    # 1. Plain non-numeric categorical columns (structural cardinality limits only)
+    for col in df.columns:
+        if col == target or pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        vc = df[col].value_counts(dropna=False)
+        if 2 <= len(vc) <= SEGMENT_MAX_CATEGORIES:
+            for cat in vc.index:
+                _rate_for(df[col].astype(str) == str(cat), str(col), str(cat))
+
+    # 2. One-hot dummy groups + standalone 0/1 columns
+    binary_cols = [
+        c for c in df.columns
+        if c != target and pd.api.types.is_numeric_dtype(df[c])
+        and set(pd.unique(df[c].dropna())).issubset({0, 1, 0.0, 1.0, False, True})
+    ]
+    groups: Dict[str, List[Any]] = {}
+    for col in binary_cols:
+        name = str(col)
+        prefix = name.rsplit("_", 1)[0] if "_" in name else name
+        groups.setdefault(prefix, []).append(col)
+
+    for prefix, cols in groups.items():
+        if len(cols) >= 2:
+            for col in cols:
+                _rate_for(df[col] == 1, prefix, str(col)[len(prefix) + 1:])
+            ref_mask = pd.Series(True, index=df.index)
+            for col in cols:
+                ref_mask &= df[col] == 0
+            _rate_for(ref_mask, prefix, "<reference>")
+        else:
+            col = cols[0]
+            _rate_for(df[col] == 1, str(col), "1")
+            _rate_for(df[col] == 0, str(col), "0")
+
+    # 3. Per-target-class median/mean for numeric columns (top-K by |corr| with
+    #    the positive-class indicator; skips the binary/dummy columns themselves).
+    #    No name filters — ranking is purely statistical.
+    y_ind = (y == pos_label).astype(float)
+    scored: List[Tuple[Any, float]] = []
+    for col in df.columns:
+        if col == target or not pd.api.types.is_numeric_dtype(df[col]) or col in binary_cols:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        if series.nunique(dropna=True) <= 2:
+            continue
+        corr = series.corr(y_ind)
+        scored.append((col, abs(float(corr)) if corr is not None and not pd.isna(corr) else 0.0))
+    top_numeric = [c for c, _ in sorted(scored, key=lambda t: t[1], reverse=True)[:SEGMENT_MAX_NUMERIC_BY_CLASS]]
+
+    for col in top_numeric:
+        series = pd.to_numeric(df[col], errors="coerce")
+        for cls in sorted(yv.unique(), key=lambda v: str(v)):
+            vals = series[valid & (y == cls)].dropna()
+            if len(vals) == 0:
+                continue
+            stats["numeric_by_class"].append({
+                "column": str(col),
+                "class": int(cls) if isinstance(cls, (int, np.integer)) else str(cls),
+                "median": round(float(vals.median()), 4),
+                "mean": round(float(vals.mean()), 4),
+            })
+
+    return stats
+
+
+def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Scans run_dir for generated data science artifacts and deterministically computes
     ground-truth verified metrics.
-    
+
     Args:
         run_dir: Path to directory containing artifact files (defaults to current working directory).
-        
+        uploaded_files: Optional paths of the user's raw uploads. When provided, their
+            original (un-encoded) categorical columns are merged into segment_stats so
+            reference categories dropped by one-hot encoding keep their real names.
+
     Returns:
         Dictionary containing all verified metrics.
     """
@@ -374,6 +585,7 @@ def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
             verified["baseline_score_error"] = f"Failed to parse baseline_score.json: {str(e)}"
 
     # 8. Predictions Summary (predictions.csv)
+    preds_df: Optional["pd.DataFrame"] = None
     pred_path = run_path / "predictions.csv"
     if pred_path.exists() and pred_path.is_file():
         try:
@@ -392,6 +604,102 @@ def build_verified_metrics(run_dir: str = ".") -> Dict[str, Any]:
             verified["predictions_summary"] = pred_summary
         except Exception as e:
             verified["predictions_summary_error"] = f"Failed to parse predictions.csv: {str(e)}"
+
+    # 8b. Threshold analysis grounding (threshold_analysis.json) + flagged volumes
+    # recomputed from stored prediction probabilities, so report claims like
+    # "threshold 0.1885 flags 911/1409 (64.7%)" are verifiable.
+    ta_path = run_path / "threshold_analysis.json"
+    if ta_path.exists() and ta_path.is_file():
+        try:
+            with open(ta_path, "r", encoding="utf-8", errors="replace") as f:
+                ta_data = json.load(f)
+            if isinstance(ta_data, dict):
+                flagged_volumes: Dict[str, Any] = {}
+                if preds_df is not None:
+                    prob_col = next((c for c in preds_df.columns if "prob" in str(c).lower()), None)
+                    truth_col = next((c for c in preds_df.columns
+                                      if any(k in str(c).lower() for k in ("true", "actual"))), None)
+                    if prob_col is not None:
+                        probs = pd.to_numeric(preds_df[prob_col], errors="coerce")
+                        truth = (pd.to_numeric(preds_df[truth_col], errors="coerce")
+                                 if truth_col is not None else None)
+                        mask = probs.notna() & (truth.notna() if truth is not None else True)
+                        probs = probs[mask]
+                        truth = truth[mask] if truth is not None else None
+                        for vol_key, thr in (("default", ta_data.get("default_threshold")),
+                                             ("recommended", ta_data.get("recommended_threshold"))):
+                            thr_f = safe_float(thr)
+                            if thr_f is None or len(probs) == 0:
+                                continue
+                            flagged_mask = probs >= thr_f
+                            flagged = int(flagged_mask.sum())
+                            vol = {
+                                "threshold": thr_f,
+                                "flagged_count": flagged,
+                                "total": int(len(probs)),
+                                "flagged_pct": round(float(flagged / len(probs) * 100), 2),
+                            }
+                            if truth is not None:
+                                tp = int(((probs >= thr_f) & (truth == 1)).sum())
+                                vol["true_positives"] = tp
+                                if tp > 0:
+                                    vol["contacts_per_true_positive"] = round(flagged / tp, 2)
+                            flagged_volumes[vol_key] = vol
+                if flagged_volumes:
+                    ta_data["flagged_volume"] = flagged_volumes
+                verified["threshold_analysis"] = ta_data
+        except Exception as e:
+            verified["threshold_analysis_error"] = f"Failed to parse threshold_analysis.json: {str(e)}"
+
+    # 10. Segment statistics grounding (dataset-agnostic; see compute_segment_stats).
+    # Preferred frame: feature_engineered_dataset.csv (may hold plain categoricals
+    # such as binned groups), else the cleaned dataset, else the profiled dataset.
+    try:
+        seg_df: Optional["pd.DataFrame"] = None
+        seg_source: Optional[str] = None
+        for cand in ("feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"):
+            cand_path = run_path / cand
+            if cand_path.exists() and cand_path.is_file():
+                seg_df = pd.read_csv(cand_path)
+                seg_source = cand
+                break
+        if seg_df is None and target_csv is not None and target_csv.exists():
+            seg_df = pd.read_csv(target_csv)
+            seg_source = target_csv.name
+        if seg_df is not None:
+            declared = declared_target_column(run_path)
+            seg_stats = compute_segment_stats(seg_df, declared_target=declared)
+            if seg_stats is not None:
+                seg_stats["source_file"] = seg_source
+                # Merge named segments from the raw uploads: the run-dir datasets are
+                # typically one-hot encoded, so reference categories only exist there
+                # under their real names (raw entries win on label collisions).
+                for up in uploaded_files or []:
+                    try:
+                        if not up or not str(up).lower().endswith(".csv") or not os.path.exists(up):
+                            continue
+                        raw_df = pd.read_csv(up, nrows=500_000)
+                        if declared not in raw_df.columns:
+                            continue
+                        raw_stats = compute_segment_stats(raw_df, declared_target=declared)
+                        if not raw_stats:
+                            continue
+                        by_key = {
+                            (str(s["feature"]).lower(), str(s["category"]).lower()): s
+                            for s in seg_stats["rate_by_category"]
+                        }
+                        for s in raw_stats.get("rate_by_category", []):
+                            by_key[(str(s["feature"]).lower(), str(s["category"]).lower())] = s
+                        seg_stats["rate_by_category"] = sorted(
+                            by_key.values(), key=lambda s: abs(float(s["rate"]) - seg_stats["overall"]["rate"]),
+                            reverse=True,
+                        )
+                        seg_stats["raw_source_file"] = os.path.basename(up)
+                    except Exception:
+                        continue
+                verified["segment_stats"] = seg_stats
+    except Exception as e:
+        verified["segment_stats_error"] = f"Failed to compute segment stats: {str(e)}"
 
     # 9. Save verified_metrics.json locally to run_dir
     try:

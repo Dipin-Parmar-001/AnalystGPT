@@ -34,6 +34,10 @@ def setup_logfire(service_name: str = "analyst-gpt") -> bool:
             # Instrument standard python logging module
             logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()])
             _configured = True
+            # Mirror every logfire log/span to the local per-run JSONL file.
+            # Patch BEFORE the init message so it is captured too.
+            from agents.observability import patch_logfire
+            patch_logfire()
             logfire.info("Logfire telemetry initialized successfully", service_name=service_name)
         except Exception as e:
             print(f"[Logfire Setup Warning] Failed to configure Logfire: {e}", file=sys.stderr)

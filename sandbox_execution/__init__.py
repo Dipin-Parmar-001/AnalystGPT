@@ -24,6 +24,8 @@ from sandbox_execution.tool_manager import (
 
 from sandbox_execution.verification_script import (
     build_verified_metrics,
+    compute_segment_stats,
+    detect_target_column,
 )
 
 __all__ = [
@@ -43,5 +45,7 @@ __all__ = [
     "execute_python",
     "EXECUTE_PYTHON_TOOL_SPEC",
     "build_verified_metrics",
+    "compute_segment_stats",
+    "detect_target_column",
 ]
 
