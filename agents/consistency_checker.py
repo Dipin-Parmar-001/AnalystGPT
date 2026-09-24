@@ -23,6 +23,7 @@ apply the severity-based failure policy.
 """
 
 import os
+import re
 import json
 import glob
 import hashlib
@@ -671,6 +672,33 @@ def check_visualization_descriptions(output_dir: str) -> List[Finding]:
 _SEGMENT_SKIP_CATEGORIES = {"0", "1", "<reference>", "no", "yes"}
 _RATE_MATCH_TOL_PCT = 0.5  # percentage points; covers 1-decimal rounding of true rates
 
+# Sentences describing model PREDICTION behavior rather than dataset segments.
+# Percentages quoted here are holdout prediction rates (flag rate, positive-class
+# share, contact volume), which must not be judged against segment churn rates.
+_PREDICTION_SENTENCE_RE = re.compile(
+    r"flag(?:ged| rate|s)?\b|positive[- ]class|predicted (?:rate|share|volume|count|positive)"
+    r"|\bpredictions?\b|test (?:set|predictions)|holdout|contact(?:s|ed)? volume",
+    re.IGNORECASE,
+)
+
+
+def _binary_feature_labels(feature: str) -> List[str]:
+    """Normalized index labels for a binary feature so prose like 'customers
+    without partners' or 'no dependents' resolves to the feature's segments."""
+    import re as _re
+
+    feat = _re.sub(r"[\s\-\u2013\u2014_]+", " ", (feature or "").strip()).lower()
+    if not feat:
+        return []
+    labels = [feat, feat + "s"]
+    # Common singular/plural variants for features already ending in 's'
+    # ('dependents' -> 'dependent') so singular prose still matches.
+    if feat.endswith("ies"):
+        labels.append(feat[:-3] + "y")
+    elif feat.endswith("s"):
+        labels.append(feat[:-1])
+    return labels
+
 
 def _load_segment_frame(output_dir: str):
     """Loads the dataset artifact used for segment grounding (FE preferred over cleaned)."""
@@ -755,6 +783,18 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     the rates of the categories named in that same sentence, it is fabricated
     -> critical.
 
+    Semantic rules (to avoid false positives on legitimately derived numbers):
+
+    - Binary yes/no segments (one-hot reference categories) are indexed under
+      their FEATURE name as well (e.g. 'partner', 'dependents'), with both the
+      yes and no rates as legitimate referents. A sentence like "customers
+      without partners (32.96%)" therefore checks against Partner=No's real
+      rate instead of being judged against unrelated co-mentioned segments.
+    - Sentences describing model PREDICTION behavior (flag rate, positive-class
+      share of predictions, test-set volume) are excluded: quoted percentages
+      there are model outputs on the holdout, not dataset segment churn rates.
+      Value grounding for those numbers remains the numeric verifier's job.
+
     Matching is deliberately scoped to the categories mentioned in the sentence:
     a fabricated rate must not be excused by colliding with some *other*
     segment's true rate (pool saturation). Fully generic — the vocabulary checked
@@ -770,7 +810,9 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     if not stats:
         return findings
 
-    # Index named segments by normalized category label.
+    # Index named segments by normalized category label. Binary yes/no levels are
+    # additionally indexed under their feature name so prose like "customers
+    # without partners" resolves to the Partner segments.
     by_label: Dict[str, List[Dict[str, Any]]] = {}
     for seg in stats.get("rate_by_category", []):
         category = str(seg.get("category", "")).strip()
@@ -778,9 +820,20 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
             float(seg["rate"])
         except (KeyError, TypeError, ValueError):
             continue
-        if not category or category in _SEGMENT_SKIP_CATEGORIES or len(category) < 3:
+        if not category:
             continue
-        by_label.setdefault(_norm_segment_label(category), []).append(seg)
+        # Self-index only distinctive category labels; bare yes/no levels are
+        # reachable via their feature-name labels below.
+        if len(category) >= 3 and category.lower() not in _SEGMENT_SKIP_CATEGORIES:
+            by_label.setdefault(_norm_segment_label(category), []).append(seg)
+        if str(seg.get("feature", "")).strip().lower() in {"churn", "churn label", "churn value", "target"}:
+            continue
+        if category.lower() in {"no", "yes"}:
+            for label in _binary_feature_labels(str(seg.get("feature", ""))):
+                by_label.setdefault(label, []).append(seg)
+
+    # Ground-truth percentages already verified elsewhere (VERIFIED_METRICS):
+    # exempting them keeps this check focused on segment attribution.
 
     def _norm(s: str) -> str:
         return _norm_segment_label(s)
@@ -794,10 +847,22 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     # (so 'DSL' is not found inside 'SDSL'), while punctuation like '(' next to
     # a bucket label ('(0-12') still matches.
     def _label_in(low: str, label: str) -> bool:
-        return _re.search(rf"(?<![0-9a-z]){ _re.escape(label) }(?![0-9a-z])", low) is not None
+        # Trailing 's?' (positive lookahead) lets 'partner' match the plural prose
+        # 'partners' while still requiring a word boundary after it.
+        return _re.search(rf"(?<![0-9a-z]){ _re.escape(label) }(?=s?(?![0-9a-z]))", low) is not None
 
     for sentence in sentences:
         low = _norm(sentence)
+        # Skip verification-notice blockquotes: runs whose report embedded prior
+        # gate output quote finding text (with segment rates) verbatim, which the
+        # check must not re-adjudicate as new report claims.
+        if low.startswith(">") and ("verification notice" in low or "report quotes" in low):
+            continue
+        # Model-prediction sentences quote prediction-side rates (flag rate,
+        # positive-class share), not dataset segment rates. Judging those against
+        # segment ground truth produces false positives.
+        if _PREDICTION_SENTENCE_RE.search(low):
+            continue
         mentioned: List[Tuple[str, List[Dict[str, Any]]]] = [
             (label, segs) for label, segs in by_label.items() if _label_in(low, label)
         ]

@@ -11,8 +11,11 @@ This module manages:
 
 import os
 import io
+import sys
 import json
 import time
+import ctypes
+import threading
 import mimetypes
 import tempfile
 import contextlib
@@ -52,6 +55,11 @@ DEFAULT_SANDBOX_PACKAGES = [
     "joblib",
     "openpyxl",
 ]
+
+# Hard execution cap for any single sandboxed code call (seconds). Matches the
+# Modal @app.function(timeout=...) on the remote executor; long-running work
+# (e.g. large hyperparameter searches) is cut off at the container layer.
+SANDBOX_TIMEOUT_S = 300
 
 
 # ==========================================
@@ -536,7 +544,9 @@ if HAS_MODAL:
 
     @_default_app.function(
         image=_default_image,
-        timeout=500,
+        # Per-invocation cap: kills only this function call, never the caller's
+        # persistent sandbox state.
+        timeout=SANDBOX_TIMEOUT_S,
         memory=2048,
         cpu=2.0,
         serialized=True,
@@ -552,7 +562,7 @@ else:
 def create_sandbox_executor(
     app: Optional[Any] = None,
     image: Optional[Any] = None,
-    timeout: int = 60,
+    timeout: int = SANDBOX_TIMEOUT_S,
     memory: int = 1024,
     cpu: float = 1.0,
 ):
@@ -564,7 +574,7 @@ def create_sandbox_executor(
             "The 'modal' package is not installed. Please install it using `pip install modal`."
         )
 
-    if app is None and image is None and timeout == 60 and memory == 1024 and cpu == 1.0:
+    if app is None and image is None and timeout == SANDBOX_TIMEOUT_S and memory == 1024 and cpu == 1.0:
         return global_execute_python_in_sandbox
 
     if app is None:
@@ -595,7 +605,7 @@ _GLOBAL_SANDBOX_MANAGER: Optional["ModalSandboxManager"] = None
 def get_global_sandbox_manager(
     app_name: str = "analystGPT-sandbox",
     extra_packages: Optional[List[str]] = None,
-    timeout: int = 60,
+    timeout: int = SANDBOX_TIMEOUT_S,
     memory: int = 1024,
     cpu: float = 1.0,
     reset: bool = False,
@@ -645,7 +655,7 @@ class ModalSandboxManager:
         self,
         app_name: str = "analystGPT-sandbox",
         extra_packages: Optional[List[str]] = None,
-        timeout: int = 60,
+        timeout: int = SANDBOX_TIMEOUT_S,
         memory: int = 1024,
         cpu: float = 1.0,
     ):
@@ -772,10 +782,11 @@ class ModalSandboxManager:
 
             success = False
             error_str = ""
+            timed_out = False
 
             # CRITICAL FIX: Set matplotlib to use 'Agg' backend (non-interactive) BEFORE executing user code.
             # This prevents Tkinter threading errors ("main thread is not in main loop") that occur when
-            # matplotlib tries to use a GUI backend in a background thread (Modal sandbox).
+            # matplotlib uses a GUI backend in a background thread (Modal sandbox).
             matplotlib_setup_code = (
                 "import os\n"
                 "os.environ['MPLBACKEND'] = 'Agg'\n"
@@ -783,18 +794,59 @@ class ModalSandboxManager:
                 "matplotlib.use('Agg')\n"
             )
 
-            try:
-                os.chdir(self._sandbox_dir)
-                with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            # Per-call timeout watchdog. The user code runs in a worker thread; if it
+            # exceeds self.timeout seconds we inject an exception into THAT thread only.
+            # The stateful manager (workspace dir, file registry, persistent globals)
+            # stays alive so subsequent tool calls continue from the same state.
+            exec_holder: Dict[str, Any] = {"error": None}
+
+            def _run_user_code() -> None:
+                try:
                     # First execute matplotlib backend setup
                     exec(matplotlib_setup_code, self._globals)
                     # Then execute user code
                     exec(code, self._globals)
-                success = True
-            except Exception:
-                success = False
-                error_str = traceback.format_exc()
+                except BaseException:
+                    exec_holder["error"] = traceback.format_exc()
+
+            # sys.stdout/sys.stderr are process-global; redirect them here in the
+            # CALLING thread (not the worker) and always restore them in finally,
+            # so a timed-out worker can never leave the process streams captured.
+            real_stdout, real_stderr = sys.stdout, sys.stderr
+            try:
+                os.chdir(self._sandbox_dir)
+                sys.stdout, sys.stderr = stdout_buf, stderr_buf
+                worker = threading.Thread(target=_run_user_code, daemon=True)
+                worker.start()
+                worker.join(self.timeout)
+                if worker.is_alive():
+                    timed_out = True
+                    # Ask the worker thread to raise SystemExit at its next bytecode
+                    # boundary. Uninterruptible C extensions (some solvers) may delay
+                    # this, but the container itself is still capped by the Modal
+                    # function timeout.
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                        ctypes.c_long(worker.ident), ctypes.py_object(SystemExit)
+                    )
+                    worker.join(min(30, self.timeout))
+                    error_str = (
+                        f"SandboxExecutionTimeout: code execution exceeded the "
+                        f"{self.timeout}s limit and was terminated. Reduce the workload "
+                        f"(fewer hyperparameter combinations, smaller n_iter/cv, fewer "
+                        f"estimators) and split long computations across tool calls."
+                    )
+                    if HAS_LOGFIRE:
+                        logfire.warn(
+                            "Stateful Sandbox execution TIMED OUT (call interrupted, sandbox kept alive)",
+                            timeout_s=self.timeout,
+                            app_name=self.app_name,
+                        )
+                elif exec_holder["error"] is not None:
+                    error_str = exec_holder["error"]
+                else:
+                    success = True
             finally:
+                sys.stdout, sys.stderr = real_stdout, real_stderr
                 os.chdir(cwd)
 
             execution_time = time.time() - start_t

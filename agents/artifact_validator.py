@@ -455,6 +455,83 @@ def build_hallucination_warning_prompt(
     return "\n".join(warning_parts)
 
 
+def build_repair_prompt(
+    validation_result: ValidationResult,
+    agent_name: str,
+    task_title: str,
+    task_description: str,
+    output_dir: str,
+    failure_reasons: Optional[List[str]] = None
+) -> str:
+    """
+    Build a TARGETED repair prompt for a validation retry.
+
+    Unlike build_hallucination_warning_prompt (which re-issues the whole task),
+    this tells the agent exactly what already exists on disk (do not redo) and
+    restricts the work to only the failed parts: missing artifacts, a missing
+    own-summary, or report-structure problems.
+    """
+    existing: List[str] = []
+    try:
+        existing = sorted(os.listdir(output_dir))
+    except OSError:
+        pass
+
+    parts = [
+        f"🔧 TARGETED REPAIR MODE — {agent_name}, Task: {task_title}",
+        "",
+        "A previous attempt already completed most of this task. Its artifacts are",
+        "still on disk and VALID. Do NOT regenerate, recompute, or overwrite any",
+        "file listed below — redoing finished work wastes your limited tool budget:",
+    ]
+    if existing:
+        parts.append("")
+        parts.append("ALREADY DONE (verified on disk — leave untouched):")
+        for fname in existing:
+            parts.append(f"  ✅ {fname}")
+    else:
+        parts.append("  (no artifacts on disk yet)")
+
+    parts.append("")
+    parts.append("REPAIR ONLY THE FOLLOWING — this is the entire scope of this retry:")
+
+    if validation_result.missing_artifacts:
+        parts.append("")
+        parts.append("  ❌ Missing artifacts — create each one with execute_python, then")
+        parts.append("     read it back to verify it exists before finishing:")
+        for art in validation_result.missing_artifacts:
+            parts.append(f"     - {art}")
+
+    if validation_result.fallback_detected:
+        parts.append("")
+        parts.append("  🔄 You did not produce your own summary JSON (a structural fallback")
+        parts.append("     was written instead). Write YOUR OWN summary with the real details")
+        parts.append("     of what you did (preprocessing, encoding, metrics, etc.). Do not")
+        parts.append("     regenerate the data artifacts to do this — the summary only.")
+
+    if not validation_result.report_structure_valid:
+        parts.append("")
+        parts.append("  📝 Report structure issues to fix in the report only:")
+        for issue in validation_result.report_structure_issues[:5]:
+            parts.append(f"     - {issue}")
+
+    if failure_reasons:
+        parts.append("")
+        parts.append("  Validator failure details:")
+        for reason in failure_reasons[:5]:
+            parts.append(f"     - {reason[:200]}")
+
+    parts.extend([
+        "",
+        "CONSTRAINTS:",
+        f"- Same tool-call budget as the previous attempt. Spend it ONLY on the repair items above.",
+        f"- Task context (for reference only — already-done parts need no repeat): {task_description[:300]}",
+        "- Do not claim success unless you verified each repaired artifact exists.",
+    ])
+
+    return "\n".join(parts)
+
+
 def validate_and_get_warning(
     agent_response: Dict[str, Any],
     output_dir: str,

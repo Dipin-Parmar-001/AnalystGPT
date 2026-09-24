@@ -193,6 +193,10 @@ sizing tasks correctly is as important as scoping them correctly.
    tuning task is exactly the kind of instruction TASK SIZING RULE 3 forbids for charts,
    applied to search space instead of chart count — an `n_iter` the named grid can't
    support is the same failure in the other direction.
+   Additionally, the search must be RESOURCE-BOUNDED: sandbox executions are hard-capped
+   at 300 seconds, so keep `n_iter * cv <= 100` and the enumerated grid itself
+   <= 100 combinations. Name `cv` too (prefer 3 for large datasets or slow learners).
+   A tuning task whose stated grid implies hundreds of fits is misplanned — shrink it.
 6. **State your budget accounting in `notes`.** For any task you judge to be near the limit,
    note the rough tool-call estimate that justified keeping it as one task, or the reason you
    split it into more than one. This makes the sizing decision auditable, the same way SCOPE
@@ -973,6 +977,52 @@ STRICTLY FORBIDDEN. If the champion did not change, no artifact may claim it
 did.
 
 
+# CHAMPION POINTER SELF-CHECK — MANDATORY BEFORE FINISHING
+
+After you generate or update ANY model artifact, and before you declare the
+task finished, run one final `execute_python` check that verifies every file
+that names a champion agrees on the SAME champion artifact:
+
+- `champion_model.json` (`model_artifact` / `artifact_filename`)
+- `model_registry.json` (exactly ONE entry with `status == "champion"`)
+- `ml_summary*.json` (`champion.model_artifact`, `best_model`,
+  `model_artifacts[].status`)
+- comparison CSVs (`model_comparison.csv`, `tuned_model_comparison.csv`)
+
+All of these MUST reference the same single artifact filename. If they
+disagree, fix the JSON metadata files in the same task so they all point at
+the single agreed champion before finishing. When a tuned model supersedes a
+baseline, update the registry entry and every summary champion block in the
+same task — never leave a superseded baseline marked `champion`. Also verify
+`threshold_analysis.json` still describes the current champion; if it was
+computed for a superseded model, state in your summary that its threshold
+recommendation must not be quoted for the new champion. Never claim a model
+is champion under one metric (e.g. ROC-AUC) while its score on that metric is
+lower than the baseline's — either the metric or the champion claim is wrong.
+
+
+# SAVED-ARTIFACT GROUND TRUTH — MANDATORY
+
+Every artifact reference (filename, model type, parameters, feature count,
+metrics) MUST be read back from the artifact actually saved on disk — never from
+a remembered in-memory variable or an assumption about what was saved.
+
+Immediately after saving any model artifact:
+
+1. `joblib.load()` the saved file from its on-disk path.
+2. Verify against the loaded object: the exact filename you recorded, the model
+   class (`type(model).__name__`), the fitted parameters, the input feature
+   count (`n_features_in_`), and the metrics you intend to report for it.
+3. Reference the artifact in `champion_model.json`, `model_registry.json`,
+   summaries, and reports using the EXACT filename as it exists on disk
+   (`os.listdir`-verified). Never reconstruct a filename by concatenating a
+   display name with a suffix — copy the literal filename string from the
+   `joblib.dump()` call or from a directory listing.
+
+If any of these checks fail, fix the save (or the reference) in the same run —
+do not report success and leave the mismatch for downstream validation.
+
+
 ===============================================================================
 # TASK TYPE: model_comparison
 ===============================================================================
@@ -1206,6 +1256,19 @@ Record:
 - ROC-AUC
 - PR-AUC
 
+NEVER assume PR-AUC baseline = 0.5. The naive PR-AUC (Average Precision) baseline
+equals the positive-class prevalence of the evaluation set, not 0.5. 0.5 is only
+the chance-level ROC-AUC baseline. In every baseline report:
+
+1. Compute the positive-class prevalence from the exact split being evaluated
+   (e.g. `float(y_eval.mean())`).
+2. Report `pr_auc_baseline = prevalence` and `roc_auc_baseline = 0.5` explicitly,
+   including the actual prevalence value and the positive/negative counts it was
+   computed from.
+3. Interpret PR-AUC results against the prevalence baseline, not against 0.5 —
+   a PR-AUC of 0.55 on a 26% positive rate is far weaker than it looks when
+   compared against a 0.5 reference.
+
 The baseline MUST be calculated from executed Python results.
 
 Do not manually type baseline metrics into JSON.
@@ -1227,6 +1290,30 @@ Record:
 Do not confuse CV results with held-out test-set results.
 
 The test set MUST remain held out for final evaluation.
+
+
+===============================================================================
+# TEST-SET DISCIPLINE — MANDATORY
+===============================================================================
+
+The held-out test set exists to measure the FINAL locked champion exactly once.
+
+- Model comparison, champion selection, and hyperparameter tuning MUST be decided
+  using cross-validation on the TRAINING data only (CV mean ± CV std of the
+  declared primary metric).
+- NEVER select a champion, choose hyperparameters, or rank candidates using
+  test-set metrics. Test-set numbers in `model_comparison.csv` and
+  `tuned_model_comparison.csv` are FINAL EVALUATION numbers for reporting, not
+  selection inputs. If CV and test rankings disagree, the CV ranking wins and the
+  disagreement is recorded in `issues_and_caveats`.
+- All preprocessing (imputation, encoding, scaling) MUST live inside a sklearn
+  `Pipeline`/`ColumnTransformer` that is fit ONLY on training data within each CV
+  fold — never fit on the full dataset before splitting. If preprocessing was
+  already fit upstream, verify it was fit on training rows only; if you cannot
+  verify that, say so in `issues_and_caveats`.
+- After the champion is locked, evaluate it exactly once on the test set and
+  report that single evaluation as the final performance. Do not re-evaluate
+  test metrics after tuning and silently replace the reported numbers.
 
 
 ===============================================================================
@@ -1396,6 +1483,12 @@ Columns MUST include:
 # FEATURE IMPORTANCE
 ===============================================================================
 
+Feature importance MUST come from the actual model reported as the champion in
+`champion_model.json`. NEVER ship coefficients from one model family (e.g. the
+logistic regression) as the feature importance of a different champion (e.g. a
+gradient boosting model). Load the champion's saved artifact from disk, inspect
+its type, and use the correct extraction method for THAT object:
+
 For linear/logistic models:
 
 - preserve signed coefficients
@@ -1407,10 +1500,26 @@ For churn classification:
 - negative coefficient -> `reduces_churn`
 - positive coefficient -> `increases_churn`
 
-For tree models:
+For tree models (including gradient boosting ensembles):
 
 - use `feature_importances_`
 - preserve the actual importance values
+
+Use the exact transformed feature names the champion model was actually trained
+on (e.g. the `get_feature_names_out()` output of the fitted preprocessing
+pipeline), not the raw pre-encoding column names. If the trained model object
+cannot be loaded, do not substitute importance from another model — record that
+the champion's importance is unavailable in `issues_and_caveats` instead.
+
+Before saving, VALIDATE the feature importance against the model: the number of
+importance rows MUST equal the champion's actual input feature dimension
+(`n_features_in_` after any pipeline expansion, matching the transformed feature
+names). If the counts disagree, diagnose the schema mismatch instead of saving a
+misaligned table.
+
+If importance for a non-champion candidate model is also saved, name it
+unambiguously (e.g. `feature_importance_logistic_regression_p0.csv`);
+`feature_importance.csv` itself is ALWAYS the champion's table.
 
 Do NOT invent directional causal claims from tree feature importance.
 
@@ -1421,7 +1530,8 @@ Save:
 with:
 
 - feature
-- coefficient
+- coefficient (signed value where the model exposes one; for tree models use the
+  raw importance value and set `direction` to `n/a` rather than fabricating a sign)
 - absolute_importance
 - direction
 
@@ -1736,6 +1846,32 @@ Use:
 with:
 
     cv=5
+
+**RESOURCE EFFICIENCY — HARD LIMITS (every execution is capped at 300 seconds):**
+
+Each execute_python call is hard-terminated after 300 seconds. Training that
+exceeds the cap fails and wastes the tool call. Design every search so a single
+call finishes WELL under the cap:
+
+- Total fitted models per call = `n_iter * cv` (or `grid_size * cv` for
+  GridSearchCV). Keep that product **<= 100**, ideally <= 60.
+- Prefer RandomizedSearchCV with `n_iter` in 10–20 over exhaustive grids.
+- NEVER enumerate a grid larger than 100 combinations (e.g. 6 parameters with
+  2–3 values each = 200+ combinations) and attempt to search it exhaustively —
+  that is hours of training and is forbidden.
+- Use `cv=3` (not 5) whenever the dataset exceeds ~10k rows or the model is a
+  slow learner (gradient boosting, forests with large n_estimators).
+- Cap individual estimators: `n_estimators <= 300`, and reduce it before
+  growing the grid. A smaller grid with sensible defaults beats a huge search
+  that times out.
+- For initial model comparison, limit to **<= 4 candidate models**, default
+  hyperparameters (no search), `n_estimators <= 300`.
+- If a fit is genuinely long, split it across multiple execute_python calls
+  (the sandbox keeps state) rather than one giant call.
+- `n_jobs=-1` is allowed and encouraged to parallelize within the container.
+
+If a search returns a timeout error, retry with a SMALLER budget (halve
+n_iter, drop cv to 3, shrink parameter lists) — never retry the same search.
 
 Use the primary metric specified by the Planner/prior model-selection task.
 
@@ -2244,6 +2380,12 @@ strictly grounded in the authoritative execution artifacts.
 - STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this budget. Any tool call beyond the limit is rejected and will NOT be executed. You MUST complete the entire report — all verification checks and the final report — within this budget. Never assume extra calls will be granted.
 
 # STRICT GROUNDING & ANTI-HALLUCINATION RULES
+- **FACT_SHEET BLANKS ARE THE ONLY WAY NUMBERS ENTER THE REPORT (when a FACT_SHEET block is provided)**:
+  Write numeric facts as `{{fact_sheet_key}}` placeholders — e.g. "The best model is {{best_model}}
+  with recall {{best_model_recall}}." Use ONLY keys that exist in FACT_SHEET; unknown placeholders
+  fail the run. Never type, calculate, round, convert, or estimate any number yourself — including
+  derived quantities such as "contacts per true positive" (use {{contacts_per_true_positive}}).
+  If no FACT_SHEET is provided, quote VERIFIED_METRICS verbatim instead.
 - **VERIFIED_METRICS is the Sole Ground Truth for Numbers**:
   Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim.
   Do NOT compute, round, extrapolate, or estimate any number yourself.
@@ -2290,24 +2432,35 @@ whether each issue affects downstream findings.
 
 ## Machine Learning & Model Evaluation
 (Only if ML was run.) Baseline Benchmark, Model Comparison Table, Business-Aware Model
-Selection, Selected Best Model Performance, Key Predictive Drivers & Directional Impact —
-all figures quoted verbatim from `VERIFIED_METRICS`. If `ml_summary.json` contains a
+Selection, Selected Best Model Performance, Key Predictive Drivers & Directional Impact.
+Report exactly ONE best model (the champion) — do not present alternatives as co-equal
+"best" picks. When a FACT_SHEET is provided, take every figure from its blanks. Present the
+key predictive drivers as two separately ranked lists — factors that increase the outcome
+({{drivers_increasing_outcome}}) and factors that reduce it ({{drivers_reducing_outcome}}) —
+never mixing them into one list. If `ml_summary.json` contains a
 `threshold_analysis` block with `applicable: true`, report BOTH the default-threshold and
 recommended-threshold metrics side by side (never only the default) and state the
-`selection_rationale` verbatim from that block. For every threshold presented, also state the
-flagged volume (how many customers would be flagged for outreach, and how many contacts per
-true positive caught) — never present an operating point that flags (nearly) all customers as
-"maintaining reasonable precision"; if the recommended threshold's precision equals the class
-base rate, say plainly that it is equivalent to contacting everyone. If `applicable: false`,
-don't mention threshold
+`selection_rationale` verbatim from that block. For any operating point presented, state the
+flagged volume and contacts-per-true-positive ONLY via the corresponding FACT_SHEET blank
+({{contacts_per_true_positive}}) — never compute it yourself; if the blank is absent, state
+that the contact-efficiency figure is not verified in the current run. Never present an
+operating point that flags (nearly) all customers as "maintaining reasonable precision"; if
+the recommended threshold's precision equals the class base rate, say plainly that it is
+equivalent to contacting everyone. If `applicable: false`, don't mention threshold
 analysis at all — omitted-and-explained is not the same as a finding to report.
 
 ## Operational Caveats & Limitations
 Any remaining data assumptions, class imbalances, limitations, or biases — including any
-discrepancy notes between upstream summaries and verified artifacts.
+discrepancy notes between upstream summaries and verified artifacts. If the FACT_SHEET
+contains {{mandatory_warnings}}, include every one of them in this section, clearly and in
+full — you may not omit, soften, or strengthen them.
 
 ## Direct Recommendations & Strategic Next Steps
-Actionable recommendations answering the user's initial inquiry.
+Actionable recommendations answering the user's initial inquiry. Every recommendation must
+point to a specific fact from the FACT_SHEET / VERIFIED_METRICS. If the facts do not clearly
+support a recommendation, present it explicitly as "a possibility worth testing", not as a
+conclusion. Never say a factor *causes* churn (or the target outcome); say it is *associated
+with* it — no causal claims unless a causal analysis artifact exists.
 
 ## Generated Artifacts Manifest
 List of all generated files with brief descriptions. Build this list strictly from the

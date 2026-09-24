@@ -32,6 +32,7 @@ from agents.memory_manager import MessageHistoryManager, sanitize_messages, conv
 from agents.planner_agent import ExecutionPlan
 from agents.cancellation import CancellationToken, WorkflowCancelledException
 from agents.numeric_verifier import verify_report_numbers, attach_verification_warning
+from agents.fact_sheet import fill_blanks, extract_blanks, replace_unresolved_blanks
 
 try:
     import logfire
@@ -258,6 +259,7 @@ class ReporterAgent:
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
         verified_metrics: Optional[Dict[str, Any]] = None,
+        fact_sheet: Optional[Dict[str, str]] = None,
         max_correction_turns: int = 0,
     ) -> str:
         """
@@ -328,6 +330,20 @@ class ReporterAgent:
         if verified_metrics:
             verified_str = json.dumps(verified_metrics, indent=2, default=str)
             user_content_parts.append(f"=== VERIFIED_METRICS (GROUND TRUTH — COMPUTED DIRECTLY FROM ARTIFACTS) ===\n{verified_str}\n")
+
+        # 1b. Fact Sheet: the ONLY source the report's {{blank}} tokens may reference.
+        # Values are pre-formatted by code; the reporter never types or converts numbers.
+        if fact_sheet:
+            facts_str = json.dumps(fact_sheet, indent=2, default=str)
+            user_content_parts.append(
+                "=== FACT_SHEET (PRE-FORMATTED FACTS — THE ONLY VALUES YOUR {{BLANKS}} MAY REFERENCE) ===\n"
+                f"{facts_str}\n"
+                "NUMBER RULE (NON-NEGOTIABLE): write the report with {{blank}} placeholders instead of numbers — "
+                "e.g. \"The best model is {{best_model}} with recall {{best_model_recall}}.\" "
+                "Use ONLY keys that exist in FACT_SHEET. Never type, round, or convert any number yourself; "
+                "if a needed fact is not in FACT_SHEET, write \"not verified in current run\" instead. "
+                "Placeholders are filled in by code after you deliver the report; any {{key}} not in FACT_SHEET fails the run.\n"
+            )
 
         # 2. Data Analyst Summaries (Context Only)
         if analyst_summaries:
@@ -532,6 +548,50 @@ class ReporterAgent:
                     final_report = file_report
             except Exception as read_err:
                 print(f"[ReporterAgent Warning] Could not read {report_filepath}: {read_err}. Falling back to LLM response.")
+
+        # ==============================================================================
+        # BLANK FILLING: substitute {{fact_sheet_key}} tokens with code-formatted values.
+        # Unknown blanks get ONE repair turn; anything still unresolved is replaced with
+        # "(not verified in current run)" so no invented number can reach the reader.
+        # ==============================================================================
+        if final_report and fact_sheet:
+            fill = fill_blanks(final_report, fact_sheet)
+            if fill["unknown_blanks"]:
+                _safe_callback("unknown_blanks_detected", {
+                    "agent": self.agent_name,
+                    "unknown_blanks": fill["unknown_blanks"],
+                })
+                if HAS_LOGFIRE:
+                    logfire.warn("ReporterAgent used unknown fact-sheet blanks; requesting repair",
+                                 unknown_blanks=fill["unknown_blanks"])
+                try:
+                    memory_manager.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] Your report used {{blank}} placeholders that do NOT exist in FACT_SHEET: "
+                            f"{', '.join('{{' + b + '}}' for b in fill['unknown_blanks'])}. "
+                            "Re-output the COMPLETE report using only keys present in FACT_SHEET "
+                            "(or plain text \"not verified in current run\" where no fact exists). "
+                            "Do not make any more tool calls."
+                        ),
+                    })
+                    repair_msg = self._call_llm(memory_manager.messages, tools=[])
+                    repaired_report = repair_msg.content or ""
+                    if repaired_report and repaired_report.strip():
+                        final_report = repaired_report
+                        memory_manager.append_assistant({"role": "assistant", "content": final_report})
+                        fill = fill_blanks(final_report, fact_sheet)
+                except WorkflowCancelledException:
+                    raise
+                except Exception as blank_err:
+                    print(f"[ReporterAgent Warning] blank repair turn failed: {blank_err}")
+                # Last resort: unresolved blanks can never carry an invented number.
+                if fill["unknown_blanks"]:
+                    final_report = replace_unresolved_blanks(fill["report"])
+                else:
+                    final_report = fill["report"]
+            else:
+                final_report = fill["report"]
 
         # ==============================================================================
         # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
@@ -851,6 +911,7 @@ class ReporterAgent:
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
         verified_metrics: Optional[Dict[str, Any]] = None,
+        fact_sheet: Optional[Dict[str, str]] = None,
         max_correction_turns: int = 0,
     ) -> Dict[str, Any]:
         """
@@ -868,6 +929,7 @@ class ReporterAgent:
             step_callback=step_callback,
             cancellation_token=cancellation_token,
             verified_metrics=verified_metrics,
+            fact_sheet=fact_sheet,
             max_correction_turns=max_correction_turns,
         )
 

@@ -29,6 +29,7 @@ try:
         reset_global_sandbox_manager,
         prepare_input_files,
         HAS_MODAL,
+        SANDBOX_TIMEOUT_S,
     )
 except ImportError as err:
     print(f"[ToolManager Warning] Failed to import sandbox_execution.utils: {err}")
@@ -37,6 +38,7 @@ except ImportError as err:
     reset_global_sandbox_manager = None
     prepare_input_files = None
     HAS_MODAL = False
+    SANDBOX_TIMEOUT_S = 300
 
 
 # ==========================================
@@ -47,7 +49,7 @@ def execute_python(
     code: str,
     files: Optional[Union[List[str], Dict[str, Union[str, bytes, Path]]]] = None,
     output_dir: Optional[str] = None,
-    timeout: int = 60,
+    timeout: int = SANDBOX_TIMEOUT_S,
     extra_packages: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """

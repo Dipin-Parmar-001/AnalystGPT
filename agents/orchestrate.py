@@ -42,10 +42,13 @@ from agents.artifact_validator import (
     validate_artifacts,
     validate_and_get_warning,
     build_hallucination_warning_prompt,
+    build_repair_prompt,
     ValidationResult
 )
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
 from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
+from agents.preflight_gate import run_preflight, verify_champion_consistency
+from agents.fact_sheet import build_facts
 from agents.observability import (
     get_recorder,
     set_task_context,
@@ -83,6 +86,65 @@ def build_post_verification_retry_prompt(unverified_errors: List[str]) -> str:
         "4. Do NOT compute, invent, or round new numbers.\n"
         "5. This is NOT a missing-artifact problem: all artifacts already exist. Do NOT re-create or re-save artifacts."
     )
+
+
+def _is_tuning_task(task: Any) -> bool:
+    """True when the task is a hyperparameter-tuning task (by declared type or title)."""
+    return (
+        getattr(task, "task_type", None) == "hyperparameter_tuning"
+        or "hyperparameter" in str(getattr(task, "title", "")).lower()
+        or "tuning" in str(getattr(task, "title", "")).lower()
+        or "hpt" in str(getattr(task, "title", "")).lower()
+    )
+
+
+def _normalize_champion_pointer(output_dir: str) -> Optional[str]:
+    """Rewrites champion_model.json's artifact reference to the exact on-disk
+    filename when the recorded name is an unambiguous case/format variant of a
+    real artifact (spaces vs underscores, missing or doubled .pkl suffix).
+
+    Returns the corrected filename, or None when the pointer already matches a
+    real artifact or no unambiguous match exists (in which case the stale-pointer
+    consistency check fires as usual).
+    """
+    import re as _re
+
+    champ_path = os.path.join(output_dir, "champion_model.json")
+    if not os.path.exists(champ_path):
+        return None
+    try:
+        with open(champ_path, encoding="utf-8") as f:
+            champ = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(champ, dict):
+        return None
+
+    champ_artifact = champ.get("model") or champ.get("artifact_filename")
+    if not champ_artifact:
+        return None
+    pkl_files = [f for f in os.listdir(output_dir) if f.lower().endswith(".pkl")]
+    if champ_artifact in pkl_files:
+        return None  # pointer is fine
+
+    def _canon(name: str) -> str:
+        name = name.strip().lower()
+        if not name.endswith(".pkl"):
+            name += ".pkl"
+        name = _re.sub(r"[\s\-]+", "_", name)
+        name = _re.sub(r"_*\.pkl$", ".pkl", name)
+        return name
+
+    target = _canon(champ_artifact)
+    matches = [f for f in pkl_files if _canon(f) == target]
+    if len(matches) != 1:
+        return None
+    champ["model"] = matches[0]
+    champ["pointer_normalized_from"] = champ_artifact
+    with open(champ_path, "w", encoding="utf-8") as f:
+        json.dump(champ, f, indent=2)
+    print(f"[Orchestrator] Normalized champion pointer '{champ_artifact}' -> '{matches[0]}'", flush=True)
+    return matches[0]
 
 
 class WorkflowOrchestrator:
@@ -277,6 +339,16 @@ class WorkflowOrchestrator:
                             })
                 except Exception as num_err:
                     logfire.error("Orchestrator: numeric verification failed", error=str(num_err))
+
+            # 1b. Normalize the champion pointer against the artifacts actually on
+            # disk. Agents occasionally record a display name (e.g.
+            # "Gradient Boosting_p0.pkl") instead of the exact saved filename; if a
+            # deterministic, unambiguous match exists, correct the pointer so the
+            # stale-pointer check judges real staleness, not formatting drift.
+            try:
+                _normalize_champion_pointer(self.current_output_dir)
+            except Exception as champ_err:
+                logfire.warn("Orchestrator: champion pointer normalization failed", error=str(champ_err))
 
             # 2. Deterministic cross-artifact consistency checks
             try:
@@ -838,6 +910,8 @@ class WorkflowOrchestrator:
                         task_validation_failed = False  # True if task exhausted retries without passing
                         last_validation_errors = []  # Errors from the immediately previous attempt
                         last_failure_kind = None  # "artifact_validation" or "post_verification"
+                        last_missing_artifacts: list = []  # Missing artifacts from the previous attempt (drives targeted repair)
+                        last_fallback_detected = False  # Fallback flag from the previous attempt
 
                         while attempt <= max_retries and not validation_passed and not task_validation_failed:
                             _attempt_t0 = time.perf_counter()
@@ -867,7 +941,12 @@ class WorkflowOrchestrator:
                             # Tool call budget: fixed per task. Validation retries do
                             # NOT grant extra calls — the agent must fit its corrected
                             # work inside the same budget (user-confirmed policy).
+                            # Hyperparameter tuning needs a larger budget: grid search,
+                            # tuned-vs-baseline comparison, champion repoint, and artifact
+                            # verification do not fit reliably in the standard allowance.
                             current_tool_budget = max_tool_calls_per_agent
+                            if _is_tuning_task(task):
+                                current_tool_budget = max(15, max_tool_calls_per_agent)
 
                             # Rebuild the authoritative dataset profile from disk for this
                             # attempt so prompts always carry the current ground truth.
@@ -891,6 +970,21 @@ class WorkflowOrchestrator:
                                     print(f"[Orchestrator Notice] build_verified_metrics error: {vm_err}")
                                     verified_metrics = {}
 
+                                # Preflight gate (checks + auto-repair; warn-not-stop) and the
+                                # code-built fact sheet the reporter's {{blanks}} reference.
+                                # Only on the first attempt: retries reuse the repaired state.
+                                fact_sheet = None
+                                if attempt == 0:
+                                    try:
+                                        preflight = run_preflight(self.current_output_dir, goal_text=query_text)
+                                        if preflight.get("repairs"):
+                                            print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs']}", flush=True)
+                                        # Refresh verified metrics after possible artifact repairs
+                                        verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
+                                        fact_sheet = build_facts(self.current_output_dir, verified_metrics, preflight)
+                                    except Exception as pre_err:
+                                        print(f"[Orchestrator Notice] preflight/fact sheet skipped: {pre_err}")
+
                                 # Build prompt - add warning if this is a retry
                                 reporter_prompt = query_text
                                 if attempt > 0 and validation_errors:
@@ -899,15 +993,17 @@ class WorkflowOrchestrator:
                                         # numeric-verification retry prompt, not the hallucination template.
                                         reporter_prompt = f"{build_post_verification_retry_prompt(validation_errors)}\n\nOriginal Query: {query_text}"
                                     else:
-                                        reporter_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                        # Targeted repair: fix only the flagged report issues /
+                                        # missing artifacts; do not rewrite the report from scratch.
+                                        reporter_prompt = f"{build_repair_prompt(ValidationResult(
                                             is_valid=False,
-                                            missing_artifacts=[],
+                                            missing_artifacts=last_missing_artifacts,
                                             existing_artifacts=[],
-                                            fallback_detected=False,
+                                            fallback_detected=last_fallback_detected,
                                             hallucination_warnings=validation_errors,
                                             report_structure_valid=False,
-                                            report_structure_issues=[]
-                                        ), agent_class_name, '', task.description)}\n\nOriginal Query: {query_text}"
+                                            report_structure_issues=validation_errors
+                                        ), agent_class_name, task.title, task.description, self.current_output_dir, validation_errors)}\n\nOriginal Query: {query_text}"
                                 reporter_prompt = f"{reporter_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
@@ -919,6 +1015,7 @@ class WorkflowOrchestrator:
                                     step_callback=step_callback,
                                     cancellation_token=self.cancellation_token,
                                     verified_metrics=verified_metrics,
+                                    fact_sheet=fact_sheet,
                                     max_tool_calls=current_tool_budget,
                                     max_correction_turns=0,  # retries owned by the combined orchestrator loop below
                                 )
@@ -971,12 +1068,7 @@ class WorkflowOrchestrator:
                                     ml_files.append(vm_path)
 
                                 # Check if this is a Hyperparameter Tuning task
-                                is_hpt_task = (
-                                    getattr(task, "task_type", None) == "hyperparameter_tuning"
-                                    or "hyperparameter" in task.title.lower()
-                                    or "tuning" in task.title.lower()
-                                    or "hpt" in task.title.lower()
-                                )
+                                is_hpt_task = _is_tuning_task(task)
 
                                 if is_hpt_task:
                                     # Validate presence of model comparison artifacts.
@@ -1029,15 +1121,17 @@ class WorkflowOrchestrator:
                                 # Build prompt - add warning if this is a retry
                                 ml_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}{data_context_note}"
                                 if attempt > 0 and validation_errors:
-                                    ml_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                    # Targeted repair: only re-do the failed parts (missing
+                                    # artifacts / own summary), not the whole task.
+                                    ml_prompt = f"{build_repair_prompt(ValidationResult(
                                         is_valid=False,
-                                        missing_artifacts=[],
+                                        missing_artifacts=last_missing_artifacts,
                                         existing_artifacts=[],
-                                        fallback_detected=False,
+                                        fallback_detected=last_fallback_detected,
                                         hallucination_warnings=validation_errors,
                                         report_structure_valid=True,
                                         report_structure_issues=[]
-                                    ), agent_class_name, '', task.description)}\n\n{ml_prompt}"
+                                    ), agent_class_name, task.title, task.description, self.current_output_dir, validation_errors)}{data_context_note}"
                                 ml_prompt = f"{ml_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
@@ -1068,15 +1162,16 @@ class WorkflowOrchestrator:
                                 # Build prompt - add warning if this is a retry
                                 analyst_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}"
                                 if attempt > 0 and validation_errors:
-                                    analyst_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                    # Targeted repair: only re-do the failed parts, not the whole task.
+                                    analyst_prompt = f"{build_repair_prompt(ValidationResult(
                                         is_valid=False,
-                                        missing_artifacts=[],
+                                        missing_artifacts=last_missing_artifacts,
                                         existing_artifacts=[],
-                                        fallback_detected=False,
+                                        fallback_detected=last_fallback_detected,
                                         hallucination_warnings=validation_errors,
                                         report_structure_valid=True,
                                         report_structure_issues=[]
-                                    ), agent_class_name, '', task.description)}\n\n{analyst_prompt}"
+                                    ), agent_class_name, task.title, task.description, self.current_output_dir, validation_errors)}"
                                 analyst_prompt = f"{analyst_prompt}{profile_block}"
 
                                 agent_res = agent_instance.run_task(
@@ -1095,15 +1190,16 @@ class WorkflowOrchestrator:
                                 # Fallback agent
                                 fallback_prompt = f"{query_text}\nTask: {task.title}\nDescription: {task.description}"
                                 if attempt > 0 and validation_errors:
-                                    fallback_prompt = f"{build_hallucination_warning_prompt(ValidationResult(
+                                    # Targeted repair: only re-do the failed parts, not the whole task.
+                                    fallback_prompt = f"{build_repair_prompt(ValidationResult(
                                         is_valid=False,
-                                        missing_artifacts=[],
+                                        missing_artifacts=last_missing_artifacts,
                                         existing_artifacts=[],
-                                        fallback_detected=False,
+                                        fallback_detected=last_fallback_detected,
                                         hallucination_warnings=validation_errors,
                                         report_structure_valid=True,
                                         report_structure_issues=[]
-                                    ), 'DataAnalystAgent', '', task.description)}\n\n{fallback_prompt}"
+                                    ), 'DataAnalystAgent', task.title, task.description, self.current_output_dir, validation_errors)}"
 
                                 fallback_res = self.data_analyst_agent.run_task(
                                     prompt=f"{fallback_prompt}{profile_block}",
@@ -1198,6 +1294,8 @@ class WorkflowOrchestrator:
                                 if not validation_result.is_valid:
                                     failure_kind = "artifact_validation"
                                     last_validation_errors = validation_result.hallucination_warnings
+                                    last_missing_artifacts = list(validation_result.missing_artifacts or [])
+                                    last_fallback_detected = validation_result.fallback_detected
                                 else:
                                     failure_kind = "post_verification"
                                     last_validation_errors = post_verification_errors
@@ -1235,6 +1333,52 @@ class WorkflowOrchestrator:
                                     print(f"[Orchestrator ERROR] Task #{task.task_id} failed validation ({failure_kind}) after {max_retries} combined retries. Marking as validation_failed and continuing workflow...")
                                     print(f"  Last validation errors: {last_validation_errors}")
 
+                                    # Downgrade: if every artifact exists on disk and the report is
+                                    # structurally valid, the only remaining failure signal is the
+                                    # fallback-summary marker (a degraded summary, not missing work).
+                                    # Accept the task with a warning instead of failing it — retrying
+                                    # cannot fix an agent that never writes its own summary, and the
+                                    # artifacts the rest of the workflow consumes are all present.
+                                    if (failure_kind == "artifact_validation"
+                                            and not validation_result.missing_artifacts
+                                            and validation_result.report_structure_valid):
+                                        print(f"[Orchestrator] Task #{task.task_id} accepted with degraded summary (all artifacts present, fallback summary in use).")
+                                        task.status = "completed"
+                                        task.result = task_out
+                                        for gf in agent_res.get("generated_files", []) or []:
+                                            if gf not in self.generated_artifacts:
+                                                self.generated_artifacts.append(gf)
+                                                if HAS_LOGFIRE:
+                                                    logfire.info(f"New Artifact: {gf}", artifact_file=gf, producer_task=task.task_id, producer_agent=agent_class_name)
+                                        self.completed_task_results.append({
+                                            "task_id": task.task_id,
+                                            "title": task.title,
+                                            "agent": agent_class_name,
+                                            "status": "completed",
+                                            "output": task_out,
+                                            "summary_data": agent_res.get("summary_data"),
+                                            "generated_files": agent_res.get("generated_files", []),
+                                            "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
+                                            "validation_retries": attempt,
+                                            "warning": "Accepted with fallback summary: agent did not produce its own summary JSON, but all required artifacts exist and were verified."
+                                        })
+                                        if HAS_LOGFIRE:
+                                            logfire.warn(
+                                                "Task accepted with degraded summary",
+                                                task_id=task.task_id,
+                                                agent=agent_class_name,
+                                                missing_artifacts=[],
+                                                fallback_detected=validation_result.fallback_detected
+                                            )
+                                        task_validation_failed = True
+                                        validation_passed = True
+                                        downgraded_to_warning = True
+                                    else:
+                                        task_validation_failed = True
+                                        task.status = "validation_failed"
+                                        task.result = task_out
+                                        downgraded_to_warning = False
+
                                     # If the reporter's numeric post-verification is still failing,
                                     # append the warning banner to the final persisted report.
                                     if isinstance(agent_instance, ReporterAgent) and post_verification_failed:
@@ -1251,39 +1395,40 @@ class WorkflowOrchestrator:
                                                     rf.write(self.final_report)
                                             except Exception as write_err:
                                                 print(f"[Orchestrator Warning] Failed to update {report_filepath}: {write_err}")
-                                    task_validation_failed = True
-                                    task.status = "validation_failed"
-                                    task.result = task_out
+                                    if not downgraded_to_warning:
+                                        task_validation_failed = True
+                                        task.status = "validation_failed"
+                                        task.result = task_out
 
-                                    # Collect whatever files were generated
-                                    for gf in agent_res.get("generated_files", []) or []:
-                                        if gf not in self.generated_artifacts:
-                                            self.generated_artifacts.append(gf)
+                                        # Collect whatever files were generated
+                                        for gf in agent_res.get("generated_files", []) or []:
+                                            if gf not in self.generated_artifacts:
+                                                self.generated_artifacts.append(gf)
 
-                                    self.completed_task_results.append({
-                                        "task_id": task.task_id,
-                                        "title": task.title,
-                                        "agent": agent_class_name,
-                                        "status": "validation_failed",
-                                        "output": task_out,
-                                        "summary_data": agent_res.get("summary_data"),
-                                        "generated_files": agent_res.get("generated_files", []),
-                                        "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
-                                        "validation_failed": True,
-                                        "validation_errors": validation_result.hallucination_warnings,
-                                        "validation_retries": max_retries
-                                    })
+                                        self.completed_task_results.append({
+                                            "task_id": task.task_id,
+                                            "title": task.title,
+                                            "agent": agent_class_name,
+                                            "status": "validation_failed",
+                                            "output": task_out,
+                                            "summary_data": agent_res.get("summary_data"),
+                                            "generated_files": agent_res.get("generated_files", []),
+                                            "tool_calls_made": agent_res.get("tool_calls_made") or agent_res.get("tool_calls_used", 0),
+                                            "validation_failed": True,
+                                            "validation_errors": validation_result.hallucination_warnings,
+                                            "validation_retries": max_retries
+                                        })
 
-                                    if HAS_LOGFIRE:
-                                        logfire.error(
-                                            "Artifact validation failed after max retries",
-                                            task_id=task.task_id,
-                                            agent=agent_class_name,
-                                            missing_artifacts=validation_result.missing_artifacts,
-                                            fallback_detected=validation_result.fallback_detected,
-                                            report_structure_valid=validation_result.report_structure_valid,
-                                            final_errors=last_validation_errors
-                                        )
+                                        if HAS_LOGFIRE:
+                                            logfire.error(
+                                                "Artifact validation failed after max retries",
+                                                task_id=task.task_id,
+                                                agent=agent_class_name,
+                                                missing_artifacts=validation_result.missing_artifacts,
+                                                fallback_detected=validation_result.fallback_detected,
+                                                report_structure_valid=validation_result.report_structure_valid,
+                                                final_errors=last_validation_errors
+                                            )
 
                                     # Exit the while loop - task has permanently failed validation
                                     # We do NOT set validation_passed = True here; task_validation_failed handles exit
@@ -1300,6 +1445,27 @@ class WorkflowOrchestrator:
                             _execute_task()
                     else:
                         _execute_task()
+
+                    # Post-task champion consistency gate: after EVERY ML task,
+                    # verify all champion-mentioning artifacts agree (they are
+                    # rewritten/repaired in place; findings never stop the run).
+                    if isinstance(agent_instance, MLAgent):
+                        try:
+                            champ_check = verify_champion_consistency(
+                                self.current_output_dir, goal_text=query_text
+                            )
+                            if champ_check.get("repairs"):
+                                print(f"[Orchestrator] Champion consistency repairs (Task #{task.task_id}): "
+                                      f"{champ_check['repairs']}", flush=True)
+                            if not champ_check.get("consistent", True):
+                                if HAS_LOGFIRE:
+                                    logfire.warn(
+                                        "Champion consistency check found disagreements after ML task",
+                                        task_id=task.task_id,
+                                        detail=[f["message"] for f in champ_check.get("findings", [])],
+                                    )
+                        except Exception as champ_err:
+                            print(f"[Orchestrator Notice] champion consistency check skipped: {champ_err}")
 
                     # Global counters: per-task latency, status, retries
                     task_duration = time.perf_counter() - task_t0
@@ -1354,6 +1520,18 @@ class WorkflowOrchestrator:
                                 print(f"[Orchestrator Notice] build_verified_metrics error: {vm_err}")
                                 verified_metrics = {}
 
+                            # Preflight gate (checks + auto-repair; warn-not-stop) then the
+                            # code-built fact sheet for the reporter's {{blanks}}.
+                            fact_sheet = None
+                            try:
+                                preflight = run_preflight(self.current_output_dir, goal_text=query_text)
+                                if preflight.get("repairs"):
+                                    print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs']}", flush=True)
+                                verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
+                                fact_sheet = build_facts(self.current_output_dir, verified_metrics, preflight)
+                            except Exception as pre_err:
+                                print(f"[Orchestrator Notice] preflight/fact sheet skipped: {pre_err}")
+
                             self.final_report = self.reporter_agent.generate_report(
                                 user_goal=query_text,
                                 analyst_summaries=summaries.get("analyst_summaries", []),
@@ -1363,6 +1541,7 @@ class WorkflowOrchestrator:
                                 step_callback=step_callback,
                                 cancellation_token=self.cancellation_token,
                                 verified_metrics=verified_metrics,
+                                fact_sheet=fact_sheet,
                                 max_correction_turns=2,  # standalone synthesis path: no orchestrator retry loop here
                             )
                         except WorkflowCancelledException:
