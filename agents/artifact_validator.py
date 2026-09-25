@@ -532,6 +532,121 @@ def build_repair_prompt(
     return "\n".join(parts)
 
 
+# Champion disagreement error codes that need targeted repair
+CHAMPION_DISAGREEMENT_CODES = {
+    "champion_pointer_disagreement",
+    "champion_registry_disagreement",
+    "champion_disagreement_ml_summary",
+    "stale_champion_pointer",
+    "stale_threshold_analysis",
+    "threshold_analysis_model_mismatch",
+    "champion_registry_disagreement",
+    "champion_not_selected",
+    "registry_missing_artifact",
+    "artifact_load_verification_failed",
+    "artifact_feature_mismatch",
+    "confusion_matrix_mismatch",
+}
+
+
+def is_champion_disagreement_error(warning: str) -> bool:
+    """Check if a validation warning is related to champion disagreement."""
+    for code in CHAMPION_DISAGREEMENT_CODES:
+        if code in warning:
+            return True
+    return False
+
+
+def build_champion_repair_prompt(
+    validation_result: ValidationResult,
+    agent_name: str,
+    task_title: str,
+    task_description: str,
+    output_dir: str,
+    failure_reasons: Optional[List[str]] = None
+) -> str:
+    """
+    Build a TARGETED repair prompt specifically for champion disagreement errors.
+
+    This tells the agent to fix ONLY the champion pointer issues (champion_model.json,
+    model_registry.json, ml_summary.json, threshold_analysis.json) without redoing
+    the entire ML task. The agent should run the champion_selector code logic or
+    manually fix the pointers.
+    """
+    existing: List[str] = []
+    try:
+        existing = sorted(os.listdir(output_dir))
+    except OSError:
+        pass
+
+    # Extract champion-specific errors
+    champ_errors = []
+    other_errors = []
+    if failure_reasons:
+        for reason in failure_reasons:
+            if is_champion_disagreement_error(reason):
+                champ_errors.append(reason)
+            else:
+                other_errors.append(reason)
+
+    parts = [
+        f"🔧 CHAMPION POINTER REPAIR MODE — {agent_name}, Task: {task_title}",
+        "",
+        "A previous attempt completed the ML work but the champion pointers are inconsistent.",
+        "The model artifacts (pkl files, comparison CSVs, predictions) are VALID and must NOT be regenerated.",
+        "You ONLY need to fix the champion metadata files to agree on the correct champion:",
+    ]
+    if existing:
+        parts.append("")
+        parts.append("ALREADY DONE (verified on disk — leave untouched):")
+        for fname in existing:
+            if fname.endswith(".pkl") or fname.endswith(".csv") or "predictions" in fname:
+                parts.append(f"  ✅ {fname} (model artifact / data — DO NOT REGENERATE)")
+
+    parts.append("")
+    parts.append("REPAIR ONLY THE FOLLOWING CHAMPION METADATA FILES:")
+
+    if champ_errors:
+        parts.append("")
+        parts.append("  ❌ Champion disagreement errors to fix:")
+        for err in champ_errors:
+            parts.append(f"     - {err[:200]}")
+
+    parts.append("")
+    parts.append("  REQUIRED ACTIONS (run with execute_python):")
+    parts.append("     1. Import and run: from agents.champion_selector import select_champion")
+    parts.append("        select_champion(output_dir, goal_text='...')  # This rewrites champion_model.json and model_registry.json")
+    parts.append("     2. Verify champion_model.json points to the correct versioned artifact (e.g., logistic_regression_p0.pkl)")
+    parts.append("     3. Verify model_registry.json has exactly ONE entry with status='champion' matching that artifact")
+    parts.append("     4. Fix any ml_summary*.json files to point to the same champion (best_model, champion.model_artifact, model_artifacts[].status)")
+    parts.append("     5. If threshold_analysis.json is stale for the old model, regenerate it for the CURRENT champion:")
+    parts.append("        - Load predictions.csv, compute precision_recall_curve")
+    parts.append("        - Save new threshold_analysis.json with model_artifact = current champion artifact")
+    parts.append("     6. Read back each fixed file to verify it exists and is correct")
+
+    if other_errors:
+        parts.append("")
+        parts.append("  Other issues (fix these too if applicable):")
+        for err in other_errors[:3]:
+            parts.append(f"     - {err[:200]}")
+
+    if validation_result.fallback_detected:
+        parts.append("")
+        parts.append("  🔄 You did not produce your own summary JSON. Write YOUR OWN summary")
+        parts.append("     with the real details of what you did. Do not regenerate data artifacts.")
+
+    parts.extend([
+        "",
+        "CONSTRAINTS:",
+        f"- Same tool-call budget as the previous attempt. Spend it ONLY on the champion pointer repairs above.",
+        f"- DO NOT re-train models, re-run comparisons, or regenerate predictions — they are already correct.",
+        f"- Task context (for reference only): {task_description[:300]}",
+        "- Do not claim success unless you verified each repaired metadata file exists and agrees.",
+    ])
+
+    return "\n".join(parts)
+
+
 def validate_and_get_warning(
     agent_response: Dict[str, Any],
     output_dir: str,

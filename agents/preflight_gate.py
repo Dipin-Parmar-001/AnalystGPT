@@ -416,6 +416,121 @@ def annotate_stale_threshold_analysis(output_dir: str, champ: Optional[Dict[str,
     return _dump_json(os.path.join(output_dir, "threshold_analysis.json"), ta)
 
 
+def _regenerate_threshold_analysis(output_dir: str, champ: Dict[str, Any]) -> bool:
+    """Regenerate threshold_analysis.json for the current champion model.
+
+    This loads the champion's predictions and computes a fresh threshold analysis
+    that matches the champion model. Returns True if successful.
+    """
+    import pandas as pd
+    import numpy as np
+    from sklearn.metrics import precision_recall_curve
+
+    champ_art = champ.get("artifact_filename") or champ.get("model")
+    if not champ_art:
+        return False
+
+    # Load predictions.csv
+    pred_path = os.path.join(output_dir, "predictions.csv")
+    if not os.path.isfile(pred_path):
+        return False
+
+    try:
+        pred_df = pd.read_csv(pred_path)
+    except Exception:
+        return False
+
+    # Find actual and predicted columns
+    cols = {c.strip().lower(): c for c in pred_df.columns}
+    actual_col = next((cols[c] for c in ("actual", "y_true", "y_actual", "true") if c in cols), None)
+    pred_col = next((cols[c] for c in ("predicted", "y_pred", "prediction", "probability", "score") if c in cols), None)
+
+    if not actual_col or not pred_col:
+        return False
+
+    try:
+        y_true = pred_df[actual_col].astype(int)
+        y_score = pred_df[pred_col].astype(float)
+    except Exception:
+        return False
+
+    # Compute precision-recall curve
+    try:
+        precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    except Exception:
+        return False
+
+    # Default metrics at threshold 0.5
+    if len(thresholds) > 0:
+        # Find index closest to 0.5
+        idx_05 = np.argmin(np.abs(thresholds - 0.5))
+    else:
+        idx_05 = 0
+
+    # If thresholds array is shorter (last element has no threshold), handle it
+    if idx_05 >= len(precision):
+        idx_05 = len(precision) - 1
+
+    default_metrics = {
+        "threshold": 0.5,
+        "precision": float(precision[idx_05]) if idx_05 < len(precision) else 0.0,
+        "recall": float(recall[idx_05]) if idx_05 < len(recall) else 0.0,
+        "f1": 0.0,
+    }
+    if default_metrics["precision"] + default_metrics["recall"] > 0:
+        default_metrics["f1"] = 2 * default_metrics["precision"] * default_metrics["recall"] / (default_metrics["precision"] + default_metrics["recall"])
+
+    # Find best operating point: max precision with recall >= 0.90
+    best_idx = None
+    best_precision = -1.0
+    for i, r in enumerate(recall):
+        if r >= 0.90 and precision[i] > best_precision:
+            best_precision = precision[i]
+            best_idx = i
+
+    if best_idx is not None and best_idx < len(thresholds):
+        recommended_threshold = float(thresholds[best_idx])
+        recommended_metrics = {
+            "threshold": recommended_threshold,
+            "precision": float(precision[best_idx]),
+            "recall": float(recall[best_idx]),
+            "f1": 0.0,
+        }
+        if recommended_metrics["precision"] + recommended_metrics["recall"] > 0:
+            recommended_metrics["f1"] = 2 * recommended_metrics["precision"] * recommended_metrics["recall"] / (recommended_metrics["precision"] + recommended_metrics["recall"])
+    else:
+        # Fallback: best F1
+        f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
+        best_idx = int(np.argmax(f1_scores))
+        recommended_threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+        recommended_metrics = {
+            "threshold": recommended_threshold,
+            "precision": float(precision[best_idx]),
+            "recall": float(recall[best_idx]),
+            "f1": float(f1_scores[best_idx]),
+        }
+
+    # Build threshold_analysis.json
+    ta = {
+        "applicable": True,
+        "model_artifact": champ_art,
+        "model_name": champ.get("model_name"),
+        "default_metrics": default_metrics,
+        "recommended_metrics": recommended_metrics,
+        "recommended_threshold": recommended_threshold,
+        "selection_rationale": "Max precision subject to recall >= 0.90 on test set (confirmation only; not for production threshold selection)",
+        "precision_recall_curve": {
+            "thresholds": thresholds.tolist() if hasattr(thresholds, 'tolist') else list(thresholds),
+            "precision": precision.tolist() if hasattr(precision, 'tolist') else list(precision),
+            "recall": recall.tolist() if hasattr(recall, 'tolist') else list(recall),
+        },
+        "regenerated_by": "preflight_gate for current champion",
+        "regenerated_at": datetime.now().isoformat(),
+    }
+
+    return _dump_json(os.path.join(output_dir, "threshold_analysis.json"), ta)
+
+
 def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bool = True) -> Dict[str, Any]:
     """Post-ML-task gate: every artifact that names a champion must name THE champion.
 
@@ -495,8 +610,13 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
     stale_findings = _check_stale_threshold_analysis(output_dir, champ)
     result["findings"].extend(stale_findings)
     if repair and any(f["code"] == "stale_threshold_analysis" for f in stale_findings):
-        if annotate_stale_threshold_analysis(output_dir, champ):
-            result["repairs"].append("threshold_analysis.json annotated as stale for the current champion")
+        # Try to regenerate threshold_analysis.json for the current champion
+        if _regenerate_threshold_analysis(output_dir, champ):
+            result["repairs"].append("threshold_analysis.json regenerated for the current champion model")
+        else:
+            # Fall back to annotation if regeneration fails
+            if annotate_stale_threshold_analysis(output_dir, champ):
+                result["repairs"].append("threshold_analysis.json annotated as stale for the current champion (regeneration failed)")
 
     result["consistent"] = len(result["findings"]) == 0
 

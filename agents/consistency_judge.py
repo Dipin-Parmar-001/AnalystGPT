@@ -82,13 +82,31 @@ def _normalize_ws(s: str) -> str:
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Extracts the first JSON object from an LLM response (fenced or bare)."""
+    """Extracts the first JSON object from an LLM response (fenced or bare).
+
+    Handles:
+    - Markdown fenced code blocks (```json ... ```)
+    - Bare JSON objects
+    - Multiple JSON objects (returns the first valid one with expected keys)
+    - Partial/truncated JSON (attempts to repair)
+    """
     if not text:
         return None
+
+    # Strategy 1: Markdown fenced code block
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidates = [fence.group(1)] if fence else []
+    if fence:
+        try:
+            obj = json.loads(fence.group(1))
+            if isinstance(obj, dict) and ("claims" in obj or "overall_assessment" in obj):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 2: Find all balanced JSON objects in the text
+    candidates = []
     start = text.find("{")
-    if start != -1:
+    while start != -1:
         depth = 0
         for i in range(start, len(text)):
             if text[i] == "{":
@@ -98,14 +116,58 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
                 if depth == 0:
                     candidates.append(text[start:i + 1])
                     break
+        start = text.find("{", start + 1)
+
+    # Strategy 3: Try to find JSON-like content and repair common issues
+    if not candidates:
+        # Look for content that looks like our expected schema
+        json_like = re.search(r'\{.*?"claims".*?\}', text, re.DOTALL)
+        if json_like:
+            candidates.append(json_like.group(0))
+
+    # Validate candidates
     for cand in candidates:
         try:
             obj = json.loads(cand)
             if isinstance(obj, dict):
-                return obj
+                # Accept if it has our expected structure
+                if "claims" in obj or "overall_assessment" in obj:
+                    return obj
+                # Also accept if it has claim-like structure (some LLMs omit top-level keys)
+                if any(k in str(obj).lower() for k in ("quote", "verdict", "severity")):
+                    return obj
         except json.JSONDecodeError:
-            continue
+            # Try to repair common JSON issues
+            repaired = _repair_json(cand)
+            if repaired:
+                try:
+                    obj = json.loads(repaired)
+                    if isinstance(obj, dict) and ("claims" in obj or "overall_assessment" in obj):
+                        return obj
+                except json.JSONDecodeError:
+                    continue
+
     return None
+
+
+def _repair_json(text: str) -> Optional[str]:
+    """Attempt to repair common JSON issues from LLM output."""
+    if not text:
+        return None
+
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # Fix unquoted keys (simple cases)
+    text = re.sub(r'(\{|\,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1 "\2":', text)
+
+    # Ensure it ends properly
+    if text.count("{") > text.count("}"):
+        text += "}" * (text.count("{") - text.count("}"))
+    elif text.count("[") > text.count("]"):
+        text += "]" * (text.count("[") - text.count("]"))
+
+    return text
 
 
 VALID_VERDICTS = {"contradicted", "unverifiable", "supported"}
@@ -219,6 +281,10 @@ class ConsistencyJudge:
                 logfire.warn("ConsistencyJudge LLM call failed; proceeding without judge findings", error=str(e))
             return JudgeResult(parse_ok=False, error=f"LLM call failed: {e}")
 
+        # Log raw response for debugging
+        if HAS_LOGFIRE:
+            logfire.debug("ConsistencyJudge raw response", response_preview=raw[:500])
+
         parsed = _extract_json_object(raw)
         if parsed is None:
             # One strict retry: an unparsable judge response must not silently
@@ -226,7 +292,7 @@ class ConsistencyJudge:
             repair_suffix = (
                 "\n\nYour previous response was not parsable as JSON. Respond AGAIN with "
                 "ONLY the raw JSON object with keys 'overall_assessment' and 'claims' — "
-                "no prose, no markdown fences, no commentary."
+                "no prose, no markdown fences, no commentary. Output MUST start with { and end with }."
             )
             try:
                 raw = self._call_llm("\n\n".join(user_parts) + repair_suffix)
@@ -235,10 +301,15 @@ class ConsistencyJudge:
                     logfire.warn("ConsistencyJudge retry LLM call failed", error=str(e))
                 return JudgeResult(parse_ok=False, raw_response=raw[:2000],
                                    error=f"unparsable_json (retry LLM call failed: {e})")
+
+            if HAS_LOGFIRE:
+                logfire.debug("ConsistencyJudge retry raw response", response_preview=raw[:500])
+
             parsed = _extract_json_object(raw)
             if parsed is None:
                 if HAS_LOGFIRE:
-                    logfire.warn("ConsistencyJudge returned unparsable output after one retry; ignoring judge findings")
+                    logfire.warn("ConsistencyJudge returned unparsable output after one retry; ignoring judge findings",
+                                 raw_response=raw[:1000])
                 return JudgeResult(parse_ok=False, raw_response=raw[:2000],
                                    error="unparsable_json (after 1 retry)")
 

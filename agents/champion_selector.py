@@ -45,8 +45,42 @@ def _norm_model_name(name: str) -> str:
 
 
 def _goal_wants_recall(goal_text: str) -> bool:
+    """Determine if the user's goal explicitly prioritizes recall over ROC-AUC.
+
+    Checks for:
+    1. Explicit metric specification: "primary metric: recall", "optimize for f1", "metric=roc_auc"
+    2. Business context keywords: churn, fraud, "catch as many", "don't miss"
+    """
     g = (goal_text or "").lower()
-    return any(k in g for k in ("churn", "recall", "catch", "miss", "identify", "detect", "fraud", "attrition"))
+
+    # First: Check for explicit primary metric specification (highest priority)
+    # Patterns like: "primary metric: recall", "optimize for f1", "metric=roc_auc", "target: precision"
+    import re
+    explicit_metric_patterns = [
+        r"primary\s+metric\s*[:\-]\s*(recall|f1|roc[_\-]?auc|pr[_\-]?auc|precision|accuracy)",
+        r"optimize\s+for\s+(recall|f1|roc[_\-]?auc|pr[_\-]?auc|precision|accuracy)",
+        r"metric\s*[=\:]\s*(recall|f1|roc[_\-]?auc|pr[_\-]?auc|precision|accuracy)",
+        r"target\s*[:\-]\s*(recall|f1|roc[_\-]?auc|pr[_\-]?auc|precision|accuracy)",
+        r"maximize\s+(recall|f1|roc[_\-]?auc|pr[_\-]?auc|precision|accuracy)",
+    ]
+    for pattern in explicit_metric_patterns:
+        match = re.search(pattern, g)
+        if match:
+            metric = match.group(1).replace("-", "_")
+            if metric in ("recall", "f1"):
+                return True
+            elif metric in ("roc_auc", "pr_auc", "precision", "accuracy"):
+                return False
+
+    # Second: Business context keywords that imply recall priority
+    recall_keywords = (
+        "churn", "fraud", "attrition",
+        "catch as many", "don't miss", "do not miss",
+        "identify all", "detect all", "miss no",
+        "minimize false negative", "reduce false negative",
+        "recall", "sensitivity", "true positive rate"
+    )
+    return any(k in g for k in recall_keywords)
 
 
 def _load_comparison_rows(output_dir: str) -> List[Dict[str, Any]]:
@@ -94,15 +128,49 @@ def _load_comparison_rows(output_dir: str) -> List[Dict[str, Any]]:
     return list(rows_by_key.values())
 
 
-def _pick_metric(metrics: Dict[str, float], goal_text: str) -> Optional[str]:
+def _pick_metric(metrics: Dict[str, float], goal_text: str, output_dir: Optional[str] = None) -> Optional[str]:
+    """Select the best metric based on goal, verified metrics, and available data.
+
+    Priority:
+    1. Explicit metric from verified_metrics.json (user-specified or code-selected)
+    2. Goal-based priority (recall vs default)
+    3. Verify the metric exists in comparison data; if not, fall back to next priority
+    4. Regression fallback
+    """
+    # 1. Check verified_metrics.json for explicitly set primary metric
+    if output_dir:
+        import os
+        import json
+        vm_path = os.path.join(output_dir, "verified_metrics.json")
+        if os.path.exists(vm_path):
+            try:
+                with open(vm_path, "r", encoding="utf-8") as f:
+                    vm = json.load(f)
+                # Check for user-specified primary metric in the goal/plan
+                explicit_metric = vm.get("primary_metric") or vm.get("goal_primary_metric")
+                if explicit_metric:
+                    norm_explicit = _norm_metric_key(explicit_metric)
+                    if norm_explicit in metrics:
+                        return norm_explicit
+                    # If explicit metric not in this row's metrics, check if it exists in ANY row
+                    # (we'd need access to all rows; for now fall through to goal-based)
+            except Exception:
+                pass
+
+    # 2. Goal-based priority
     priority = RECALL_PRIORITY if _goal_wants_recall(goal_text) else DEFAULT_PRIORITY
+
+    # 3. Verify metric exists in comparison data, fall back if not
     for cand in priority:
         if cand in metrics:
             return cand
-    # regression fallback: minimize error metrics
+
+    # 4. Regression fallback: minimize error metrics
     for cand in ("rmse", "mae", "mse"):
         if cand in metrics:
             return cand
+
+    # 5. Last resort: first available metric
     if metrics:
         return sorted(metrics.keys())[0]
     return None
@@ -122,7 +190,7 @@ def select_champion(output_dir: str, goal_text: str = "") -> Optional[Dict[str, 
     if not candidates:
         return None
 
-    metric = _pick_metric(candidates[0]["metrics"], goal_text)
+    metric = _pick_metric(candidates[0]["metrics"], goal_text, output_dir)
     if metric is None:
         return None
     ascending = metric in ASCENDING_METRICS

@@ -43,6 +43,8 @@ from agents.artifact_validator import (
     validate_and_get_warning,
     build_hallucination_warning_prompt,
     build_repair_prompt,
+    build_champion_repair_prompt,
+    is_champion_disagreement_error,
     ValidationResult
 )
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
@@ -1299,6 +1301,9 @@ class WorkflowOrchestrator:
                                 else:
                                     failure_kind = "post_verification"
                                     last_validation_errors = post_verification_errors
+                                    last_missing_artifacts = []
+                                    last_fallback_detected = False
+
                                 last_failure_kind = failure_kind
 
                                 print(f"[Orchestrator Validation] Task #{task.task_id} ({agent_class_name}) failed {failure_kind} (attempt {attempt + 1}/{max_retries + 1}):")
@@ -1450,22 +1455,119 @@ class WorkflowOrchestrator:
                     # verify all champion-mentioning artifacts agree (they are
                     # rewritten/repaired in place; findings never stop the run).
                     if isinstance(agent_instance, MLAgent):
-                        try:
-                            champ_check = verify_champion_consistency(
-                                self.current_output_dir, goal_text=query_text
-                            )
-                            if champ_check.get("repairs"):
-                                print(f"[Orchestrator] Champion consistency repairs (Task #{task.task_id}): "
-                                      f"{champ_check['repairs']}", flush=True)
-                            if not champ_check.get("consistent", True):
-                                if HAS_LOGFIRE:
-                                    logfire.warn(
-                                        "Champion consistency check found disagreements after ML task",
-                                        task_id=task.task_id,
-                                        detail=[f["message"] for f in champ_check.get("findings", [])],
+                        # Reconstruct ml_files for potential repair retry
+                        current_dataset_file = None
+                        for cand in ["feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"]:
+                            cand_path = os.path.join(self.current_output_dir, cand)
+                            if cand in self.generated_artifacts or os.path.exists(cand_path):
+                                current_dataset_file = cand
+                                break
+
+                        ml_files = list(files_list)
+                        if current_dataset_file:
+                            full_cand_path = os.path.join(self.current_output_dir, current_dataset_file)
+                            if full_cand_path not in ml_files and current_dataset_file not in ml_files:
+                                ml_files.insert(0, full_cand_path)
+
+                        vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
+                        if os.path.exists(vm_path) and vm_path not in ml_files and "verified_metrics.json" not in ml_files:
+                            ml_files.append(vm_path)
+
+                        # Run champion consistency check with retry for disagreements
+                        max_champ_retries = 1  # Single targeted retry for champion pointer fixes
+                        champ_retry = 0
+                        while champ_retry <= max_champ_retries:
+                            try:
+                                champ_check = verify_champion_consistency(
+                                    self.current_output_dir, goal_text=query_text
+                                )
+                                if champ_check.get("repairs"):
+                                    print(f"[Orchestrator] Champion consistency repairs (Task #{task.task_id}): "
+                                          f"{champ_check['repairs']}", flush=True)
+
+                                # Check for champion disagreement findings that need targeted retry
+                                champ_disagreement_findings = [
+                                    f for f in champ_check.get("findings", [])
+                                    if f.get("code") in (
+                                        "champion_pointer_disagreement",
+                                        "champion_registry_disagreement",
+                                        "stale_champion_pointer",
+                                        "stale_threshold_analysis",
+                                        "champion_disagreement_ml_summary",
+                                        "threshold_analysis_model_mismatch",
+                                        "registry_missing_artifact",
+                                        "artifact_load_verification_failed",
                                     )
-                        except Exception as champ_err:
-                            print(f"[Orchestrator Notice] champion consistency check skipped: {champ_err}")
+                                ]
+
+                                if champ_disagreement_findings and champ_retry < max_champ_retries:
+                                    champ_retry += 1
+                                    print(f"[Orchestrator] Champion disagreement detected (attempt {champ_retry}/{max_champ_retries}), running targeted repair...")
+                                    if HAS_LOGFIRE:
+                                        logfire.info(
+                                            "Champion disagreement retry",
+                                            task_id=task.task_id,
+                                            attempt=champ_retry,
+                                            findings=[f["code"] for f in champ_disagreement_findings],
+                                        )
+
+                                    # Run targeted repair using MLAgent with champion repair prompt
+                                    # The repair only fixes metadata pointers, doesn't retrain models
+                                    try:
+                                        # Build champion repair prompt
+                                        vr = ValidationResult(
+                                            is_valid=False,
+                                            missing_artifacts=[],
+                                            existing_artifacts=[],
+                                            fallback_detected=False,
+                                            hallucination_warnings=[f["message"] for f in champ_disagreement_findings],
+                                            report_structure_valid=True,
+                                            report_structure_issues=[]
+                                        )
+                                        repair_prompt = build_champion_repair_prompt(
+                                            vr, agent_class_name, task.title, task.description,
+                                            self.current_output_dir, [f["message"] for f in champ_disagreement_findings]
+                                        )
+
+                                        # Run the repair
+                                        agent_res = agent_instance.run_task(
+                                            prompt=repair_prompt,
+                                            uploaded_files=ml_files,
+                                            plan=active_plan,
+                                            task_id=task.task_id,
+                                            max_tool_calls=5,  # Small budget for pointer fixes only
+                                            step_callback=step_callback,
+                                            cancellation_token=self.cancellation_token
+                                        )
+
+                                        # Collect any generated files
+                                        for gf in agent_res.get("generated_files", []) or []:
+                                            if gf not in self.generated_artifacts:
+                                                self.generated_artifacts.append(gf)
+
+                                        # Continue loop to re-verify
+                                        continue
+
+                                    except Exception as repair_err:
+                                        print(f"[Orchestrator Notice] champion repair failed: {repair_err}")
+                                        if HAS_LOGFIRE:
+                                            logfire.warn("Champion repair attempt failed", error=str(repair_err))
+                                        # Continue to re-check anyway (maybe auto-repair worked)
+
+                                # If consistent or max retries reached, log and break
+                                if not champ_check.get("consistent", True):
+                                    if HAS_LOGFIRE:
+                                        logfire.warn(
+                                            "Champion consistency check found disagreements after ML task",
+                                            task_id=task.task_id,
+                                            detail=[f["message"] for f in champ_check.get("findings", [])],
+                                            retries_exhausted=champ_retry >= max_champ_retries
+                                        )
+                                break  # Exit retry loop
+
+                            except Exception as champ_err:
+                                print(f"[Orchestrator Notice] champion consistency check skipped: {champ_err}")
+                                break
 
                     # Global counters: per-task latency, status, retries
                     task_duration = time.perf_counter() - task_t0

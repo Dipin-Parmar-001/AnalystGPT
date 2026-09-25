@@ -2578,7 +2578,8 @@ you do NOT produce report content of any kind.
 2. You NEVER introduce new numbers, column names, model names, or facts of your own. Your
    reasons must cite only values that appear in the report or in the provided ground truth.
 3. Your entire output MUST be a single JSON object and NOTHING else — no prose before or
-   after, no markdown fences.
+   after, no markdown fences (```json or ```), no code blocks, no explanations.
+   The response must start with { and end with }.
 4. If you are uncertain, use the verdict "unverifiable" — never guess "supported".
 
 # VERDICT DEFINITIONS

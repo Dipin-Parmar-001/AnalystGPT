@@ -332,7 +332,11 @@ def check_missing_values_consistency(output_dir: str, profile: Dict[str, Any]) -
 # ------------------------------------------------------- model lineage checks
 
 def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
-    """Reconciles champion pointer, model registry, and comparison tables with the pkl files on disk."""
+    """Reconciles champion pointer, model registry, and comparison tables with the pkl files on disk.
+
+    Also verifies that the champion artifact can actually be loaded and its metadata matches
+    the champion_model.json and model_registry.json entries.
+    """
     findings: List[Finding] = []
     pkl_files = {os.path.basename(p) for p in glob.glob(os.path.join(output_dir, "*.pkl"))}
 
@@ -345,6 +349,9 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
                 f"champion_model.json points to '{champ_artifact}', which does not exist on disk. Available: {', '.join(sorted(pkl_files)) or 'none'}.",
                 ["champion_model.json"],
             ))
+        elif champ_artifact and champ_artifact in pkl_files:
+            # Verify the artifact can be loaded and metadata matches
+            _verify_artifact_load(output_dir, champ_artifact, champion, findings)
 
     registry = _load_json_safe(os.path.join(output_dir, "model_registry.json"))
     registry_champion_artifacts = set()
@@ -393,6 +400,45 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
             pass
 
     return findings
+
+
+def _verify_artifact_load(output_dir: str, artifact_name: str, champion: Dict[str, Any], findings: List[Finding]) -> None:
+    """Verify the champion artifact can be loaded and its metadata matches expectations."""
+    import os
+    artifact_path = os.path.join(output_dir, artifact_name)
+
+    try:
+        import joblib
+        model = joblib.load(artifact_path)
+
+        # Verify the loaded model is a valid sklearn-like estimator
+        if not hasattr(model, "predict") and not hasattr(model, "predict_proba"):
+            findings.append(Finding(
+                SEVERITY_CRITICAL, "artifact_load_verification_failed",
+                f"Champion artifact '{artifact_name}' loaded but does not appear to be a valid model (missing predict/predict_proba).",
+                ["champion_model.json", artifact_name],
+            ))
+            return
+
+        # If model has feature_names_in_, verify against expected features
+        if hasattr(model, "feature_names_in_"):
+            expected_features = champion.get("expected_features")
+            if expected_features:
+                loaded_features = list(model.feature_names_in_)
+                if set(loaded_features) != set(expected_features):
+                    findings.append(Finding(
+                        SEVERITY_MINOR, "artifact_feature_mismatch",
+                        f"Champion artifact '{artifact_name}' has different features than expected. "
+                        f"Loaded: {loaded_features}, Expected: {expected_features}",
+                        ["champion_model.json", artifact_name],
+                    ))
+
+    except Exception as e:
+        findings.append(Finding(
+            SEVERITY_CRITICAL, "artifact_load_verification_failed",
+            f"Champion artifact '{artifact_name}' could not be loaded: {e}",
+            ["champion_model.json", artifact_name],
+        ))
 
 
 # ---------------------------------------------------- duplicate summaries check
@@ -502,7 +548,7 @@ def check_cleaning_integrity(output_dir: str, profile: Dict[str, Any]) -> List[F
 
 # ------------------------------------------------------- threshold sanity check
 
-def check_threshold_analysis(output_dir: str) -> List[Finding]:
+def check_threshold_analysis(output_dir: str, champion_artifact: Optional[str] = None) -> List[Finding]:
     """
     Validates the recommended operating point in threshold_analysis.json.
 
@@ -511,11 +557,25 @@ def check_threshold_analysis(output_dir: str) -> List[Finding]:
     value; when the stored curve contains a better operating point (recall
     >= 0.90 with materially higher precision), that is flagged critical.
     Also cross-checks the claimed recommended metrics against the curve.
+    Verifies the threshold analysis belongs to the current champion model.
     """
     findings: List[Finding] = []
     ta = _load_json_safe(os.path.join(output_dir, "threshold_analysis.json"))
     if not isinstance(ta, dict) or ta.get("applicable") is not True:
         return findings
+
+    # Verify the threshold analysis belongs to the champion model
+    if champion_artifact:
+        ta_artifact = ta.get("model_artifact") or ta.get("model") or ta.get("artifact_filename")
+        if ta_artifact and ta_artifact != champion_artifact:
+            findings.append(Finding(
+                SEVERITY_CRITICAL, "threshold_analysis_model_mismatch",
+                f"threshold_analysis.json was generated for model '{ta_artifact}' but the current "
+                f"champion is '{champion_artifact}'. The threshold recommendation does not apply to "
+                f"the champion model and must be regenerated.",
+                ["threshold_analysis.json", "champion_model.json"],
+            ))
+            # Don't return early - still validate the curve for completeness
 
     rec_metrics = ta.get("recommended_metrics") or {}
     rec_recall = rec_metrics.get("recall")
@@ -1029,12 +1089,18 @@ def run_consistency_checks(
     profile = build_dataset_profile(output_dir, uploaded_files, persist=False)
     findings: List[Finding] = []
 
+    # Load champion artifact for threshold analysis verification
+    champion_artifact = None
+    champion = _load_json_safe(os.path.join(output_dir, "champion_model.json"))
+    if isinstance(champion, dict):
+        champion_artifact = champion.get("model") or champion.get("artifact_filename")
+
     checks = (
         ("dataset_shape_claims", lambda: check_dataset_shape_claims(output_dir, profile)),
         ("phantom_columns", lambda: check_phantom_columns(output_dir, profile)),
         ("missing_values_consistency", lambda: check_missing_values_consistency(output_dir, profile)),
         ("cleaning_integrity", lambda: check_cleaning_integrity(output_dir, profile)),
-        ("threshold_analysis", lambda: check_threshold_analysis(output_dir)),
+        ("threshold_analysis", lambda: check_threshold_analysis(output_dir, champion_artifact)),
         ("viz_descriptions", lambda: check_visualization_descriptions(output_dir)),
         ("model_artifact_consistency", lambda: check_model_artifact_consistency(output_dir)),
         ("duplicate_summaries", lambda: check_duplicate_summaries(output_dir)),
