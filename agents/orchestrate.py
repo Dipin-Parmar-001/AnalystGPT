@@ -48,6 +48,7 @@ from agents.artifact_validator import (
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
 from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
 from agents.preflight_gate import run_preflight, verify_champion_consistency
+from agents.champion_selector import select_initial_champion, evaluate_challenger
 from agents.fact_sheet import build_facts
 from agents.observability import (
     get_recorder,
@@ -1446,26 +1447,33 @@ class WorkflowOrchestrator:
                     else:
                         _execute_task()
 
-                    # Post-task champion consistency gate: after EVERY ML task,
-                    # verify all champion-mentioning artifacts agree (they are
-                    # rewritten/repaired in place; findings never stop the run).
-                    if isinstance(agent_instance, MLAgent):
+                    # Post-task champion selection: after model_comparison task, select initial champion.
+                    # After hyperparameter_tuning task, evaluate challenger against current champion.
+                    if isinstance(agent_instance, MLAgent) and task.task_type in ("model_comparison", "hyperparameter_tuning"):
                         try:
-                            champ_check = verify_champion_consistency(
-                                self.current_output_dir, goal_text=query_text
-                            )
-                            if champ_check.get("repairs"):
-                                print(f"[Orchestrator] Champion consistency repairs (Task #{task.task_id}): "
-                                      f"{champ_check['repairs']}", flush=True)
-                            if not champ_check.get("consistent", True):
-                                if HAS_LOGFIRE:
-                                    logfire.warn(
-                                        "Champion consistency check found disagreements after ML task",
-                                        task_id=task.task_id,
-                                        detail=[f["message"] for f in champ_check.get("findings", [])],
-                                    )
+                            primary_metric = task.primary_metric
+                            if task.task_type == "model_comparison":
+                                champ_result = select_initial_champion(
+                                    self.current_output_dir,
+                                    goal_text=query_text,
+                                    primary_metric=primary_metric
+                                )
+                                if champ_result and not champ_result.get("error"):
+                                    print(f"[Orchestrator] Initial champion selected (Task #{task.task_id}): "
+                                          f"{champ_result['model_name']} ({champ_result.get('primary_metric_name', primary_metric)}={champ_result['score']:.4f})", flush=True)
+                                elif champ_result and champ_result.get("error"):
+                                    print(f"[Orchestrator] Champion selection issue (Task #{task.task_id}): {champ_result['message']}", flush=True)
+                            elif task.task_type == "hyperparameter_tuning":
+                                champ_result = evaluate_challenger(
+                                    self.current_output_dir,
+                                    goal_text=query_text,
+                                    primary_metric=primary_metric
+                                )
+                                if champ_result:
+                                    print(f"[Orchestrator] Challenger evaluated (Task #{task.task_id}): "
+                                          f"champion={champ_result['model_name']} ({champ_result.get('primary_metric_name', primary_metric)}={champ_result['score']:.4f})", flush=True)
                         except Exception as champ_err:
-                            print(f"[Orchestrator Notice] champion consistency check skipped: {champ_err}")
+                            print(f"[Orchestrator Notice] champion selection skipped: {champ_err}")
 
                     # Global counters: per-task latency, status, retries
                     task_duration = time.perf_counter() - task_t0

@@ -16,6 +16,55 @@ from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
 
+
+def is_fragmented_or_unparsable_response(message: Any) -> bool:
+    """
+    Detect if the LLM response is fragmented, unparsable, or contains only
+    token usage metadata instead of actual content.
+
+    Returns True if the response should be retried.
+    """
+    if message is None:
+        return True
+
+    # Check if content is None or empty
+    content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        # If no content and no tool calls, it's likely an incomplete response
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+    # Check if content looks like token usage metadata (JSON with token fields)
+    if isinstance(content, str):
+        content_stripped = content.strip()
+        # Check for the specific token usage metadata pattern
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                # Check for token usage metadata keys
+                token_keys = {"completion_tokens", "prompt_tokens", "total_tokens",
+                             "completion_tokens_details", "prompt_tokens_details",
+                             "cost", "is_byok", "cost_details"}
+                if isinstance(parsed, dict) and token_keys.intersection(parsed.keys()):
+                    # This is token usage metadata, not actual content
+                    return True
+            except json.JSONDecodeError:
+                pass
+
+        # Check for other common fragmented response patterns
+        # e.g., empty object, just whitespace, or clearly incomplete
+        if content_stripped in ["{}", "[]", "null", ""]:
+            return True
+
+    # Check finish_reason if available (some providers include this in message)
+    finish_reason = getattr(message, "finish_reason", None)
+    if finish_reason in ["length", "content_filter", "function_call"]:
+        # These might indicate incomplete responses
+        pass
+
+    return False
+
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
     try:
@@ -222,6 +271,17 @@ class MLAgent:
                 try:
                     response = self.client.chat.completions.create(**kwargs)
                     message = response.choices[0].message
+
+                    # Check for fragmented or unparsable response (token usage metadata, etc.)
+                    if is_fragmented_or_unparsable_response(message):
+                        if HAS_LOGFIRE:
+                            logfire.warn("Detected fragmented/unparsable LLM response (token metadata only), retrying...",
+                                         content_snippet=str(getattr(message, "content", None))[:200])
+                        else:
+                            print(f"[MLAgent] Detected fragmented/unparsable LLM response, retrying...")
+                        # Treat as an error to trigger retry
+                        raise RuntimeError("Fragmented or unparsable LLM response received (token metadata only)")
+
                     return message
                 except Exception as err:
                     err_str = str(err).lower()
@@ -357,22 +417,30 @@ class MLAgent:
         task_type = getattr(primary_task, "task_type", None) or "model_comparison"
 
         if task_type == "hyperparameter_tuning":
+            # Get primary_metric from task spec
+            primary_metric = getattr(primary_task, "primary_metric", None) if primary_task else None
+            metric_hint = f" (Planner specified: {primary_metric})" if primary_metric else ""
+
             task_specific_instructions = (
                 f"Instructions for Hyperparameter Tuning:\n"
                 f"1. You have a budget of MAX {effective_max_calls} tool calls.\n"
-                f"2. Load `model_comparison.csv` and `best_model.pkl` directly from FILE_REGISTRY.\n"
+                f"2. Load `model_comparison.csv` and the champion model artifact (from `champion_model.json[\"artifact_filename\"]`) directly from FILE_REGISTRY.\n"
                 f"3. Reconstruct training data using identical split and preprocessing from baseline.\n"
-                f"4. Bounded search: Run GridSearchCV or RandomizedSearchCV with cv=5 over the bounded parameter search space specified in your task description.\n"
-                f"5. Honest reporting: Only overwrite `best_model.pkl` if the tuned model's primary metric strictly outperforms baseline.\n"
+                f"4. Bounded search: Run GridSearchCV or RandomizedSearchCV with cv=5 over the bounded parameter search space specified in your task description. Use scoring='{primary_metric or 'roc_auc'}'{metric_hint} for the search -- this MUST match the primary_metric from the task spec / champion_model.json.\n"
+                f"5. Honest reporting: Only update `champion_model.json` to point to the tuned model if the tuned model's primary metric strictly outperforms baseline.\n"
                 f"6. MANDATORY OUTPUT ARTIFACTS:\n"
                 f"   - `tuned_model_comparison.csv` (Comparing baseline vs tuned metrics side by side)\n"
                 f"   - `best_params.json` (Winning hyperparameter combination and best CV score)\n"
                 f"   - `hyperparameter_tuning_summary.json` (Structured tuning summary JSON)\n"
                 f"   - `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json` AND `ml_summary.json` (Your own task summary with tuned-vs-baseline metric deltas — both files required)\n"
-                f"   - `best_model.pkl` (Updated only if tuned model won)\n"
+                f"   - Versioned tuned model artifact (e.g., `logistic_regression_p1_tuned.pkl`)\n"
                 f"7. Provide a concise summary of tuning results, parameter improvements, and test metric deltas."
             )
         else:
+            # Get primary_metric from task spec
+            primary_metric = getattr(primary_task, "primary_metric", None) if primary_task else None
+            metric_hint = f" (Planner specified: {primary_metric})" if primary_metric else ""
+
             task_specific_instructions = (
                 f"Instructions for Model Training & Comparison:\n"
                 f"1. Dataset Loading: If `feature_engineered_dataset.csv` or `cleaned_dataset.csv` is available in FILE_REGISTRY or inputs, load it directly. If not available, use the main dataset provided.\n"
@@ -380,15 +448,16 @@ class MLAgent:
                 f"3. Preprocessing: Use One-Hot Encoding (`pd.get_dummies(..., drop_first=True)` or `OneHotEncoder`) for nominal features, `LabelEncoder()` strictly for classification target `y`, `StandardScaler()` fit strictly on `X_train`, and `train_test_split(..., test_size=0.2, random_state=42, stratify=y if classification else None)`.\n"
                 f"4. Metrics: For classification, evaluate Accuracy, Precision, Recall, F1, ROC-AUC, **PR-AUC** (`average_precision_score`), and **5-Fold Stratified Cross-Validation** (`CV_Mean`, `CV_Std`). For regression, evaluate RMSE, MAE, R2, MSE, and 5-Fold CV R2.\n"
                 f"5. Directional Feature Importance: Extract signed `coefficient`, `absolute_importance`, and `direction` (e.g., `'reduces_churn'` / `'increases_churn'` or `'reduces_target'` / `'increases_target'`) and save to `feature_importance.csv`.\n"
-                f"6. Business-Aware Model Selection: Provide a comparative multi-metric rationale (e.g. 'Model A has highest ROC-AUC/PR-AUC while Model B has higher recall. Model A was selected because ROC-AUC was designated as primary metric...').\n"
-                f"7. MANDATORY 7 ARTIFACTS: Your script MUST save all 7 core files:\n"
-                f"   - `model_comparison.csv` (Comparing models across Accuracy, Precision, Recall, F1, ROC_AUC, PR_AUC, CV_Mean, CV_Std)\n"
-                f"   - `baseline_score.json` (Dummy baseline benchmark)\n"
+                f"6. Business-Aware Model Selection: The primary metric for selection is {primary_metric or 'roc_auc'}{metric_hint}. Provide a comparative multi-metric rationale and select the model that scores highest on this primary metric (or lowest for error metrics like RMSE).\n"
+                f"7. MANDATORY ARTIFACTS: Your script MUST save all core files:\n"
+                f"   - `model_comparison.csv` (Comparing models across Accuracy, Precision, Recall, F1, ROC_AUC, PR_AUC, CV_Mean, CV_Std, **model_artifact**)\n"
+                f"   - `baseline_score.json` (Dummy baseline benchmark using `DummyClassifier(strategy=\"most_frequent\")` labeled \"Majority Class Baseline\")\n"
                 f"   - `feature_importance.csv` (Columns: feature, coefficient, absolute_importance, direction)\n"
                 f"   - `confusion_matrix.json` (Confusion matrix data for best model)\n"
                 f"   - `predictions.csv` (Predictions with customerID, actual, predicted, probability)\n"
-                f"   - `best_model.pkl` (Best model saved via joblib.dump)\n"
+                f"   - Versioned model artifacts (e.g., `logistic_regression_p0.pkl`, `random_forest_p0.pkl` — NOT `best_model.pkl`)\n"
                 f"   - `ml_summary.json` AND `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json` (Structured machine learning summary — both files required)\n"
+                f"   - `model_registry.json` and `champion_model.json`\n"
                 f"8. You have a budget of MAX {effective_max_calls} tool calls.\n"
                 f"9. Output the final structured JSON summary and metric details."
             )

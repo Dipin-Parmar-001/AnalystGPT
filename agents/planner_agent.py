@@ -136,6 +136,7 @@ class TaskItem:
     inputs: List[str] = field(default_factory=list)
     result: Optional[Any] = None
     est_tool_calls: Optional[int] = None
+    primary_metric: Optional[str] = None  # e.g., "recall", "roc_auc", "pr_auc", "f1", "accuracy"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -158,7 +159,8 @@ class TaskItem:
             depends_on=data.get("depends_on", []),
             inputs=data.get("inputs", []),
             result=data.get("result"),
-            est_tool_calls=data.get("est_tool_calls")
+            est_tool_calls=data.get("est_tool_calls"),
+            primary_metric=data.get("primary_metric")
         )
 
 

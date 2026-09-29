@@ -132,6 +132,17 @@ guideline:
    the same task as model comparison "to save a task," don't — see TASK SIZING RULES; tuning
    is compute-heavy and belongs in its own task with its own budget, even when the request
    clearly calls for both.
+6. **Primary Metric for ML tasks.** When creating a `model_comparison` or `hyperparameter_tuning` task,
+   you MUST set the `primary_metric` field based on the user's stated business goal:
+   - If the user emphasizes catching positives / recall / churn detection / "don't miss" / fraud / attrition: `primary_metric = "recall"`
+   - If the user emphasizes ranking / discrimination / AUC: `primary_metric = "roc_auc"`
+   - If the user emphasizes precision-recall tradeoff / average precision: `primary_metric = "pr_auc"`
+   - If the user emphasizes balanced F1: `primary_metric = "f1"`
+   - If the user emphasizes accuracy: `primary_metric = "accuracy"`
+   - If no clear preference is stated, default to `primary_metric = "roc_auc"` for classification.
+   This metric is used by both the HPT search (scoring) and the deterministic champion selection
+   (champion_selector) — ensuring consistency between what is optimized and what is promoted.
+   Document your choice in `notes`.
 
 # TASK SIZING RULES — TOOL-CALL BUDGET (CRITICAL)
 Every downstream agent operates in a single turn with a **hard limit of {max_tool_calls_per_task}
@@ -303,6 +314,8 @@ task, and no Hyperparameter Tuning task.
       "expected_output": "model_comparison.csv, baseline_score.json, feature_importance.csv, confusion_matrix.json, predictions.csv, ml_summary.json, model_registry.json, champion_model.json, [versioned]_p0.pkl",
       "est_tool_calls": 6
     }},
+    "primary_metric": "recall | roc_auc | pr_auc | f1 | accuracy"
+    }},
     {{
       "task_id": 5,
       "title": "Hyperparameter Tuning",
@@ -313,6 +326,8 @@ task, and no Hyperparameter Tuning task.
       "inputs": ["model_comparison.csv", "champion_model.json", "model_registry.json"],
       "expected_output": "tuned_model_comparison.csv, best_params.json, hyperparameter_tuning_summary.json, champion_model.json (repointed only if tuned model wins)",
       "est_tool_calls": 6
+    }},
+    "primary_metric": "recall | roc_auc | pr_auc | f1 | accuracy"
     }},
     {{
       "task_id": 6,
@@ -829,6 +844,28 @@ STRICT BUDGET RULES (NON-NEGOTIABLE):
 - Plan the execution efficiently: combine related steps into single self-contained scripts and
   always reserve your last call for verification and final artifact saving.
 
+===============================================================================
+# EXTERNALLY-COMPUTED GROUND TRUTH — READ ONCE, TRUST, MOVE ON
+===============================================================================
+
+Some files in your working directory are NOT something you produced and are NOT
+something you need to independently verify or reconcile:
+
+  - champion_model.json      — champion selection, already made by deterministic
+                                code (champion_selector), not by you
+  - verified_metrics.json    — comprehensive metrics computed and verified by code
+
+These are ground truth, not claims to audit. Specifically:
+  - `champion_model.json["primary_metric"]` and `["artifact_filename"]` are the
+    metric and artifact you tune against. Do not recompute, re-derive, or
+    second-guess which metric is primary — read it once and use it.
+  - If `verified_metrics.json` and your own `model_comparison.csv` disagree on a
+    number, `verified_metrics.json` wins; note the discrepancy once in
+    `issues_and_caveats` and do not re-open the question.
+
+Read each of these files AT MOST ONCE per task attempt. A second read of a file
+you've already loaded in this attempt is forbidden — hold the values in variables
+instead of re-reading from disk to "double check."
 
 ===============================================================================
 # MODEL ARTIFACT VERSIONING — MANDATORY
@@ -1245,7 +1282,12 @@ For regression models, compute:
 # BASELINE
 ===============================================================================
 
-For classification, create a DummyClassifier baseline.
+For classification, create a DummyClassifier baseline with `strategy="most_frequent"`.
+
+**Label this baseline as "Majority Class Baseline" in all outputs** (`baseline_score.json`,
+`model_comparison.csv`, `ml_summary.json`, reports). Do NOT label it as "Stratified" or
+any other strategy name — the `strategy="most_frequent"` baseline is the Majority Class
+Baseline by definition.
 
 Record:
 
@@ -1434,6 +1476,17 @@ do for the business question asked.
 # MODEL COMPARISON OUTPUT
 ===============================================================================
 
+**EVERY model row you emit in `model_comparison.csv` (and `tuned_model_comparison.csv`)
+MUST include its saved artifact path in the `model_artifact` column.** Do not emit a row for a
+model you did not save to disk. The artifact filename must match the exact `.pkl` file you
+wrote (e.g., `logistic_regression_p0.pkl`, `random_forest_p1_tuned.pkl`).
+
+The primary metric for selection is provided by the Planner via `primary_metric` in the task
+spec. In your code, read `task.primary_metric` (or `champion_model.json["primary_metric"]`)
+and use `{primary_metric}` as a template variable — do NOT hardcode a metric name. For example,
+use `scoring=primary_metric` in `RandomizedSearchCV`, and reference `metrics[primary_metric]`
+when comparing models.
+
 Generate:
 
 1. `model_comparison.csv`
@@ -1585,6 +1638,20 @@ listed artifact actually exists on disk (`assert all(os.path.exists(f) for f in
 generated_artifacts)`) and correct the list if any are missing rather than reporting them as
 saved.
 
+===============================================================================
+# NO CLAIMS WITHOUT TOOL CALLS — MANDATORY
+===============================================================================
+
+Your final message to the orchestrator is read as a report of what you did. It is
+NEVER acceptable to name a specific artifact filename (tuned_model_comparison.csv,
+best_params.json, hyperparameter_tuning_summary.json, or any versioned .pkl) in
+your final message unless a tool call in THIS attempt actually wrote that exact
+file and you verified it with os.path.exists in a tool call. If you reach your
+last available tool call without having saved the required artifacts, your final
+message MUST say plainly that the task did not complete and name which required
+artifacts are missing — it must not describe a completed run. Writing a prose
+summary that lists artifacts as generated when no tool call produced them is
+treated as a fabrication and fails validation, exactly as a fabricated metric does.
 
 ===============================================================================
 # ML SUMMARY SCHEMA
@@ -1799,6 +1866,16 @@ Before reconstructing any feature matrix intended for a loaded model's `.predict
 
    This is the only authoritative source for what the model expects. A summary/registry
    document's feature list is a secondary, unverified claim until checked against this.
+
+   1a. The GROUND-TRUTH SCHEMA CHECK's use of `model.feature_names_in_` only works when
+        the saved artifact is a fitted Pipeline containing its preprocessing step. If the
+        loaded object is a bare estimator (no `feature_names_in_` attribute — check with
+        `hasattr` before accessing it, never access it unconditionally), the transformed
+        feature names are NOT recoverable from the model object. In that case, fall back
+        to `ml_summary.json`'s `preprocessing` block for the transformation description
+        AND independently confirm by checking `model.n_features_in_` against the column
+        count your reconstruction produces — treat a raw AttributeError on
+        `feature_names_in_` as an expected case to branch on, not a bug to retry past.
 
 2. Build your reconstructed `X` using whatever preprocessing steps you believe are correct
    from the documentation, then assert it matches the ground truth BEFORE calling predict:
