@@ -150,7 +150,7 @@ class ReporterAgent:
         max_tool_calls: int = 10,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 1000,
-        max_tokens_before_compact: int = 4000,
+        max_tokens_before_compact: int = 100000,
     ):
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")

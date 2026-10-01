@@ -419,7 +419,28 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
         except Exception as e:
             verified["dataset"] = {"error": f"Failed to parse dataset {target_csv.name}: {str(e)}"}
 
-    # 4. Model Comparison (model_comparison.csv & tuned_model_comparison.csv)
+    # 4d. Model Registry & Champion Pointer (load FIRST to get primary_metric from Planner)
+    reg_path = run_path / "model_registry.json"
+    if reg_path.exists() and reg_path.is_file():
+        try:
+            with open(reg_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["model_registry"] = json.load(f)
+        except Exception as e:
+            verified["model_registry_error"] = f"Failed to parse model_registry.json: {str(e)}"
+
+    champ_path = run_path / "champion_model.json"
+    primary_metric = None
+    if champ_path.exists() and champ_path.is_file():
+        try:
+            with open(champ_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["champion_model"] = json.load(f)
+            # Extract the primary_metric that was set by the Planner agent
+            if isinstance(verified["champion_model"], dict):
+                primary_metric = verified["champion_model"].get("primary_metric")
+        except Exception as e:
+            verified["champion_model_error"] = f"Failed to parse champion_model.json: {str(e)}"
+
+    # 4. Model Comparison (model_comparison.csv)
     mc_path = run_path / "model_comparison.csv"
     if mc_path.exists() and mc_path.is_file():
         try:
@@ -448,16 +469,37 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                     metrics_map[m_name] = m_dict
                 verified["model_metrics"] = metrics_map
 
-                # Determine best model
-                # Priority metrics: ROC-AUC, ROC_AUC, roc_auc, PR-AUC, F1, F1-Score, f1_score, f1, AUC, Accuracy, accuracy, R2, RMSE
+                # Determine best model using the primary_metric from champion_model.json (set by Planner)
+                # Fall back to goal-aware priority if primary_metric not available
                 target_metric = None
                 sort_ascending = False
-                for m_candidate in ["ROC-AUC", "ROC_AUC", "roc_auc", "PR-AUC", "pr_auc", "F1", "F1-Score", "f1_score", "f1", "AUC", "Accuracy", "accuracy", "R2", "r2_score"]:
-                    found_col = next((c for c in mc.columns if c.strip().lower() == m_candidate.lower()), None)
-                    if found_col:
-                        target_metric = found_col
-                        sort_ascending = False
-                        break
+
+                # Normalize metric name for matching
+                def _norm_metric_key(col: str) -> str:
+                    return col.strip().lower().replace(" ", "").replace("-", "_")
+
+                if primary_metric:
+                    # Use the primary_metric specified by the Planner
+                    pm = _norm_metric_key(primary_metric)
+                    for col in mc.columns:
+                        if _norm_metric_key(col) == pm:
+                            target_metric = col
+                            # Check if it's a metric to minimize (RMSE, MAE, MSE, log_loss)
+                            if pm in {"rmse", "mae", "mse", "log_loss"}:
+                                sort_ascending = True
+                            break
+
+                # Fallback: goal-aware priority (same logic as champion_selector)
+                if not target_metric:
+                    recall_priority = ["recall", "f1", "roc_auc", "roc-auc", "pr_auc", "pr-auc", "accuracy"]
+                    default_priority = ["roc_auc", "roc-auc", "pr_auc", "pr-auc", "f1", "recall", "accuracy"]
+                    # We don't have goal_text here, so use default priority
+                    for cand in default_priority:
+                        found_col = next((c for c in mc.columns if _norm_metric_key(c) == cand), None)
+                        if found_col:
+                            target_metric = found_col
+                            sort_ascending = False
+                            break
 
                 if not target_metric:
                     for m_candidate in ["RMSE", "rmse", "MAE", "mae", "MSE", "mse"]:
@@ -521,23 +563,6 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                 verified["best_params"] = json.load(f)
         except Exception as e:
             verified["best_params_error"] = f"Failed to parse best_params.json: {str(e)}"
-
-    # 4d. Model Registry & Champion Pointer
-    reg_path = run_path / "model_registry.json"
-    if reg_path.exists() and reg_path.is_file():
-        try:
-            with open(reg_path, "r", encoding="utf-8", errors="replace") as f:
-                verified["model_registry"] = json.load(f)
-        except Exception as e:
-            verified["model_registry_error"] = f"Failed to parse model_registry.json: {str(e)}"
-
-    champ_path = run_path / "champion_model.json"
-    if champ_path.exists() and champ_path.is_file():
-        try:
-            with open(champ_path, "r", encoding="utf-8", errors="replace") as f:
-                verified["champion_model"] = json.load(f)
-        except Exception as e:
-            verified["champion_model_error"] = f"Failed to parse champion_model.json: {str(e)}"
 
     # 5. Feature Importance (feature_importance.csv)
     fi_path = run_path / "feature_importance.csv"

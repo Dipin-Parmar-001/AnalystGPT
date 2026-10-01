@@ -142,7 +142,7 @@ class DataAnalystAgent:
         self,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 200,
-        max_tokens_before_compact: int = 3000,
+        max_tokens_before_compact: int = 100000,
         tool_manager: Optional[ToolManager] = None,
     ):
         if not PORTKEY_API_KEY:

@@ -358,7 +358,7 @@ class MessageHistoryManager:
         system_prompt: str,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 200,
-        max_tokens_before_compact: int = 3000,
+        max_tokens_before_compact: int = 100000,
     ):
         self.system_prompt = system_prompt
         self.keep_last_tool_pairs = keep_last_tool_pairs

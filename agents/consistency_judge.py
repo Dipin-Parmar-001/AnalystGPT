@@ -160,6 +160,7 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 VALID_VERDICTS = {"contradicted", "unverifiable", "supported"}
 VALID_SEVERITIES = {"critical", "minor"}
 MAX_CLAIMS = 20
+MAX_RETRIES = 3
 
 
 class ConsistencyJudge:
@@ -273,35 +274,105 @@ class ConsistencyJudge:
             "Audit the report now. Output ONLY the JSON object defined in your instructions."
         )
 
-        try:
-            raw = self._call_llm("\n\n".join(user_parts))
-        except Exception as e:
-            if HAS_LOGFIRE:
-                logfire.warn("ConsistencyJudge LLM call failed; proceeding without judge findings", error=str(e))
-            return JudgeResult(parse_ok=False, error=f"LLM call failed: {e}")
+        # Retry logic for LLM call (handles both call failures and unparsable responses)
+        max_retries = MAX_RETRIES
+        last_error = None
 
-        parsed = _extract_json_object(raw)
-        if parsed is None:
-            # One strict retry: an unparsable judge response must not silently
-            # zero out the entire prose-verification layer.
-            repair_suffix = (
-                "\n\nYour previous response was not parsable as JSON. Respond AGAIN with "
-                "ONLY the raw JSON object with keys 'overall_assessment' and 'claims' — "
-                "no prose, no markdown fences, no commentary."
-            )
+        for attempt in range(max_retries + 1):
             try:
-                raw = self._call_llm("\n\n".join(user_parts) + repair_suffix)
+                if attempt == 0:
+                    raw = self._call_llm("\n\n".join(user_parts))
+                else:
+                    # Retry with repair suffix
+                    repair_suffix = (
+                        f"\n\nYour previous response was not parsable as JSON (attempt {attempt}/{max_retries}). "
+                        "Respond AGAIN with ONLY the raw JSON object with keys 'overall_assessment' and 'claims' — "
+                        "no prose, no markdown fences, no commentary."
+                    )
+                    raw = self._call_llm("\n\n".join(user_parts) + repair_suffix)
+
+                # Log the raw response for debugging
+                if HAS_LOGFIRE:
+                    logfire.info(
+                        f"ConsistencyJudge LLM response received (attempt {attempt + 1}/{max_retries + 1})",
+                        raw_length=len(raw) if raw else 0,
+                        raw_preview=raw[:500] if raw else "EMPTY"
+                    )
+                else:
+                    print(f"[ConsistencyJudge] LLM response received (attempt {attempt + 1}/{max_retries + 1}), length: {len(raw) if raw else 0}")
+                    print(f"[ConsistencyJudge] Raw preview: {raw[:500] if raw else 'EMPTY'}")
+
+                parsed = _extract_json_object(raw)
+                if parsed is not None:
+                    # Successfully parsed
+                    if HAS_LOGFIRE:
+                        logfire.info(
+                            f"ConsistencyJudge JSON parsed successfully (attempt {attempt + 1})",
+                            claims_count=len(parsed.get("claims", [])),
+                            overall_assessment=parsed.get("overall_assessment", "")[:100]
+                        )
+                    else:
+                        print(f"[ConsistencyJudge] JSON parsed successfully (attempt {attempt + 1})")
+                        print(f"[ConsistencyJudge] Claims count: {len(parsed.get('claims', []))}")
+                    break
+                else:
+                    # Failed to parse JSON
+                    last_error = "unparsable_json"
+                    if HAS_LOGFIRE:
+                        logfire.warn(
+                            f"ConsistencyJudge returned unparsable JSON (attempt {attempt + 1}/{max_retries + 1})",
+                            raw_preview=raw[:500] if raw else "EMPTY"
+                        )
+                    else:
+                        print(f"[ConsistencyJudge] WARNING: Unparsable JSON (attempt {attempt + 1}/{max_retries + 1})")
+                        print(f"[ConsistencyJudge] Raw preview: {raw[:500] if raw else 'EMPTY'}")
+
+                    if attempt == max_retries:
+                        # All retries exhausted
+                        if HAS_LOGFIRE:
+                            logfire.error(
+                                "ConsistencyJudge failed after all retries - returning not verified",
+                                total_attempts=max_retries + 1,
+                                error=last_error,
+                                raw_response=raw[:2000] if raw else "EMPTY"
+                            )
+                        else:
+                            print(f"[ConsistencyJudge] ERROR: Failed after {max_retries + 1} attempts - returning not verified")
+                        return JudgeResult(
+                            parse_ok=False,
+                            raw_response=raw[:2000] if raw else "",
+                            error=f"unparsable_json (after {max_retries} retries)"
+                        )
+                    # Continue to next retry
+                    continue
+
             except Exception as e:
+                last_error = str(e)
                 if HAS_LOGFIRE:
-                    logfire.warn("ConsistencyJudge retry LLM call failed", error=str(e))
-                return JudgeResult(parse_ok=False, raw_response=raw[:2000],
-                                   error=f"unparsable_json (retry LLM call failed: {e})")
-            parsed = _extract_json_object(raw)
-            if parsed is None:
-                if HAS_LOGFIRE:
-                    logfire.warn("ConsistencyJudge returned unparsable output after one retry; ignoring judge findings")
-                return JudgeResult(parse_ok=False, raw_response=raw[:2000],
-                                   error="unparsable_json (after 1 retry)")
+                    logfire.warn(
+                        f"ConsistencyJudge LLM call failed (attempt {attempt + 1}/{max_retries + 1})",
+                        error=str(e)
+                    )
+                else:
+                    print(f"[ConsistencyJudge] LLM call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+
+                if attempt == max_retries:
+                    # All retries exhausted
+                    if HAS_LOGFIRE:
+                        logfire.error(
+                            "ConsistencyJudge LLM call failed after all retries - returning not verified",
+                            total_attempts=max_retries + 1,
+                            error=last_error
+                        )
+                    else:
+                        print(f"[ConsistencyJudge] ERROR: LLM call failed after {max_retries + 1} attempts - returning not verified")
+                    return JudgeResult(
+                        parse_ok=False,
+                        raw_response="",
+                        error=f"LLM call failed after {max_retries} retries: {last_error}"
+                    )
+                # Continue to next retry
+                continue
 
         norm_report = _normalize_ws(report_text)
         claims: List[JudgedClaim] = []

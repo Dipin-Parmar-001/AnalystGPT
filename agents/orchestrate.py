@@ -214,6 +214,7 @@ class WorkflowOrchestrator:
 
         # Hybrid verification & severity policy settings
         self.enable_consistency_judge: bool = True   # LLM prose-consistency judge (hybrid stack)
+        self.enable_numeric_verifier: bool = False   # Deterministic numeric verifier (DISABLED per user request)
         self.judge_model: Optional[str] = None       # Defaults to reporter_model
         self.severity_thresholds: Dict[str, int] = {
             "max_critical_findings": 0,  # >0 critical findings => failed-consistency
@@ -283,14 +284,14 @@ class WorkflowOrchestrator:
     def _run_final_verification(self, query_text: str, active_plan) -> Dict[str, Any]:
         """
         Full verification pass over the current final report using ALL methods:
-        1. Deterministic numeric verification (report claims vs VERIFIED_METRICS)
+        1. Deterministic numeric verification (report claims vs VERIFIED_METRICS) - DISABLED by default
         2. Deterministic cross-artifact consistency checks
         3. LLM prose-consistency judge (skipped if unavailable)
 
         Returns {"findings": [..], "verified_metrics": {..}, "numeric": {..}} where
         findings is the merged list consumed by the repair loop and severity policy.
         """
-        with logfire.span("Orchestrator: Final Verification Pass (numeric + consistency + judge)",
+        with logfire.span("Orchestrator: Final Verification Pass (numeric:DISABLED + consistency + judge)",
                           report_length=len(self.final_report or "")):
             findings: List[Dict[str, Any]] = []
 
@@ -309,13 +310,14 @@ class WorkflowOrchestrator:
                 logfire.warn("Orchestrator: verified_metrics.json not found; numeric verification skipped",
                              output_dir=self.current_output_dir)
 
-            # 1. Numeric verification of the report itself
-            numeric_summary: Dict[str, Any] = {}
-            if self.final_report and verified_metrics:
+            # 1. Numeric verification of the report itself (DISABLED - controlled by enable_numeric_verifier flag)
+            numeric_summary: Dict[str, Any] = {"enabled": False}
+            if self.enable_numeric_verifier and self.final_report and verified_metrics:
                 try:
                     from agents.numeric_verifier import verify_report_numbers
                     numeric_res = verify_report_numbers(self.final_report, verified_metrics)
                     numeric_summary = {
+                        "enabled": True,
                         "is_valid": numeric_res.is_valid,
                         "total_claims": numeric_res.total_claims_count,
                         "verified_count": numeric_res.verified_count,
@@ -340,6 +342,8 @@ class WorkflowOrchestrator:
                             })
                 except Exception as num_err:
                     logfire.error("Orchestrator: numeric verification failed", error=str(num_err))
+            else:
+                logfire.info("Orchestrator: numeric verification SKIPPED (enable_numeric_verifier=False)")
 
             # 1b. Normalize the champion pointer against the artifacts actually on
             # disk. Agents occasionally record a display name (e.g.
