@@ -101,7 +101,10 @@ class TestChampionSelector:
 
 class TestPreflightGate:
     def test_repairs_and_never_stops(self, run_dir):
-        result = run_preflight(str(run_dir), goal_text="predict churn")
+        # Selection happens once before preflight; the gate validates and repairs
+        # related artifacts against this canonical champion.
+        select_champion(str(run_dir), goal_text="predict churn")
+        result = run_preflight(str(run_dir), goal_text="predict churn", repair=True)
         # workflow continues regardless
         assert isinstance(result["warnings"], list)
         # champion disagreement + phantom file + shape mismatch were repaired or warned
@@ -123,26 +126,29 @@ class TestPreflightGate:
             "ROC_AUC": [0.9], "model_artifact": ["lr.pkl"],
         }).to_csv(d / "model_comparison.csv", index=False)
         (d / "lr.pkl").write_bytes(b"x")
+        select_champion(str(d), goal_text="churn")
         (d / "confusion_matrix.json").write_text(json.dumps({
             "matrix": [[10, 80], [90, 20]],
             "true_negatives": 10, "false_positives": 80,
             "false_negatives": 90, "true_positives": 20,
         }))
         pd.DataFrame({"actual": [1, 0, 1, 0], "predicted": [1, 0, 1, 1]}).to_csv(d / "predictions.csv", index=False)
-        result = run_preflight(str(d), goal_text="churn")
+        result = run_preflight(str(d), goal_text="churn", repair=True)
         cm = json.loads((d / "confusion_matrix.json").read_text())
         assert cm["true_positives"] == 2 and cm["false_negatives"] == 0
         assert cm.get("recomputed_by")
 
     def test_run_level_warnings(self, run_dir):
-        result = run_preflight(str(run_dir), goal_text="churn")
+        select_champion(str(run_dir), goal_text="churn")
+        result = run_preflight(str(run_dir), goal_text="churn", repair=True)
         # test set of 1409 is not small; no imbalance (<10%) — expect at most near-tie/none
         assert all(isinstance(w, str) for w in result["warnings"])
 
 
 class TestFactSheet:
     def test_build_and_format(self, run_dir):
-        pre = run_preflight(str(run_dir), goal_text="predict churn")
+        select_champion(str(run_dir), goal_text="predict churn")
+        pre = run_preflight(str(run_dir), goal_text="predict churn", repair=True)
         vm = {"dataset": {"rows": 7043, "cols": 33, "source_file": "cleaned_dataset.csv", "missing_pct": 0.0},
               "confusion_matrix": {"true_positives": 210, "false_positives": 111, "false_negatives": 164, "true_negatives": 924}}
         facts = build_facts(str(run_dir), vm, pre)

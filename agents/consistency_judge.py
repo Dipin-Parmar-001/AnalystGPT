@@ -11,8 +11,8 @@ never replaces — the deterministic gates.
 
 Guardrails so the judge cannot introduce new hallucinations:
 1. Temperature 0 and a JSON-only output contract.
-2. Robust JSON extraction + strict schema validation; one strict retry on an
-   unparsable response, after which the orchestrator emits a visible
+2. Robust JSON extraction; local Gemini-first/OpenRouter fallback on
+   provider failures or malformed output, after which the orchestrator emits a visible
    `judge_failed` finding (the run is never silently left unjudged).
 3. Anti-fabrication filter: every returned claim's `quote` must appear verbatim
    (whitespace-normalized) in the report. Claims quoting text absent from the
@@ -88,8 +88,20 @@ except ImportError:
 
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
+FALLBACK_STATUS_CODES = {400, 402, 404, 412, 429, 500, 502, 503, 504}
+GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.7-flash")
+OPENROUTER_MODELS = (
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "thinkingmachines/inkling:free",
+    "poolside/laguna-s-2.1:free",
+)
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _configured_keys(names):
+    """Return configured key names and values without exposing values in logs."""
+    return [(name, os.getenv(name)) for name in names if os.getenv(name)]
 
 
 @dataclass
@@ -131,23 +143,39 @@ def _normalize_ws(s: str) -> str:
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Extracts the first JSON object from an LLM response (fenced or bare)."""
+    """Extract the final JSON answer, ignoring preceding analysis or markdown."""
     if not text:
         return None
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     candidates = [fence.group(1)] if fence else []
-    start = text.find("{")
-    if start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    candidates.append(text[start:i + 1])
-                    break
-    for cand in candidates:
+    # Gather every balanced object (respecting braces inside JSON strings),
+    # then prefer the last one because reasoning commonly precedes the answer.
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start:i + 1])
+                start = None
+    ordered = candidates[:1] + list(reversed(candidates[1:])) if fence else list(reversed(candidates))
+    for cand in ordered:
         try:
             obj = json.loads(cand)
             if isinstance(obj, dict):
@@ -168,64 +196,72 @@ class ConsistencyJudge:
 
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: Optional[str] = None,
         client: Optional[OpenAI] = None,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
         setup_logfire()
-
+        self.routes = []
         if client is not None:
-            self.client = client
+            self.routes.append({"provider": "injected", "model": model_name or "injected", "client": client})
         else:
-            headers = {"x-portkey-api-key": PORTKEY_API_KEY}
-            if PORTKEY_CONFIG_ID:
-                headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-            else:
-                headers["x-portkey-config"] = json.dumps({
-                    "strategy": {"mode": "fallback", "on_status_codes": [429, 500, 502, 503, 504]},
-                    "targets": [
-                        {"virtual_key": "analystgpt-openrouter",
-                         "override_params": {"model": "nemotron-3-ultra-550b-a55b", "temperature": 0, "max_tokens": 2000}},
-                        {"virtual_key": "analystgpt-gemini",
-                         "override_params": {"model": "gemini-2.5-flash", "temperature": 0, "max_tokens": 2000}},
-                    ],
-                })
-            self.client = OpenAI(
-                base_url="https://api.portkey.ai/v1",
-                api_key=PORTKEY_API_KEY,
-                default_headers=headers,
-            )
+            # Exhaust Gemini models first, then OpenRouter models, using each
+            # locally configured API key. The judge never routes through Portkey.
+            for key_name, api_key in _configured_keys(("GEMINI_API_KEY", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2")):
+                for model in GEMINI_MODELS:
+                    self.routes.append({"provider": key_name, "model": model,
+                                        "client": OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)})
+            for key_name, api_key in _configured_keys(("OPENROUTER_API_KEY", "OPENROUTER_API_KEY_1", "OPENROUTER_API_KEY_2")):
+                for model in OPENROUTER_MODELS:
+                    self.routes.append({"provider": key_name, "model": model,
+                                        "client": OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)})
+            if not self.routes:
+                raise ValueError("Configure GEMINI_API_KEY and/or OPENROUTER_API_KEY (numbered variants are supported) for the consistency judge.")
 
-        self.model_name = model_name
-
-        # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
-        instrument_openai_client(self.client, agent_name="ConsistencyJudge")
+        for route in self.routes:
+            instrument_openai_client(route["client"], agent_name="ConsistencyJudge")
+        self.client = self.routes[0]["client"]
+        self.model_name = model_name or self.routes[0]["model"]
+        self._next_route_index = 0
 
     def _call_llm(self, user_content: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-            max_tokens=2000,
-        )
-        message = response.choices[0].message
-
-        # Check for fragmented or unparsable response (token usage metadata, etc.)
-        if is_fragmented_or_unparsable_response(message):
-            if HAS_LOGFIRE:
-                logfire.warn("Detected fragmented/unparsable LLM response (token metadata only), retrying...",
-                             content_snippet=str(getattr(message, "content", None))[:200])
-            else:
-                print(f"[ConsistencyJudge] Detected fragmented/unparsable LLM response, retrying...")
-            # Treat as an error to trigger retry
-            raise RuntimeError("Fragmented or unparsable LLM response received (token metadata only)")
-
-        return message.content or ""
+        routes = getattr(self, "routes", None) or [{
+            "provider": "injected",
+            "model": getattr(self, "model_name", "injected"),
+            "client": self.client,
+        }]
+        errors = []
+        route_count = len(routes)
+        start_index = getattr(self, "_next_route_index", 0) % route_count
+        for offset in range(route_count):
+            index = (start_index + offset) % route_count
+            route = routes[index]
+            try:
+                response = route["client"].chat.completions.create(
+                    model=route["model"],
+                    messages=[
+                        {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.1,
+                    max_tokens=2000,
+                )
+                message = response.choices[0].message
+                content = getattr(message, "content", None)
+                parsed = None if is_fragmented_or_unparsable_response(message) else _extract_json_object(content or "")
+                if parsed is None or not isinstance(parsed.get("claims"), list):
+                    errors.append(f"{route['provider']}:{route['model']} returned no valid JSON object")
+                    continue
+                # Normalize to JSON only; discard analysis, markdown, and any
+                # provider-specific reasoning text surrounding the answer.
+                self._next_route_index = (index + 1) % route_count
+                return json.dumps(parsed, ensure_ascii=False)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                detail = f"HTTP {status}" if status in FALLBACK_STATUS_CODES else "request failed"
+                errors.append(f"{route['provider']}:{route['model']} {detail}")
+        self._next_route_index = (start_index + 1) % route_count
+        raise RuntimeError("All local consistency-judge routes failed: " + "; ".join(errors))
 
     def judge_report(
         self,
@@ -438,4 +474,4 @@ def judge_result_to_findings(result: JudgeResult) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    print("ConsistencyJudge module — requires PORTKEY_API_KEY to run.")
+    print("ConsistencyJudge module — configure GEMINI_API_KEY and/or OPENROUTER_API_KEY to run.")

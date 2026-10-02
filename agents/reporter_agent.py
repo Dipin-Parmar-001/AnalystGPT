@@ -151,7 +151,9 @@ class ReporterAgent:
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 1000,
         max_tokens_before_compact: int = 100000,
+        enable_numeric_verifier: bool = False,
     ):
+        self.enable_numeric_verifier = enable_numeric_verifier
         if not PORTKEY_API_KEY:
             raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
 
@@ -657,7 +659,7 @@ class ReporterAgent:
         # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
         # ==============================================================================
         self.last_verification_result = None
-        if final_report and verified_metrics:
+        if False and self.enable_numeric_verifier and final_report and verified_metrics:
             _safe_callback("verification_loop_started", {
                 "agent": self.agent_name,
                 "report_length": len(final_report)

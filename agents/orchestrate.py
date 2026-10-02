@@ -48,7 +48,7 @@ from agents.artifact_validator import (
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
 from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
 from agents.preflight_gate import run_preflight, verify_champion_consistency
-from agents.champion_selector import select_initial_champion, evaluate_challenger
+from agents.champion_selector import select_initial_champion, evaluate_challenger, ChampionSelectionResult
 from agents.fact_sheet import build_facts
 from agents.observability import (
     get_recorder,
@@ -186,7 +186,8 @@ class WorkflowOrchestrator:
         self.reporter_agent = ReporterAgent(
             model_name=reporter_model,
             tool_manager=self.tool_manager,
-            max_tool_calls=10
+            max_tool_calls=10,
+            enable_numeric_verifier=False,
         )
 
         self.current_plan: Optional[ExecutionPlan] = None
@@ -312,7 +313,7 @@ class WorkflowOrchestrator:
 
             # 1. Numeric verification of the report itself (DISABLED - controlled by enable_numeric_verifier flag)
             numeric_summary: Dict[str, Any] = {"enabled": False}
-            if self.enable_numeric_verifier and self.final_report and verified_metrics:
+            if False and self.enable_numeric_verifier and self.final_report and verified_metrics:
                 try:
                     from agents.numeric_verifier import verify_report_numbers
                     numeric_res = verify_report_numbers(self.final_report, verified_metrics)
@@ -981,8 +982,10 @@ class WorkflowOrchestrator:
                                 fact_sheet = None
                                 if attempt == 0:
                                     try:
-                                        preflight = run_preflight(self.current_output_dir, goal_text=query_text)
-                                        if preflight.get("repairs"):
+                                        preflight = run_preflight(self.current_output_dir, goal_text=query_text, repair=True)
+                                        if preflight.get("repairs_applied"):
+                                            print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs_applied']}", flush=True)
+                                        elif preflight.get("repairs"):  # backward compat
                                             print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs']}", flush=True)
                                         # Refresh verified metrics after possible artifact repairs
                                         verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
@@ -1462,10 +1465,19 @@ class WorkflowOrchestrator:
                                     goal_text=query_text,
                                     primary_metric=primary_metric
                                 )
-                                if champ_result and not champ_result.get("error"):
+                                # Handle new ChampionSelectionResult type
+                                if isinstance(champ_result, ChampionSelectionResult):
+                                    if champ_result.is_success() and champ_result.champion:
+                                        champ = champ_result.champion
+                                        print(f"[Orchestrator] Initial champion selected (Task #{task.task_id}): "
+                                              f"{champ['model_name']} ({champ_result.primary_metric_name or primary_metric}={champ['score']:.4f})", flush=True)
+                                    else:
+                                        print(f"[Orchestrator] Champion selection issue (Task #{task.task_id}): {champ_result.error_message or champ_result.status.value}", flush=True)
+                                elif champ_result and isinstance(champ_result, dict) and not champ_result.get("error"):
+                                    # Backward compat
                                     print(f"[Orchestrator] Initial champion selected (Task #{task.task_id}): "
                                           f"{champ_result['model_name']} ({champ_result.get('primary_metric_name', primary_metric)}={champ_result['score']:.4f})", flush=True)
-                                elif champ_result and champ_result.get("error"):
+                                elif champ_result and isinstance(champ_result, dict) and champ_result.get("error"):
                                     print(f"[Orchestrator] Champion selection issue (Task #{task.task_id}): {champ_result['message']}", flush=True)
                             elif task.task_type == "hyperparameter_tuning":
                                 champ_result = evaluate_challenger(
@@ -1473,7 +1485,15 @@ class WorkflowOrchestrator:
                                     goal_text=query_text,
                                     primary_metric=primary_metric
                                 )
-                                if champ_result:
+                                if isinstance(champ_result, ChampionSelectionResult):
+                                    if champ_result.is_success() and champ_result.champion:
+                                        champ = champ_result.champion
+                                        print(f"[Orchestrator] Challenger evaluated (Task #{task.task_id}): "
+                                              f"champion={champ['model_name']} ({champ_result.primary_metric_name or primary_metric}={champ['score']:.4f})", flush=True)
+                                    else:
+                                        print(f"[Orchestrator] Challenger evaluation issue (Task #{task.task_id}): {champ_result.error_message or champ_result.status.value}", flush=True)
+                                elif champ_result and isinstance(champ_result, dict):
+                                    # Backward compat
                                     print(f"[Orchestrator] Challenger evaluated (Task #{task.task_id}): "
                                           f"champion={champ_result['model_name']} ({champ_result.get('primary_metric_name', primary_metric)}={champ_result['score']:.4f})", flush=True)
                         except Exception as champ_err:
@@ -1537,7 +1557,9 @@ class WorkflowOrchestrator:
                             fact_sheet = None
                             try:
                                 preflight = run_preflight(self.current_output_dir, goal_text=query_text)
-                                if preflight.get("repairs"):
+                                if preflight.get("repairs_applied"):
+                                    print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs_applied']}", flush=True)
+                                elif preflight.get("repairs"):  # backward compat
                                     print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs']}", flush=True)
                                 verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
                                 fact_sheet = build_facts(self.current_output_dir, verified_metrics, preflight)

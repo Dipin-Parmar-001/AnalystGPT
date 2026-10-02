@@ -19,6 +19,8 @@ import json
 import re
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
 
 from agents.logger import setup_logfire
 from agents.schema import ModelRegistry, ChampionModel, ModelEntry, ModelStatus, ModelStage, load_registry, save_registry, load_champion, save_champion
@@ -36,6 +38,56 @@ ASCENDING_METRICS = {"rmse", "mae", "mse", "log_loss"}
 
 _MODEL_NAME_KEYS = ["model", "algorithm", "name", "model_name"]
 _ARTIFACT_KEYS = ["model_artifact", "artifact", "artifact_filename", "model_file"]
+
+
+class ChampionSelectionStatus(Enum):
+    """Explicit status for champion selection results."""
+    SUCCESS = "success"
+    NO_COMPARISON_DATA = "no_comparison_data"
+    NO_VALID_CANDIDATES = "no_valid_candidates"
+    NO_VALID_ARTIFACT = "no_valid_artifact"
+    NO_METRIC_FOUND = "no_metric_found"
+    SAVE_FAILED = "save_failed"
+    REGISTRY_SYNC_FAILED = "registry_sync_failed"
+    EXCEPTION = "exception"
+
+
+@dataclass
+class ChampionSelectionResult:
+    """Structured result for champion selection to avoid None ambiguity."""
+    status: ChampionSelectionStatus
+    champion: Optional[Dict[str, Any]] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    stage: str = "selection"
+    candidate: Optional[str] = None
+    ranking: Optional[List[Dict[str, Any]]] = None
+    primary_metric_name: Optional[str] = None
+    _winner_metrics: Optional[Dict[str, float]] = None
+
+    def is_success(self) -> bool:
+        return self.status == ChampionSelectionStatus.SUCCESS
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "status": self.status.value,
+            "stage": self.stage,
+        }
+        if self.champion:
+            result["champion"] = self.champion
+        if self.error_code:
+            result["error_code"] = self.error_code
+        if self.error_message:
+            result["error_message"] = self.error_message
+        if self.candidate:
+            result["candidate"] = self.candidate
+        if self.ranking:
+            result["ranking"] = self.ranking
+        if self.primary_metric_name:
+            result["primary_metric_name"] = self.primary_metric_name
+        if self._winner_metrics:
+            result["_winner_metrics"] = self._winner_metrics
+        return result
 
 
 def _norm_metric_key(col: str) -> str:
@@ -237,12 +289,11 @@ def _update_registry_with_champion(output_dir: str, champ: Dict[str, Any], rows:
 
     matched = False
     for entry in registry.models:
-        is_champ = bool(champ_art) and _entry_art(entry) == champ_art
+        is_champ = bool(champ_art) and _entry_art(entry) == champ_art and not matched
         if is_champ:
             entry.status = ModelStatus.CHAMPION
             matched = True
         elif entry.status == ModelStatus.CHAMPION:
-            # Revert former champion to evaluated (completed evaluation)
             entry.status = ModelStatus.EVALUATED
 
     # Register champion artifact if not already registered
@@ -276,171 +327,123 @@ def select_initial_champion(
     output_dir: str,
     goal_text: str = "",
     primary_metric: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
+) -> ChampionSelectionResult:
     """Deterministically choose the best model from the run's comparison tables,
     rewrite champion_model.json, and mark the champion in model_registry.json.
 
     Called ONCE after the initial model comparison task completes.
 
-    Returns the champion record, or None when no comparison data exists.
+    Returns a ChampionSelectionResult with status, champion data, or error info.
     """
-    rows = _load_comparison_rows(output_dir)
-    if not rows:
-        return None
-
-    candidates = [r for r in rows if r["metrics"]]
-    if not candidates:
-        return None
-
-    metric = _pick_metric(candidates[0]["metrics"], goal_text, primary_metric)
-    if metric is None:
-        return None
-    ascending = metric in ASCENDING_METRICS
-    ranked = sorted(
-        candidates,
-        key=lambda r: r["metrics"].get(metric, float("inf") if ascending else float("-inf")),
-        reverse=not ascending,
-    )
-    winner = ranked[0]
-
-    champ = _build_champion_record(winner, metric, goal_text, output_dir, primary_metric)
-    if champ is None:
-        # No valid artifact - return error info
-        return {
-            "error": "no_valid_artifact",
-            "message": f"Champion candidate {winner['model']} has no valid artifact file on disk",
-            "candidate": winner["model"]
-        }
-
-    champ_path = os.path.join(output_dir, "champion_model.json")
     try:
-        # Validate with schema before saving
-        champion_model = ChampionModel(**champ)
-        save_champion(champion_model, champ_path)
-    except Exception as e:
-        print(f"[ChampionSelector] could not write champion_model.json: {e}")
-        return None
-
-    # Mark the champion in the model registry
-    _update_registry_with_champion(output_dir, champ, rows)
-
-    # Report ranking (also consumed for the near-tie warning)
-    champ["ranking"] = [
-        {"model": r["model"], "artifact": r.get("artifact"), metric: round(r["metrics"].get(metric, float("nan")), 6)}
-        for r in ranked[:5]
-    ]
-    champ["primary_metric_name"] = metric
-    champ["_winner_metrics"] = winner["metrics"]
-
-    if logfire:
-        logfire.info(
-            "Initial champion selected by code",
-            model=champ["model_name"],
-            artifact=champ.get("artifact_filename"),
-            metric=metric,
-            score=champ["score"],
-        )
-    return champ
-
-
-def evaluate_challenger(
-    output_dir: str,
-    goal_text: str = "",
-    primary_metric: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
-    """Compare current champion vs. the one tuned model (challenger).
-
-    Called AFTER each HPT task. Reads current champion from champion_model.json,
-    finds the challenger from tuned_model_comparison.csv, and returns whichever wins.
-
-    Returns the champion record (either retained or updated), or None on error.
-    """
-    # Load current champion
-    champ_path = os.path.join(output_dir, "champion_model.json")
-    current_champ = load_champion(champ_path)
-    if current_champ is None:
-        # No existing champion - fall back to initial selection
-        return select_initial_champion(output_dir, goal_text, primary_metric)
-
-    # Load comparison rows to find the challenger (p1/p2 from tuned_model_comparison.csv)
-    rows = _load_comparison_rows(output_dir)
-    if not rows:
-        return current_champ.dict()
-
-    # Find challenger rows (phase p1, p2, etc. from tuned_model_comparison.csv)
-    challengers = [r for r in rows if r.get("phase") != "p0" and r.get("source_file") == "tuned_model_comparison.csv"]
-    if not challengers:
-        return current_champ.dict()
-
-    # For now, assume single challenger per HPT run (the one just tuned)
-    # In future, could handle multiple by picking the best among them
-    challenger = challengers[0]
-
-    # Get metric from primary_metric or current champion
-    metric = primary_metric or current_champ.primary_metric
-    if metric not in challenger["metrics"] or metric not in current_champ.dict().get("_winner_metrics", {}):
-        # Fall back to goal-aware pick
-        metric = _pick_metric(challenger["metrics"], goal_text, primary_metric)
+        rows = _load_comparison_rows(output_dir)
+        if not rows:
+            return ChampionSelectionResult(ChampionSelectionStatus.NO_COMPARISON_DATA, error_code="NO_COMPARISON_DATA", error_message="No model comparison CSV files found", stage="load_data")
+        candidates = [row for row in rows if row["metrics"]]
+        if not candidates:
+            return ChampionSelectionResult(ChampionSelectionStatus.NO_VALID_CANDIDATES, error_code="NO_VALID_CANDIDATES", error_message="No candidates with metrics found")
+        metric = _pick_metric(candidates[0]["metrics"], goal_text, primary_metric)
         if metric is None:
-            return current_champ.dict()
-
-    ascending = metric in ASCENDING_METRICS
-    current_score = current_champ.score
-    challenger_score = challenger["metrics"].get(metric, float("inf") if ascending else float("-inf"))
-
-    # Determine winner
-    if (not ascending and challenger_score > current_score) or (ascending and challenger_score < current_score):
-        # Challenger wins
-        winner = challenger
-        basis = f"challenger {winner['model']} improved {metric.upper()} from {current_score:.6f} to {challenger_score:.6f}"
-    else:
-        # Current champion retained
-        winner = next(r for r in rows if r.get("artifact") == current_champ.artifact_filename or r["model"] == current_champ.model_name)
-        basis = f"current champion {current_champ.model_name} retained ({metric.upper()}={current_score:.6f} vs challenger {challenger_score:.6f})"
-
-    champ = _build_champion_record(winner, metric, goal_text, output_dir, primary_metric)
-    if champ is None:
-        # Challenger has no valid artifact - retain current
-        return current_champ.dict()
-
-    # Update champion_model.json
-    try:
-        champion_model = ChampionModel(**champ)
-        save_champion(champion_model, champ_path)
+            return ChampionSelectionResult(ChampionSelectionStatus.NO_METRIC_FOUND, error_code="NO_METRIC_FOUND", error_message="No suitable metric found")
+        ascending = metric in ASCENDING_METRICS
+        ranked = sorted(candidates, key=lambda row: row["metrics"].get(metric, float("inf") if ascending else float("-inf")), reverse=not ascending)
+        winner = ranked[0]
+        champ = _build_champion_record(winner, metric, goal_text, output_dir, primary_metric)
+        if champ is None:
+            return ChampionSelectionResult(ChampionSelectionStatus.NO_VALID_ARTIFACT, error_code="NO_VALID_ARTIFACT", error_message=f"Champion candidate {winner['model']} has no valid artifact", candidate=winner["model"])
+        champ_path = os.path.join(output_dir, "champion_model.json")
+        try:
+            save_champion(ChampionModel(**champ), champ_path)
+            verified = load_champion(champ_path)
+            if verified is None or verified.artifact_filename != champ.get("artifact_filename"):
+                raise ValueError("written champion does not match selected artifact")
+        except Exception as exc:
+            return ChampionSelectionResult(ChampionSelectionStatus.SAVE_FAILED, stage="verify_write", error_code="ARTIFACT_VERIFY_FAILED", error_message=str(exc), candidate=winner["model"])
+        registry_error = None
+        try:
+            _update_registry_with_champion(output_dir, champ, rows)
+        except Exception as exc:
+            registry_error = exc
+        champ["ranking"] = [{"model": row["model"], "artifact": row.get("artifact"), metric: round(row["metrics"].get(metric, float("nan")), 6)} for row in ranked[:5]]
+        champ["primary_metric_name"] = metric
+        champ["_winner_metrics"] = winner["metrics"]
+        result = ChampionSelectionResult(ChampionSelectionStatus.SUCCESS, champ, stage="registry_sync" if registry_error else "completed", ranking=champ["ranking"], primary_metric_name=metric, _winner_metrics=winner["metrics"])
+        if registry_error:
+            result.error_code = "REGISTRY_SYNC_FAILED"
+            result.error_message = f"Champion selected and saved, but registry sync failed: {registry_error}"
+        return result
     except Exception as e:
-        print(f"[ChampionSelector] could not write champion_model.json: {e}")
-        return None
-
-    # Update registry
-    _update_registry_with_champion(output_dir, champ, rows)
-
-    # Ranking for reporting
-    all_candidates = [r for r in rows if r["metrics"]]
-    ranked = sorted(
-        all_candidates,
-        key=lambda r: r["metrics"].get(metric, float("inf") if ascending else float("-inf")),
-        reverse=not ascending,
-    )
-    champ["ranking"] = [
-        {"model": r["model"], "artifact": r.get("artifact"), metric: round(r["metrics"].get(metric, float("nan")), 6)}
-        for r in ranked[:5]
-    ]
-    champ["primary_metric_name"] = metric
-    champ["_winner_metrics"] = winner["metrics"]
-
-    if logfire:
-        logfire.info(
-            "Challenger evaluated",
-            model=champ["model_name"],
-            artifact=champ.get("artifact_filename"),
-            metric=metric,
-            score=champ["score"],
-            changed=champ["model_name"] != current_champ.model_name
+        print(f"[ChampionSelector] unhandled exception during select_initial_champion: {e}")
+        return ChampionSelectionResult(
+            status=ChampionSelectionStatus.EXCEPTION,
+            stage="initial_selection",
+            error_code="SELECTION_EXCEPTION",
+            error_message=f"Exception during champion selection: {e}"
         )
-    return champ
 
+
+def evaluate_challenger(output_dir: str, goal_text: str = "", primary_metric: Optional[str] = None) -> ChampionSelectionResult:
+    """Evaluate the latest tuned challenger against the persisted champion."""
+    try:
+        champ_path = os.path.join(output_dir, "champion_model.json")
+        current = load_champion(champ_path)
+        if current is None:
+            return select_initial_champion(output_dir, goal_text, primary_metric)
+        rows = _load_comparison_rows(output_dir)
+        challengers = [r for r in rows if r.get("phase") != "p0" and r.get("source_file") == "tuned_model_comparison.csv"]
+        if not challengers:
+            return ChampionSelectionResult(ChampionSelectionStatus.SUCCESS, champion=current.dict(), primary_metric_name=current.primary_metric)
+        challenger = max(challengers, key=lambda r: int(r.get("phase", "p0")[1:]) if r.get("phase", "p0")[1:].isdigit() else 0)
+        metric = primary_metric or current.primary_metric
+        if metric not in challenger["metrics"]:
+            metric = _pick_metric(challenger["metrics"], goal_text, primary_metric)
+        if metric is None:
+            return ChampionSelectionResult(ChampionSelectionStatus.NO_METRIC_FOUND, champion=current.dict(), error_code="NO_METRIC_FOUND", error_message="No comparable metric found", stage="challenger")
+        ascending = metric in ASCENDING_METRICS
+        current_score = current.score
+        challenger_score = challenger["metrics"].get(metric, float("inf") if ascending else float("-inf"))
+        challenger_wins = challenger_score < current_score if ascending else challenger_score > current_score
+        if challenger_wins:
+            winner = challenger
+        else:
+            winner = next((r for r in rows if r.get("artifact") == current.artifact_filename or r["model"] == current.model_name), None)
+            if winner is None:
+                return ChampionSelectionResult(ChampionSelectionStatus.NO_VALID_CANDIDATES, champion=current.dict(), error_code="CURRENT_CHAMPION_NOT_IN_COMPARISON", error_message="Current champion has no comparison row", stage="challenger")
+        champ = _build_champion_record(winner, metric, goal_text, output_dir, primary_metric)
+        if champ is None:
+            return ChampionSelectionResult(ChampionSelectionStatus.SUCCESS, champion=current.dict(), primary_metric_name=current.primary_metric)
+        try:
+            save_champion(ChampionModel(**champ), champ_path)
+            saved = load_champion(champ_path)
+            if saved is None or saved.artifact_filename != champ.get("artifact_filename"):
+                raise ValueError("written champion does not match selected artifact")
+        except Exception as exc:
+            return ChampionSelectionResult(ChampionSelectionStatus.SAVE_FAILED, stage="verify_write", error_code="ARTIFACT_VERIFY_FAILED", error_message=str(exc))
+        registry_error = None
+        try:
+            _update_registry_with_champion(output_dir, champ, rows)
+        except Exception as exc:
+            registry_error = exc
+        ranked = sorted([r for r in rows if r["metrics"]], key=lambda r: r["metrics"].get(metric, float("inf") if ascending else float("-inf")), reverse=not ascending)
+        champ["ranking"] = [{"model": r["model"], "artifact": r.get("artifact"), metric: round(r["metrics"].get(metric, float("nan")), 6)} for r in ranked[:5]]
+        champ["primary_metric_name"] = metric
+        champ["_winner_metrics"] = winner["metrics"]
+        result = ChampionSelectionResult(ChampionSelectionStatus.SUCCESS, champion=champ, stage="registry_sync" if registry_error else "completed", ranking=champ["ranking"], primary_metric_name=metric, _winner_metrics=winner["metrics"])
+        if registry_error:
+            result.error_code = "REGISTRY_SYNC_FAILED"
+            result.error_message = f"Champion selected and saved, but registry sync failed: {registry_error}"
+        return result
+    except Exception as exc:
+        return ChampionSelectionResult(ChampionSelectionStatus.EXCEPTION, stage="evaluate_challenger", error_code="SELECTION_EXCEPTION", error_message=f"Exception during challenger evaluation: {exc}")
 
 # Backward compatibility
 def select_champion(output_dir: str, goal_text: str = "") -> Optional[Dict[str, Any]]:
-    """Legacy function - calls select_initial_champion for backward compatibility."""
-    return select_initial_champion(output_dir, goal_text)
+    """Legacy function - calls select_initial_champion for backward compatibility.
+
+    Returns the champion dict if successful, None otherwise.
+    For new code, use select_initial_champion which returns ChampionSelectionResult.
+    """
+    result = select_initial_champion(output_dir, goal_text)
+    if result.is_success() and result.champion:
+        return result.champion
+    return None

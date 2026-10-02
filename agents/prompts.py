@@ -1460,7 +1460,9 @@ skipped — do not skip it silently.
    present, also state the flagged volume: how many of the N test customers are predicted
    positive (count and %) and how many customers are contacted per true positive caught
    (N_flagged / TP).
-4. Save `threshold_analysis.json` with, at minimum: `default_threshold`, `default_metrics`,
+4. Save `threshold_analysis.json` with, at minimum: `model_artifact` (exact filename from
+   `champion_model.json["artifact_filename"]`), `model_id` (artifact basename without `.pkl`),
+   `default_threshold`, `default_metrics`,
    `recommended_threshold`, `recommended_metrics`, `selection_rationale`, and the full
    `precision_recall_curve` sample points used to choose it (or a reference to
    `predictions.csv` columns that allow it to be reconstructed).
@@ -2556,8 +2558,11 @@ Selection, Selected Best Model Performance, Key Predictive Drivers & Directional
 - Present the key predictive drivers as two separately ranked lists: factors that increase the outcome
   ({{drivers_increasing_outcome}}) and factors that reduce it ({{drivers_reducing_outcome}}). Never mix
   them into one list. If no FACT_SHEET is provided, build the two lists from `feature_importance.csv`.
+- Treat threshold analysis as applicable to the champion only when its `model_artifact` exactly
+  matches `champion_model.json["artifact_filename"]`. If it is missing or differs, do not report its
+  operating points for the champion; state the preflight mismatch warning when present.
 - If `ml_summary.json` (or the latest `ml_summary_task_*.json`) contains a `threshold_analysis` block
-  with `applicable: true`, report BOTH the default-threshold and recommended-threshold metrics side by
+  with `applicable: true` and matching champion artifact identity, report BOTH the default-threshold and recommended-threshold metrics side by
   side (never only the default) and state the `selection_rationale` verbatim from that block. For each
   operating point, give the flagged volume and contacts-per-true-positive from the FACT_SHEET blank
   ({{contacts_per_true_positive}}), from `threshold_analysis.json`, or computed under the derivation rule

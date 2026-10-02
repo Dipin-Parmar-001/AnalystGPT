@@ -1,10 +1,9 @@
-1. the agent sometimes while compare the current model performance it is comparing with the parent model then sometimes it reconstructing that parent model with assumption which cause the mismatch between the actual parent model and the new reconstructed parent model. fix it via strict prompt instructions.
+here are the fixes need to be fixed before going to the real world deployemnet:
 
-2. the agent does not saving all the version of the model. when comparing by HPT that the model was improved or not then it is just updating the best_model.pkl and just updating the versioning name on the artifacts or summaries and etc. but not actually save that updated model eg. logistic_regrassion_p1.pkl not save that just update the versions name. fix it via strict instructions on the prompt.
-
-3. as the model updates the best model but it does not updating the champion artifact so prompt it strictly for update all the related artifacts according the improvement or not.
-
-4. prompt it for strict rules that manages dont make contradictions like once not updated the best model but updating the artifacts by saying that the best model was updated.
-
-5. must aligning that all the artifacts supports the same information no contradiction like some artifacts says updated and some not updated. all must match the correct and same info.
-
+1. required files needs to be selected or written by planner agent as per the task
+2. the verification gates should also be selected by planner or be careful about the user interaction
+3. also display the selected key-metrics on the dashboard or ui
+4. the maximum number of rows may be caped with strict limit like 100000 so check for that.
+5. planner should have option to ask the user or explicitely block the plan and empty plan gives only notes should also be shown in the dashboard not to fail silently.
+6. the planner may producing deliverables but we are may be not using thems
+7. shift from all local calculation and buildings from sandbox

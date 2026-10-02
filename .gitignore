@@ -79,6 +79,7 @@ scratch/*
 backend/scratch/*
 !backend/scratch/.gitkeep
 **/scratch/*
+!scratch/test_champion_preflight_regressions.py
 
 uploads/*
 !uploads/.gitkeep
