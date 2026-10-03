@@ -695,6 +695,7 @@ class WorkflowOrchestrator:
                     user_query=user_query,
                     dataset_context=dataset_context,
                     max_tool_calls_per_task=max_tool_calls_per_task,
+                    step_callback=step_callback,
                     cancellation_token=cancellation_token
                 )
         rec.add_duration("plan_creation_time_s", time.perf_counter() - plan_t0)
@@ -741,6 +742,7 @@ class WorkflowOrchestrator:
                 updated_plan = self.planner_agent.modify_plan(
                     target_plan,
                     modification_prompt,
+                    step_callback=step_callback,
                     cancellation_token=cancellation_token
                 )
         self.current_plan = updated_plan

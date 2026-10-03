@@ -78,6 +78,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC, build_verified_metrics
 from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT, REPORT_REPAIR_PROMPT, resolve_budget_placeholders
 from agents.memory_manager import MessageHistoryManager, sanitize_messages, convert_to_plain_chat
+from agents.portkey_routing import create_with_thinking_route, extract_reasoning_text
 from agents.planner_agent import ExecutionPlan
 from agents.cancellation import CancellationToken, WorkflowCancelledException
 from agents.numeric_verifier import verify_report_numbers, attach_verification_warning
@@ -239,7 +240,7 @@ class ReporterAgent:
             delays = [10, 20, 30]
             for attempt, delay in enumerate(delays + [0]):
                 try:
-                    response = self.client.chat.completions.create(**kwargs)
+                    response = create_with_thinking_route(self.client, **kwargs)
                     message = response.choices[0].message
 
                     # Check for fragmented or unparsable response (token usage metadata, etc.)
@@ -281,7 +282,7 @@ class ReporterAgent:
                         if effective_tools:
                             fallback_kwargs["tools"] = effective_tools
                         try:
-                            fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            fallback_resp = create_with_thinking_route(self.client, **fallback_kwargs)
                             self._plain_chat_mode = True
                             return fallback_resp.choices[0].message
                         except Exception as fallback_err:
@@ -483,9 +484,15 @@ class ReporterAgent:
 
             thought = assistant_msg.content or ""
             tool_calls = assistant_msg.tool_calls or []
+            reasoning = extract_reasoning_text(assistant_msg)
 
-            if thought:
-                _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
+            if thought or reasoning:
+                _safe_callback("llm_thought", {
+                    "agent": self.agent_name,
+                    "turn": turn,
+                    "thought": thought,
+                    "reasoning": reasoning,
+                })
 
             msg_dict: Dict[str, Any] = {"role": "assistant"}
             if assistant_msg.content:
@@ -859,6 +866,15 @@ class ReporterAgent:
             assistant_msg = self._call_llm(memory_manager.messages, tools=self.tool_manager.get_tool_specs())
             thought = assistant_msg.content or ""
             tool_calls = assistant_msg.tool_calls or []
+            reasoning = extract_reasoning_text(assistant_msg)
+
+            if thought or reasoning:
+                _safe_callback("llm_thought", {
+                    "agent": self.agent_name,
+                    "turn": turn,
+                    "thought": thought,
+                    "reasoning": reasoning,
+                })
 
             msg_dict: Dict[str, Any] = {"role": "assistant"}
             if assistant_msg.content:

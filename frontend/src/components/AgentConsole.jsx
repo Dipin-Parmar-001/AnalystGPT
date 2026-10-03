@@ -114,9 +114,22 @@ export default function AgentConsole({ events, isRunning }) {
                     </span>
                     <span className="text-walnut-mute text-[10px]">{timestamp}</span>
                   </div>
-                  <p className="text-walnut-text/90 whitespace-pre-wrap font-sans text-[13px] leading-relaxed">
-                    {data.thought}
-                  </p>
+                  {data.reasoning && (
+                    <div className="mb-2">
+                      <div className="text-[10px] uppercase tracking-wide text-accent mb-1">Model reasoning</div>
+                      <p className="text-walnut-text/90 whitespace-pre-wrap font-sans text-[13px] leading-relaxed">
+                        {data.reasoning}
+                      </p>
+                    </div>
+                  )}
+                  {data.thought && (
+                    <div>
+                      {data.reasoning && <div className="text-[10px] uppercase tracking-wide text-walnut-mute mb-1">Response</div>}
+                      <p className="text-walnut-text/90 whitespace-pre-wrap font-sans text-[13px] leading-relaxed">
+                        {data.thought}
+                      </p>
+                    </div>
+                  )}
                 </div>
               );
             }

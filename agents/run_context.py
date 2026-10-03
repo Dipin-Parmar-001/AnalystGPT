@@ -35,6 +35,7 @@ DATASET_LIFECYCLE = [
 ]
 
 _PROFILE_FILENAME = "dataset_profile.json"
+MAX_PROFILE_ROWS = 10_000_000
 
 
 def _profile_one_csv(path: str) -> Optional[Dict[str, Any]]:
@@ -42,7 +43,9 @@ def _profile_one_csv(path: str) -> Optional[Dict[str, Any]]:
     try:
         import pandas as pd
 
-        df = pd.read_csv(path, nrows=100000)
+        # Profiles must cover large uploads too; nrows here is a hard cap and
+        # previously made every dataset over 100k rows report a false shape.
+        df = pd.read_csv(path, nrows=MAX_PROFILE_ROWS)
         rows = int(df.shape[0])
         cols = int(df.shape[1])
         missing_cells = int(df.isna().sum().sum())

@@ -3,7 +3,6 @@ here are the fixes need to be fixed before going to the real world deployemnet:
 1. required files needs to be selected or written by planner agent as per the task
 2. the verification gates should also be selected by planner or be careful about the user interaction
 3. also display the selected key-metrics on the dashboard or ui
-4. the maximum number of rows may be caped with strict limit like 100000 so check for that.
 5. planner should have option to ask the user or explicitely block the plan and empty plan gives only notes should also be shown in the dashboard not to fail silently.
-6. the planner may producing deliverables but we are may be not using thems
+6. the planner may producing deliverables but we are may be not using them
 7. shift from all local calculation and buildings from sandbox

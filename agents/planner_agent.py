@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.cancellation import CancellationToken, WorkflowCancelledException
 from agents.memory_manager import sanitize_messages
+from agents.portkey_routing import create_with_thinking_route, extract_reasoning_text
 
 
 try:
@@ -523,6 +524,7 @@ class PlannerAgent:
         dataset_context: Optional[str] = None,
         custom_agents: Optional[List[str]] = None,
         max_tool_calls_per_task: Optional[int] = None,
+        step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> ExecutionPlan:
         """
@@ -563,11 +565,12 @@ class PlannerAgent:
 
                     try:
 
-                        response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=0.2
-                )
+                        response = create_with_thinking_route(
+                            self.client,
+                            model=self.model_name,
+                            messages=messages,
+                            temperature=0.2,
+                        )
 
                         break
 
@@ -588,7 +591,18 @@ class PlannerAgent:
                     cancellation_token.check_cancelled(step_name="PlannerAgent after LLM plan generation")
 
                 # 1. Parse initial plan
-                raw_content = response.choices[0].message.content
+                response_message = response.choices[0].message
+                raw_content = response_message.content or ""
+                if step_callback and (raw_content or extract_reasoning_text(response_message)):
+                    try:
+                        step_callback("llm_thought", {
+                            "agent": "PlannerAgent",
+                            "turn": 1,
+                            "thought": raw_content.strip(),
+                            "reasoning": extract_reasoning_text(response_message),
+                        })
+                    except Exception:
+                        pass
                 parsed = _extract_json(raw_content)
 
                 selected_agents = parsed.get("selected_agents", [self.available_agents[0]])
@@ -648,10 +662,11 @@ class PlannerAgent:
 
                         for llm_attempt, delay in enumerate(delays + [0]):
                             try:
-                                retry_resp = self.client.chat.completions.create(
+                                retry_resp = create_with_thinking_route(
+                                    self.client,
                                     model=self.model_name,
                                     messages=sanitize_messages(current_messages),
-                                    temperature=0.2
+                                    temperature=0.2,
                                 )
                                 break
                             except Exception as err:
@@ -662,7 +677,18 @@ class PlannerAgent:
                                     continue
                                 raise err
                             
-                        retry_raw = retry_resp.choices[0].message.content
+                        retry_message = retry_resp.choices[0].message
+                        retry_raw = retry_message.content or ""
+                        if step_callback and (retry_raw or extract_reasoning_text(retry_message)):
+                            try:
+                                step_callback("llm_thought", {
+                                    "agent": "PlannerAgent",
+                                    "turn": attempt + 1,
+                                    "thought": retry_raw.strip(),
+                                    "reasoning": extract_reasoning_text(retry_message),
+                                })
+                            except Exception:
+                                pass
                         current_messages.append({"role": "assistant", "content": retry_raw})
                         retry_parsed = _extract_json(retry_raw)
 
@@ -752,6 +778,7 @@ class PlannerAgent:
         self,
         current_plan: ExecutionPlan,
         modification_prompt: str,
+        step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> ExecutionPlan:
         """
@@ -782,11 +809,12 @@ class PlannerAgent:
 
                 try:
 
-                    response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.2
-            )
+                    response = create_with_thinking_route(
+                        self.client,
+                        model=self.model_name,
+                        messages=messages,
+                        temperature=0.2,
+                    )
 
                     break
 
@@ -805,7 +833,18 @@ class PlannerAgent:
                     raise err
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name="PlannerAgent after plan modification")
-            raw_content = response.choices[0].message.content
+            response_message = response.choices[0].message
+            raw_content = response_message.content or ""
+            if step_callback and (raw_content or extract_reasoning_text(response_message)):
+                try:
+                    step_callback("llm_thought", {
+                        "agent": "PlannerAgent",
+                        "turn": 1,
+                        "thought": raw_content.strip(),
+                        "reasoning": extract_reasoning_text(response_message),
+                    })
+                except Exception:
+                    pass
             parsed = _extract_json(raw_content)
 
             selected_agents = parsed.get("selected_agents", current_plan.selected_agents)
