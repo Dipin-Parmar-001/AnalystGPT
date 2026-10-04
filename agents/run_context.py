@@ -38,14 +38,84 @@ _PROFILE_FILENAME = "dataset_profile.json"
 MAX_PROFILE_ROWS = 10_000_000
 
 
-def _profile_one_csv(path: str) -> Optional[Dict[str, Any]]:
+def _declared_artifact_grains(output_dir: str) -> Dict[str, str]:
+    """Collect explicitly declared row grains for artifacts from run summaries."""
+    grains: Dict[str, str] = {}
+    try:
+        summary_paths = [
+            os.path.join(output_dir, name) for name in os.listdir(output_dir)
+            if name.lower().endswith(".json") and "summary" in name.lower()
+        ]
+    except OSError:
+        return grains
+
+    for path in summary_paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                summary = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(summary, dict):
+            continue
+
+        row_grain = summary.get("row_grain")
+        input_grain = summary.get("input_grain")
+        output_grain = summary.get("output_grain")
+        if isinstance(row_grain, dict):
+            input_grain = input_grain or row_grain.get("input")
+            output_grain = output_grain or row_grain.get("output")
+        elif isinstance(row_grain, str):
+            output_grain = output_grain or row_grain
+        input_file = summary.get("source_file") or summary.get("input_file")
+        if input_file and input_grain:
+            grains[os.path.basename(str(input_file)).lower()] = str(input_grain)
+        output_file = summary.get("output_file")
+        if output_file and output_grain:
+            grains[os.path.basename(str(output_file)).lower()] = str(output_grain)
+
+        # For multi-output tasks, require a parallel explicit output_grains map;
+        # output role names alone are not evidence of a row grain.
+        output_files = summary.get("output_files")
+        output_grains = summary.get("output_grains")
+        if isinstance(output_files, dict) and isinstance(output_grains, dict):
+            for role, filename in output_files.items():
+                grain = output_grains.get(role)
+                if filename and grain:
+                    grains[os.path.basename(str(filename)).lower()] = str(grain)
+
+        declared_outputs = summary.get("outputs") or summary.get("artifacts")
+        if isinstance(declared_outputs, list):
+            for item in declared_outputs:
+                if not isinstance(item, dict):
+                    continue
+                filename = item.get("filename") or item.get("file")
+                grain = item.get("row_grain") or item.get("grain")
+                if filename and grain:
+                    grains[os.path.basename(str(filename)).lower()] = str(grain)
+    return grains
+
+
+def _read_profile_csv(path: str, nrows: int = MAX_PROFILE_ROWS):
+    """Read common CSV encodings in a deterministic order; return frame + encoding."""
+    import pandas as pd
+
+    errors = []
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, nrows=nrows, encoding=encoding), encoding
+        except UnicodeDecodeError as exc:
+            errors.append(f"{encoding}: {exc}")
+    raise UnicodeError("CSV decode failed for supported encodings: " + "; ".join(errors))
+
+
+def _profile_one_csv(path: str, declared_grain: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Computes rows/cols/column list/missing summary for one CSV file."""
     try:
         import pandas as pd
 
         # Profiles must cover large uploads too; nrows here is a hard cap and
         # previously made every dataset over 100k rows report a false shape.
-        df = pd.read_csv(path, nrows=MAX_PROFILE_ROWS)
+        df, encoding = _read_profile_csv(path)
         rows = int(df.shape[0])
         cols = int(df.shape[1])
         missing_cells = int(df.isna().sum().sum())
@@ -57,6 +127,8 @@ def _profile_one_csv(path: str) -> Optional[Dict[str, Any]]:
             "columns": [str(c) for c in df.columns],
             "missing_cells": missing_cells,
             "duplicate_rows": duplicate_rows,
+            "encoding": encoding,
+            "row_grain": declared_grain or "undeclared",
         }
     except Exception as e:
         return {"file": os.path.basename(path), "error": f"Failed to profile: {e}"}
@@ -106,6 +178,7 @@ def build_dataset_profile(
     profile: Dict[str, Any] = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "datasets": {},
+        "derived_artifacts": {},
         "engineered_features": [],
         "current_dataset": None,
         "notes": [],
@@ -114,10 +187,11 @@ def build_dataset_profile(
     if logfire:
         logfire.info("RunContext: building dataset profile", output_dir=output_dir, persist=persist)
     raw_path = _find_raw_dataset(output_dir, uploaded_files)
+    declared_grains = _declared_artifact_grains(output_dir)
     if raw_path:
         ext = os.path.splitext(raw_path)[1].lower()
         if ext == ".csv":
-            raw_profile = _profile_one_csv(raw_path)
+            raw_profile = _profile_one_csv(raw_path, declared_grains.get(os.path.basename(raw_path).lower()))
             # Sanity guard: a genuine raw upload can never have fewer rows than
             # the cleaned dataset (cleaning only removes rows), so a "raw"
             # profile with fewer rows is a misidentified pipeline artifact
@@ -127,7 +201,7 @@ def build_dataset_profile(
             for _name in DATASET_LIFECYCLE:
                 _p = os.path.join(output_dir, _name)
                 if os.path.exists(_p):
-                    _cleaned_probe = _profile_one_csv(_p)
+                    _cleaned_probe = _profile_one_csv(_p, declared_grains.get(os.path.basename(_p).lower()))
                     break
             if (
                 _cleaned_probe
@@ -153,7 +227,22 @@ def build_dataset_profile(
         path = os.path.join(output_dir, name)
         if os.path.exists(path):
             key = "feature_engineered" if name == "feature_engineered_dataset.csv" else "cleaned"
-            profile["datasets"][key] = _profile_one_csv(path)
+            profile["datasets"][key] = _profile_one_csv(path, declared_grains.get(name.lower()))
+
+    # Profile other run-produced CSVs too, but keep them separate from the
+    # lifecycle pointer: invoice/customer/cluster outputs are valid shapes at
+    # different grains and must not become the downstream training dataset by
+    # filename accident.
+    lifecycle_names = {name.lower() for name in DATASET_LIFECYCLE}
+    try:
+        for name in sorted(os.listdir(output_dir)):
+            if not name.lower().endswith(".csv") or name.lower() in lifecycle_names:
+                continue
+            path = os.path.join(output_dir, name)
+            if os.path.isfile(path):
+                profile["derived_artifacts"][name] = _profile_one_csv(path, declared_grains.get(name.lower()))
+    except OSError:
+        pass
 
     # Engineered features = columns present in FE dataset but not in cleaned one.
     fe = profile["datasets"].get("feature_engineered")
@@ -170,13 +259,6 @@ def build_dataset_profile(
             break
     if profile["current_dataset"] is None and profile["datasets"].get("raw"):
         profile["current_dataset"] = profile["datasets"]["raw"].get("file")
-
-    if cleaned and fe:
-        if fe.get("rows") != cleaned.get("rows"):
-            profile["notes"].append(
-                f"Row count changed between cleaned ({cleaned.get('rows')}) and "
-                f"feature-engineered ({fe.get('rows')}) datasets."
-            )
 
     if persist:
         try:

@@ -1,49 +1,31 @@
 """Portkey request routing helpers shared by the planner and reporter."""
 
-import json
+import os
 from typing import Any, Dict
 
 
-THINKING_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504],
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.1,
-                "max_tokens": 16384,
-                "extra_body": {
-                    "chat_template_kwargs": {"enable_thinking": True}
-                },
-            },
-        }
-    ]
-}
-
-
 def create_with_thinking_route(client: Any, **request_params: Any) -> Any:
-    """Try the dedicated Nvidia thinking route, then the client's normal route.
-
-    The client's default Portkey header remains intact for fallback, including
-    deployments that use PORTKEY_CONFIG_ID instead of the inline config.
-    """
-    try:
-        return client.chat.completions.create(
-            **request_params,
-            extra_headers={
-                "x-portkey-config": json.dumps(THINKING_PORTKEY_CONFIG)
-            },
-        )
-    except Exception as primary_error:
-        print(
-            "[Portkey] Dedicated Nvidia thinking route failed; "
-            f"retrying with the configured fallback route: {primary_error}"
-        )
-        return client.chat.completions.create(**request_params)
+    """Use the dedicated Nvidia route without sending an inline Portkey config."""
+    params = dict(request_params)
+    params["model"] = "nvidia/nemotron-3-ultra-550b-a55b"
+    params["extra_body"] = {
+        **(params.get("extra_body") or {}),
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    headers = dict(params.get("extra_headers") or {})
+    # Portkey blocks inline configs on many workspaces. Prefer the dedicated
+    # saved config slug, then the workspace's configured saved slug; direct
+    # virtual-key routing is available when no saved slug is configured.
+    config_slug = (os.getenv("PORTKEY_NVIDIA_CONFIG_ID") or
+                   os.getenv("PORTKEY_THINKING_CONFIG_ID") or
+                   os.getenv("PORTKEY_CONFIG_ID"))
+    if config_slug:
+        headers["x-portkey-config"] = config_slug
+        headers.pop("x-portkey-virtual-key", None)
+    else:
+        headers["x-portkey-virtual-key"] = "analystgpt-nvidia"
+    params["extra_headers"] = headers
+    return client.chat.completions.create(**params)
 
 
 def extract_reasoning_text(message: Any) -> str:

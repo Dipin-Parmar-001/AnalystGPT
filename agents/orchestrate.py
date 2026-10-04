@@ -498,6 +498,7 @@ class WorkflowOrchestrator:
                 profile_block=profile_block,
                 max_tool_calls=5,
                 cancellation_token=self.cancellation_token,
+                step_callback=step_callback,
             )
 
             if not corrected or corrected == self.final_report:

@@ -43,47 +43,6 @@ load_dotenv()
 PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
 PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        }
-    ]
-}
-
 from agents.prompts import PLANNER_AGENT, PLANNER_SYSTEM_PROMPT, PLANNER_MODIFY_PROMPT
 
 DEFAULT_AVAILABLE_AGENTS = [
@@ -105,6 +64,12 @@ class PlanStatus(str, Enum):
 def infer_task_type(title: str = "", description: str = "", assigned_agent: str = "") -> str:
     """Infers task_type from task title, description, and assigned agent."""
     combined = f"{title} {description} {assigned_agent}".lower()
+    if any(term in combined for term in (
+        "unsupervised", "clustering", "cluster analysis", "segmentation",
+        "anomaly detection", "outlier detection", "dimensionality reduction",
+        "isolation forest", "local outlier factor", "dbscan", "kmeans", "k-means", "umap", "pca",
+    )):
+        return "unsupervised_analysis"
     if "feature_engineering" in combined or "feature engineering" in combined or "engineer feature" in combined or "derived feature" in combined:
         return "feature_engineering"
     if "hyperparameter_tuning" in combined or "hyperparameter tuning" in combined or "hyperparameter" in combined or "tuning" in combined or "hpt" in combined:
@@ -130,7 +95,7 @@ class TaskItem:
     title: str = ""
     description: str = ""
     assigned_agent: str = "DataAnalystAgent"
-    task_type: Optional[str] = None  # cleaning, feature_engineering, stats_and_viz, model_comparison, hyperparameter_tuning, report
+    task_type: Optional[str] = None  # cleaning, feature_engineering, stats_and_viz, model_comparison, unsupervised_analysis, hyperparameter_tuning, report
     status: str = "pending"  # pending, in_progress, completed, failed, skipped, cancelled
     expected_output: str = ""
     depends_on: List[Any] = field(default_factory=list)
@@ -227,7 +192,11 @@ def validate_plan_prerequisites(plan: ExecutionPlan) -> tuple[bool, list[str], d
 
     tasks = plan.tasks
     cleaning_indices = [i for i, t in enumerate(tasks) if t.task_type == "cleaning" or "clean" in t.title.lower()]
-    model_indices = [i for i, t in enumerate(tasks) if t.task_type == "model_comparison" or ("model" in t.title.lower() and "tuning" not in t.title.lower())]
+    model_indices = [
+        i for i, t in enumerate(tasks)
+        if t.task_type != "unsupervised_analysis"
+        and (t.task_type == "model_comparison" or ("model" in t.title.lower() and "tuning" not in t.title.lower()))
+    ]
 
     # 1. Feature Engineering Check
     for idx, t in enumerate(tasks):
@@ -277,6 +246,7 @@ def reorder_plan_tasks(plan: ExecutionPlan) -> ExecutionPlan:
         "feature_engineering": 20,
         "stats_and_viz": 30,
         "model_comparison": 40,
+        "unsupervised_analysis": 40,
         "hyperparameter_tuning": 50,
         "report": 60
     }
@@ -346,7 +316,7 @@ def reorder_plan_tasks(plan: ExecutionPlan) -> ExecutionPlan:
             if not task.expected_output:
                 task.expected_output = "analyst_summary.json"
 
-        elif task.task_type == "model_comparison":
+        elif task.task_type in {"model_comparison", "unsupervised_analysis"}:
             if fe_new_id and fe_new_id not in remapped_deps:
                 remapped_deps.append(fe_new_id)
             elif cleaning_new_id and cleaning_new_id not in remapped_deps:
@@ -354,7 +324,11 @@ def reorder_plan_tasks(plan: ExecutionPlan) -> ExecutionPlan:
             task.depends_on = sorted(list(set([d for d in remapped_deps if d < task.task_id])))
             task.inputs = [current_dataset_after_fe]
             if not task.expected_output:
-                task.expected_output = "model_comparison.csv, best_model.pkl, ml_summary.json, predictions.csv, feature_importance.csv"
+                task.expected_output = (
+                    "unsupervised_metrics.json, unsupervised_summary.json, ml_summary.json"
+                    if task.task_type == "unsupervised_analysis"
+                    else "model_comparison.csv, best_model.pkl, ml_summary.json, predictions.csv, feature_importance.csv"
+                )
 
         elif task.task_type == "hyperparameter_tuning":
             if model_new_id and model_new_id not in remapped_deps:
@@ -487,22 +461,17 @@ class PlannerAgent:
 
         setup_logfire()
 
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
+        # create_with_thinking_route applies a saved config slug or Nvidia
+        # virtual key per request. Do not attach an inline fallback config to
+        # client defaults; Portkey rejects it when block_inline_config is on.
+        headers = {"x-portkey-api-key": PORTKEY_API_KEY}
         if PORTKEY_CONFIG_ID:
             if HAS_LOGFIRE:
                 logfire.info("PlannerAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
             else:
                 print(f"[PlannerAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("[PlannerAgent Setup] PORTKEY_CONFIG_ID not found. Using fallback config.")
-            else:
-                print("[PlannerAgent Setup] WARNING: PORTKEY_CONFIG_ID not found. Using fallback config.")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
+        elif HAS_LOGFIRE:
+            logfire.info("PlannerAgent will route through the configured Nvidia virtual key")
 
         self.client = OpenAI(
             base_url="https://api.portkey.ai/v1",

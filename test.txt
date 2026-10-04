@@ -1,13 +1,14 @@
-I have uploaded a telecom customer churn dataset and I want to build a useful churn prediction solution from it.
-
-First, understand the dataset and figure out what customer characteristics and service-related factors are most associated with customers leaving the company. Look at things like customer demographics, contract type, tenure, internet and payment methods, monthly charges, total charges, and the other available variables.
-
-Before building any models, check the data carefully for missing or invalid values, duplicates, incorrect data types, unusual values, and class imbalance. I want the analysis to be based only on the uploaded dataset, so please do not create or assume a replacement dataset if there is any problem reading or processing the file.
-
-Then perform appropriate preprocessing and feature engineering. Build a few different classification models that would be reasonable for predicting churn and compare their performance. Since identifying customers who are actually going to churn is important, don't rely only on accuracy—include suitable metrics such as precision, recall, F1-score, ROC-AUC, and a confusion matrix.
-
-After comparing the models, select the strongest candidate and perform hyperparameter tuning to see whether its performance can be improved. Make sure the evaluation is done properly using a holdout/test set and avoid any data leakage during preprocessing, feature engineering, or tuning.
-
-Finally, give me a practical final report explaining the major churn patterns you found, the most important predictors, how the models performed, which model you recommend, and what the business could potentially do with the predictions to reduce customer churn.
-
-Please keep all conclusions tied to the actual uploaded data and results produced by the analysis. Do not invent values, observations, model results, or datasets.
+Perform a comprehensive analysis of this online retail transaction dataset.
+First, inspect and validate the dataset, identify important data-quality issues, cancellations/returns, missing values, duplicates, and potential outliers. Make cleaning decisions based on the business meaning of the data rather than blindly removing unusual observations.
+Perform exploratory and business analysis covering sales performance, customers, products, geography, and temporal patterns. Create appropriate derived features and visualizations.
+Machine learning is a mandatory part of this task. You must formulate and execute at least one appropriate ML problem using only information available in this dataset. Determine whether supervised or unsupervised learning is more appropriate and justify the choice. If a target variable is not naturally provided, construct a defensible target or use an appropriate unsupervised learning approach rather than inventing an arbitrary target.
+For the ML task:
+- Perform the required feature engineering and preprocessing.
+- Prevent data leakage and explain how the train/test or evaluation strategy avoids it.
+- Train and compare multiple appropriate models where applicable.
+- Use evaluation metrics appropriate to the chosen ML problem.
+- Perform hyperparameter tuning if it is justified.
+- Save all trained models, preprocessing artifacts, evaluation metrics, predictions/cluster assignments, and other relevant artifacts.
+- Explain the strengths, limitations, and practical meaning of the ML results.
+Finally, generate a comprehensive report containing the data-quality decisions, exploratory findings, ML methodology, model results, supporting evidence, limitations, and business implications.
+Do not assume that negative quantities or unusual transactions are errors without investigating their meaning. Do not fabricate business conclusions that are not supported by the data.

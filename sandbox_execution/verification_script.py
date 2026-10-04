@@ -279,6 +279,26 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                     "extension": item.suffix.lower()
                 })
 
+    # Preserve the explicitly computed unsupervised metrics for the reporter.
+    # These remain artifact-sourced values; unlike dataset shape and supervised
+    # confusion-matrix metrics, they are not independently recomputed here.
+    unsupervised_path = run_path / "unsupervised_metrics.json"
+    if unsupervised_path.is_file():
+        try:
+            with unsupervised_path.open(encoding="utf-8") as f:
+                unsupervised_metrics = json.load(f)
+            if isinstance(unsupervised_metrics, dict):
+                verified["unsupervised_metrics_artifact"] = {
+                    "source_file": unsupervised_path.name,
+                    "values_independently_recomputed": False,
+                    "content": unsupervised_metrics,
+                }
+        except (OSError, json.JSONDecodeError) as exc:
+            verified["unsupervised_metrics_artifact"] = {
+                "source_file": unsupervised_path.name,
+                "error": f"Could not read unsupervised metrics artifact: {exc}",
+            }
+
     # 1b. Versioned Model Artifacts (e.g., logistic_regression_p0.pkl, random_forest_p1_tuned.pkl)
     versioned_model_artifacts = []
     for item in sorted(run_path.glob("*_p*.pkl")):
@@ -297,6 +317,7 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
     # 2. Dataset Verification (cleaned_dataset.csv or fallback dataset CSVs)
     dataset_candidates = [
         "cleaned_dataset.csv",
+        "feature_engineered_dataset.csv",
         "cleaned_data.csv",
         "dataset.csv",
         "data.csv"
@@ -311,7 +332,10 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
     # If not found in candidates, look for any .csv that isn't model/prediction/feature
     if not target_csv:
         for item in sorted(run_path.glob("*.csv")):
-            if item.name not in ["model_comparison.csv", "feature_importance.csv", "predictions.csv"]:
+            if item.name not in [
+                "model_comparison.csv", "feature_importance.csv", "predictions.csv",
+                "cluster_assignments.csv", "anomaly_scores.csv",
+            ]:
                 target_csv = item
                 break
 
@@ -326,9 +350,18 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
 
             num_cols_list = df.select_dtypes(include=[np.number]).columns.tolist()
             cat_cols_list = df.select_dtypes(exclude=[np.number]).columns.tolist()
+            # Numeric storage does not make an identifier a quantitative
+            # feature. Keep identifier columns visible in schema metadata, but
+            # do not publish misleading means/ranges for IDs as metric stats.
+            import re
+            identifier_cols = [
+                str(col) for col in df.columns
+                if re.search(r"(?:^|[_\s-])id(?:$|[_\s-])|identifier|id$|^id", str(col), re.IGNORECASE)
+            ]
+            numeric_measure_cols = [col for col in num_cols_list if col not in identifier_cols]
 
             numeric_stats: Dict[str, Dict[str, Any]] = {}
-            for col in num_cols_list:
+            for col in numeric_measure_cols:
                 series = df[col].dropna()
                 if len(series) > 0:
                     skew_val = safe_float(series.skew())
@@ -363,6 +396,8 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                 "numeric_columns_count": len(num_cols_list),
                 "categorical_columns_count": len(cat_cols_list),
                 "numeric_columns": num_cols_list,
+                "numeric_measure_columns": numeric_measure_cols,
+                "identifier_columns": identifier_cols,
                 "categorical_columns": cat_cols_list,
                 "numeric_stats": numeric_stats,
                 "categorical_stats": categorical_stats

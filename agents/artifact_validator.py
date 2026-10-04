@@ -214,6 +214,11 @@ def _normalize_artifact_stem(name: str) -> str:
     stem = os.path.splitext(name.lower().strip())[0]
     stem = re.sub(r"[_\-]?task[_\-]?\w*$", "", stem)  # analyst_summary_task_1 -> analyst_summary
     stem = re.sub(r"[_\-]+", "", stem)                # ignore separator variants
+    # Canonicalize numeric parameters in names (dbscan_eps1 == dbscan_eps1.0).
+    def _canonical_number(match):
+        number = float(match.group(0))
+        return str(int(number)) if number.is_integer() else str(number).rstrip("0").rstrip(".")
+    stem = re.sub(r"\d+(?:\.\d+)?", _canonical_number, stem)
     return stem
 
 
@@ -317,6 +322,25 @@ def validate_artifacts(
         if not glob.glob(os.path.join(output_dir, "*_p*.pkl")):
             missing_artifacts.append("versioned model artifact (e.g. logistic_regression_p0.pkl)")
 
+    semantic_findings = []
+    if agent_name == "MLAgent" and task_type in {"model_comparison", "hyperparameter_tuning"}:
+        # Run cross-artifact ML checks on each ML task attempt so contradictory
+        # parameters or model lineage trigger the same bounded repair path.
+        try:
+            from agents.consistency_checker import (
+                Finding,
+                check_ml_result_consistency,
+                check_model_artifact_consistency,
+            )
+            semantic_findings.extend(check_ml_result_consistency(output_dir))
+            semantic_findings.extend(check_model_artifact_consistency(output_dir))
+        except Exception as exc:
+            from agents.consistency_checker import Finding
+            semantic_findings.append(Finding(
+                severity="minor", code="ml_consistency_check_error",
+                message=f"ML consistency validation could not run: {exc}", artifacts=[],
+            ))
+
     # Validate report structure if this is a reporter agent
     report_structure_valid = True
     report_structure_issues = []
@@ -344,7 +368,14 @@ def validate_artifacts(
             f"{'; '.join(report_structure_issues[:3])}"
         )
 
-    is_valid = len(missing_artifacts) == 0 and not fallback_detected and report_structure_valid
+    critical_semantic_findings = [f for f in semantic_findings if f.severity == "critical"]
+    if semantic_findings:
+        hallucination_warnings.extend(
+            f"ML consistency {f.severity} ({f.code}): {f.message}" for f in semantic_findings
+        )
+
+    is_valid = (len(missing_artifacts) == 0 and not fallback_detected and report_structure_valid
+                and not critical_semantic_findings)
 
     return ValidationResult(
         is_valid=is_valid,
@@ -383,6 +414,12 @@ def get_required_artifacts(agent_name: str, task_type: Optional[str] = None) -> 
                 # Versioned model artifacts (e.g. logistic_regression_p0.pkl) are also
                 # mandatory per the ML contract but their names are model-family
                 # dependent, so they are enforced by the *_p*.pkl glob check below.
+            ]
+        elif task_type == "unsupervised_analysis":
+            return [
+                "unsupervised_metrics.json",
+                "unsupervised_summary.json",
+                "ml_summary.json",
             ]
         elif task_type == "hyperparameter_tuning":
             return [

@@ -720,6 +720,12 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
 
 def _run_level_warnings(output_dir: str, champ: Optional[Dict[str, Any]]) -> List[str]:
     warnings: List[str] = []
+    if (
+        os.path.isfile(os.path.join(output_dir, "unsupervised_metrics.json"))
+        and not os.path.isfile(os.path.join(output_dir, "model_comparison.csv"))
+        and not os.path.isfile(os.path.join(output_dir, "champion_model.json"))
+    ):
+        return warnings
 
     cm = _load_json_safe(os.path.join(output_dir, "confusion_matrix.json")) or {}
     tp, fp, fn, tn = (cm.get(k) for k in ("true_positives", "false_positives", "false_negatives", "true_negatives"))
@@ -943,10 +949,18 @@ def run_preflight(output_dir: str, goal_text: str = "", repair: bool = False) ->
 def _run_validation(output_dir: str, champ: Optional[Dict[str, Any]]) -> List[PreflightFinding]:
     """Run all validation checks (read-only, no repairs)."""
     findings: List[PreflightFinding] = []
-    findings.extend(_check_champion(output_dir, champ))
+    unsupervised_only = (
+        os.path.isfile(os.path.join(output_dir, "unsupervised_metrics.json"))
+        and not os.path.isfile(os.path.join(output_dir, "model_comparison.csv"))
+        and not os.path.isfile(os.path.join(output_dir, "champion_model.json"))
+    )
+    if not unsupervised_only:
+        findings.extend(_check_champion(output_dir, champ))
     usable_champ = champ if isinstance(champ, dict) else None
-    findings.extend(_check_confusion_matrix(output_dir, usable_champ))
+    if not unsupervised_only:
+        findings.extend(_check_confusion_matrix(output_dir, usable_champ))
     findings.extend(_check_file_lists(output_dir))
     findings.extend(_check_shape_counts(output_dir))
-    findings.extend(_check_stale_threshold_analysis(output_dir, usable_champ))
+    if not unsupervised_only:
+        findings.extend(_check_stale_threshold_analysis(output_dir, usable_champ))
     return findings

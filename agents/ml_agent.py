@@ -416,7 +416,19 @@ class MLAgent:
         primary_task = assigned_tasks[0] if assigned_tasks else None
         task_type = getattr(primary_task, "task_type", None) or "model_comparison"
 
-        if task_type == "hyperparameter_tuning":
+        if task_type == "unsupervised_analysis":
+            task_specific_instructions = (
+                f"Instructions for Unsupervised Analysis:\n"
+                f"1. Use the task objective to choose clustering, anomaly detection, or dimensionality reduction. Do not invent a target or labels. If the objective is underspecified, choose a defensible method and record the assumption.\n"
+                f"2. Load the requested dataset and exclude identifiers, free-text IDs, and non-feature metadata from the feature matrix. Impute missing values and scale numeric features when the chosen algorithm is distance- or scale-sensitive; record every transformation.\n"
+                f"3. For clustering, compare a small defensible set of algorithms or cluster counts. Report Silhouette (higher is better), Davies-Bouldin (lower), and Calinski-Harabasz (higher) when mathematically defined. Also report cluster sizes, noise/uncategorized share, and stability across seeds or resamples. Do not compare raw inertia across different feature spaces.\n"
+                f"4. For anomaly detection, if ground-truth labels exist and were not used for fitting, report PR-AUC and ROC-AUC plus precision@k at a stated review capacity. Without labels, report the score distribution, chosen threshold and its rationale, flagged count/rate, and a small reviewable list of flagged record IDs; do not claim accuracy.\n"
+                f"5. For dimensionality reduction, report explained variance for PCA where applicable, and trustworthiness or reconstruction error when appropriate. State what information the projection may lose.\n"
+                f"6. If independent reference labels exist, ARI/NMI may be reported as external validation only; never use them to fit or choose the representation without clearly labeling that evaluation. Metrics are not interchangeable: explain which are applicable and why any are omitted.\n"
+                f"7. Save `unsupervised_metrics.json` as JSON with `task_type`, `features_used`, `preprocessing`, `candidate_results` (list of objects with `algorithm`, `configuration`, `metrics`, `optimization_directions`, and `limitations`), and `selected_result` (object with `algorithm`, `configuration`, `metrics`, `reason`, and `limitations`). Use consistent snake_case metric keys. Save `unsupervised_summary.json` with plain-language findings. Save `ml_summary.json` and `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json`. Save `cluster_assignments.csv` for clustering with preserved identifier columns and the assigned label in a `cluster` column; for anomaly detection save scores/flags in `anomaly_scores.csv` when applicable. Save reusable fitted model/preprocessing artifacts where supported. Do not create supervised-only champion, confusion-matrix, baseline, or feature-importance artifacts.\n"
+                f"8. You have a budget of MAX {effective_max_calls} tool calls. Ground every metric in executed code and clearly label unavailable metrics instead of fabricating values."
+            )
+        elif task_type == "hyperparameter_tuning":
             # Get primary_metric from task spec
             primary_metric = getattr(primary_task, "primary_metric", None) if primary_task else None
             metric_hint = f" (Planner specified: {primary_metric})" if primary_metric else ""
@@ -657,13 +669,27 @@ class MLAgent:
         summary_filename = f"ml_summary_task_{task_id_val}.json"
         main_summary_filename = "ml_summary.json"
 
-        # Check if Python script produced ml_summary.json
-        for candidate_name in [main_summary_filename, summary_filename]:
+        # Prefer this task's own summary and reject a stale supervised summary
+        # when the current task is unsupervised.
+        summary_candidates = (
+            [summary_filename, main_summary_filename]
+            if task_type == "unsupervised_analysis"
+            else [main_summary_filename, summary_filename]
+        )
+        for candidate_name in summary_candidates:
             cand_path = os.path.join(output_dir, candidate_name)
             if os.path.exists(cand_path):
                 try:
                     with open(cand_path, "r", encoding="utf-8") as sf:
-                        summary_data = json.load(sf)
+                        candidate_summary = json.load(sf)
+                    if task_type == "unsupervised_analysis" and isinstance(candidate_summary, dict):
+                        summary_type = str(candidate_summary.get("task_type", "")).lower()
+                        has_unsupervised_data = "unsupervised_metrics" in candidate_summary
+                        if not has_unsupervised_data and not any(
+                            tag in summary_type for tag in ("unsupervised", "cluster", "anomal", "dimensionality")
+                        ):
+                            continue
+                    summary_data = candidate_summary
                     if candidate_name not in generated_files:
                         generated_files.append(candidate_name)
                     break
@@ -671,7 +697,54 @@ class MLAgent:
                     pass
 
         # If not produced directly by script, assemble from generated artifact files
-        if not summary_data:
+        if not summary_data and task_type == "unsupervised_analysis":
+            unsupervised_metrics = {}
+            unsupervised_summary = {}
+            for artifact_name, destination in (
+                ("unsupervised_metrics.json", "metrics"),
+                ("unsupervised_summary.json", "summary"),
+            ):
+                try:
+                    with open(os.path.join(output_dir, artifact_name), "r", encoding="utf-8") as af:
+                        value = json.load(af)
+                    if isinstance(value, dict):
+                        if destination == "metrics":
+                            unsupervised_metrics = value
+                        else:
+                            unsupervised_summary = value
+                except Exception:
+                    pass
+            summary_data = {
+                "agent": self.agent_name,
+                "task_id": task_id_val,
+                "task_title": assigned_tasks[0].title if assigned_tasks else "Unsupervised Analysis",
+                "status": final_status,
+                "task_type": "unsupervised_analysis",
+                "source": "fallback_from_unsupervised_artifacts",
+                "unsupervised_metrics": unsupervised_metrics,
+                "unsupervised_summary": unsupervised_summary,
+                "generated_artifacts": [
+                    {"file": gf, "description": f"Generated artifact: {gf}"}
+                    for gf in generated_files
+                ],
+                "issues_and_caveats": [
+                    "Fallback summary copied the task's unsupervised metric and summary artifacts; values were not independently recomputed."
+                ],
+            }
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                with open(os.path.join(output_dir, summary_filename), "w", encoding="utf-8") as sf:
+                    json.dump(summary_data, sf, indent=2)
+                with open(os.path.join(output_dir, main_summary_filename), "w", encoding="utf-8") as sf:
+                    json.dump(summary_data, sf, indent=2)
+                if summary_filename not in generated_files:
+                    generated_files.append(summary_filename)
+                if main_summary_filename not in generated_files:
+                    generated_files.append(main_summary_filename)
+            except Exception as write_err:
+                print(f"[MLAgent] Notice saving unsupervised fallback summary: {write_err}")
+
+        if not summary_data and task_type != "unsupervised_analysis":
             # 1. Baseline Score
             baseline_data = {}
             base_path = os.path.join(output_dir, "baseline_score.json")

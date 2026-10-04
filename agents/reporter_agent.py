@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import re
+import uuid
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -160,22 +161,17 @@ class ReporterAgent:
 
         setup_logfire()
 
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
+        # The thinking route applies a saved config slug or Nvidia virtual key
+        # per request. Never put an inline config on client defaults: it is sent
+        # on every request and is rejected by workspaces with block_inline_config.
+        headers = {"x-portkey-api-key": PORTKEY_API_KEY}
         if PORTKEY_CONFIG_ID:
             if HAS_LOGFIRE:
                 logfire.info("ReporterAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
             else:
                 print(f"[ReporterAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("[ReporterAgent Setup] PORTKEY_CONFIG_ID not found. Using fallback config.")
-            else:
-                print("[ReporterAgent Setup] WARNING: PORTKEY_CONFIG_ID not found. Using fallback config.")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
+        elif HAS_LOGFIRE:
+            logfire.info("ReporterAgent will route through the configured Nvidia virtual key")
 
         self.client = OpenAI(
             base_url="https://api.portkey.ai/v1",
@@ -393,6 +389,13 @@ class ReporterAgent:
         if verified_metrics:
             verified_str = json.dumps(verified_metrics, indent=2, default=str)
             user_content_parts.append(f"=== VERIFIED_METRICS (GROUND TRUTH — COMPUTED DIRECTLY FROM ARTIFACTS) ===\n{verified_str}\n")
+            unsupervised_artifact = verified_metrics.get("unsupervised_metrics_artifact")
+            if isinstance(unsupervised_artifact, dict):
+                user_content_parts.append(
+                    "=== UNSUPERVISED_METRICS_ARTIFACT (values produced by executed ML code; "
+                    "not independently recomputed by the host) ===\n"
+                    f"{json.dumps(unsupervised_artifact, indent=2, default=str)}\n"
+                )
 
         # 1b. Fact Sheet: the ONLY source the report's {{blank}} tokens may reference.
         # Values are pre-formatted by code; the reporter never types or converts numbers.
@@ -448,9 +451,11 @@ class ReporterAgent:
             f"2. You have a budget of up to {effective_max_calls} tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently.\n"
             "3. STRICT GROUNDING: Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim. Do not compute, round, or estimate any number yourself. If a number the report needs isn't present in `VERIFIED_METRICS`, write \"not verified in current run\" instead of guessing.\n"
             "4. On contradiction: `VERIFIED_METRICS` is authoritative. Note any upstream discrepancies in Operational Caveats.\n"
-            "5. DELIVERABLE: The report itself must be CREATED VIA A TOOL CALL. Use `execute_python` to write the complete markdown report to a file named exactly `final_report.md` (write the whole report in ONE call), e.g.:\n"
+            "5. DELIVERABLE: The report itself must be CREATED VIA A TOOL CALL. Use `execute_python` to write the complete markdown report to `final_report.md` and also save the identical contents to `reporter_final_report_delivery.md` in the SAME call. The delivery copy is required so the report is returned even if `final_report.md` was created earlier as an empty placeholder. Write the whole report in ONE call, e.g.:\n"
             "   report = \"\"\"<complete markdown report>\"\"\"\n"
             "   with open(\"final_report.md\", \"w\", encoding=\"utf-8\") as f:\n"
+            "       f.write(report)\n"
+            "   with open(\"reporter_final_report_delivery.md\", \"w\", encoding=\"utf-8\") as f:\n"
             "       f.write(report)\n"
             "   Your chat response does NOT save the report — only the `final_report.md` file written via the tool is the deliverable.\n"
             "6. Generate the complete executive markdown report following the required structure."
@@ -605,18 +610,24 @@ class ReporterAgent:
         # a brief confirmation and is not persisted anywhere.
         # ==============================================================================
         report_filepath = os.path.join(output_dir, "final_report.md")
-        if os.path.exists(report_filepath):
+        delivery_filepath = os.path.join(output_dir, "reporter_final_report_delivery.md")
+        # Prefer the unique delivery artifact exported by the sandbox. A short
+        # assistant confirmation must never replace the report created in code.
+        for candidate_path in (delivery_filepath, report_filepath):
             try:
-                with open(report_filepath, "r", encoding="utf-8") as rf:
+                if not os.path.exists(candidate_path):
+                    continue
+                with open(candidate_path, "r", encoding="utf-8") as rf:
                     file_report = rf.read()
-                if file_report and file_report.strip() and len(file_report.strip()) >= len(final_report.strip()):
+                if file_report and file_report.strip() and (candidate_path == delivery_filepath or len(file_report.strip()) >= len(final_report.strip())):
                     if HAS_LOGFIRE:
-                        logfire.info("ReporterAgent retrieved final report from saved artifact", path=report_filepath, length=len(file_report))
+                        logfire.info("ReporterAgent retrieved final report from saved artifact", path=candidate_path, length=len(file_report))
                     else:
-                        print(f"[ReporterAgent] Retrieved final report from saved artifact: {report_filepath} ({len(file_report)} chars)")
+                        print(f"[ReporterAgent] Retrieved final report from saved artifact: {candidate_path} ({len(file_report)} chars)")
                     final_report = file_report
+                    break
             except Exception as read_err:
-                print(f"[ReporterAgent Warning] Could not read {report_filepath}: {read_err}. Falling back to LLM response.")
+                print(f"[ReporterAgent Warning] Could not read {candidate_path}: {read_err}.")
 
         # ==============================================================================
         # BLANK FILLING: substitute {{fact_sheet_key}} tokens with code-formatted values.
@@ -750,21 +761,17 @@ class ReporterAgent:
                 "correction_turns_used": correction_turn
             })
 
-        # Keep the saved artifact in sync with the returned report: verification
-        # corrections or the warning banner may have modified the text after the
-        # tool call wrote final_report.md.
+        # Keep both report artifacts in sync with the returned report. The
+        # delivery copy also ensures later reads see updates to a known sandbox
+        # file even when the sandbox only exports newly created filenames.
         try:
             if final_report:
-                existing_content = ""
-                if os.path.exists(report_filepath):
-                    with open(report_filepath, "r", encoding="utf-8") as rf:
-                        existing_content = rf.read()
-                if existing_content != final_report:
-                    os.makedirs(output_dir, exist_ok=True)
-                    with open(report_filepath, "w", encoding="utf-8") as rf:
+                os.makedirs(output_dir, exist_ok=True)
+                for artifact_path in (report_filepath, delivery_filepath):
+                    with open(artifact_path, "w", encoding="utf-8") as rf:
                         rf.write(final_report)
-                    if HAS_LOGFIRE:
-                        logfire.info("ReporterAgent synced final_report.md with final report", path=report_filepath)
+                if HAS_LOGFIRE:
+                    logfire.info("ReporterAgent synced report artifacts", path=report_filepath, delivery_path=delivery_filepath)
         except Exception as sync_err:
             print(f"[ReporterAgent Warning] Failed to sync final_report.md: {sync_err}")
 
@@ -810,6 +817,7 @@ class ReporterAgent:
         profile_block: str = "",
         max_tool_calls: int = 5,
         cancellation_token: Optional[CancellationToken] = None,
+        step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> str:
         """
         Post-report repair pass: given the current report and the COMBINED findings
@@ -826,11 +834,19 @@ class ReporterAgent:
         if cancellation_token:
             cancellation_token.check_cancelled(step_name="ReporterAgent report repair")
 
+        def _safe_callback(event: str, data: Dict[str, Any]):
+            if step_callback:
+                try:
+                    step_callback(event, data)
+                except BaseException:
+                    pass
+
         findings_block = "\n".join(
             f"- [{f.get('severity', 'minor').upper()}] ({f.get('code', 'finding')}): {f.get('message', '')}"
             for f in findings[:25]
         )
         verified_metrics_block = json.dumps(verified_metrics or {}, indent=2, default=str)
+        repair_delivery_filename = f"reporter_repair_delivery_{uuid.uuid4().hex}.md"
 
         repair_prompt = REPORT_REPAIR_PROMPT.format(
             findings_block=findings_block,
@@ -850,7 +866,9 @@ class ReporterAgent:
             "content": repair_prompt + (
                 f"\n\nREMINDER: you have a strict budget of {max_tool_calls} tool calls. "
                 "After at most that many verification calls (or none, if not needed), output the "
-                "COMPLETE corrected markdown report as your final chat response."
+                "COMPLETE corrected markdown report as your final chat response. When writing it "
+                "with execute_python, write the identical contents to `final_report.md` and "
+                f"`{repair_delivery_filename}` in the same call."
             ),
         })
 
@@ -946,14 +964,27 @@ class ReporterAgent:
         # execute_python; the chat response is only a fallback.
         # ======================================================================
         try:
-            artifact_path = os.path.join(self._report_output_dir(), "final_report.md")
-            if os.path.exists(artifact_path):
+            output_dir = self._report_output_dir()
+            for artifact_path in (
+                os.path.join(output_dir, repair_delivery_filename),
+                os.path.join(output_dir, "reporter_final_report_delivery.md"),
+                os.path.join(output_dir, "final_report.md"),
+            ):
+                if not os.path.exists(artifact_path):
+                    continue
                 with open(artifact_path, "r", encoding="utf-8") as rf:
                     file_report = rf.read()
-                if file_report and file_report.strip() and len(file_report.strip()) >= len((corrected or "").strip()):
+                if file_report and file_report.strip() and (
+                    artifact_path.endswith(repair_delivery_filename)
+                    or (
+                        file_report.strip() != current_report.strip()
+                        and len(file_report.strip()) >= len((corrected or "").strip())
+                    )
+                ):
                     corrected = file_report
                     if HAS_LOGFIRE:
                         logfire.info("ReporterAgent repair retrieved corrected report from artifact", path=artifact_path, length=len(file_report))
+                    break
         except Exception as read_err:
             print(f"[ReporterAgent Warning] Could not read repaired final_report.md: {read_err}. Using chat response.")
 
@@ -966,6 +997,14 @@ class ReporterAgent:
         if not corrected.strip() or len(corrected.strip()) < len(current_report.strip()) * 0.4:
             print(f"[ReporterAgent Warning] repair response too short ({len(corrected)} chars); keeping current report")
             return current_report
+
+        # Persist corrected content under both the public artifact name and its
+        # unique export name so later consumers never fall back to chat text.
+        output_dir = self._report_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        for filename in ("final_report.md", repair_delivery_filename):
+            with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as wf:
+                wf.write(corrected)
 
         if HAS_LOGFIRE:
             logfire.info(
