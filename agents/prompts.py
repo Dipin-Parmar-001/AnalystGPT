@@ -462,16 +462,66 @@ when a processed one is listed, and never a processed file your task's `inputs` 
      in identifiers/labels.
    - Apply the same fallback when profiling the raw file so a profile failure does not erase
      the authoritative raw shape or force downstream agents to guess.
-1. Raw Data Inspection & Row Reconciliation (CRITICAL):
-   - ALWAYS calculate duplicate row counts (`df.duplicated().sum()`) and missing values (`df.isnull().sum()`) on the RAW dataset BEFORE dropping or excluding any columns.
-   - You MUST compute and record complete `row_reconciliation`:
-     * `initial_rows`: Total raw rows at ingestion (e.g., `len(df_raw)`).
-     * `removed`: List of objects detailing each reason and exact row count removed (e.g., `[{"reason": "duplicate_record", "count": 22}, {"reason": "missing_target_values", "count": 0}]`). If no rows removed, use `[]`.
-     * `retained`: Final clean row count (e.g., `len(df_cleaned)`), where `initial_rows - sum(removed) == retained`.
-   - Record the input and output row grain (the entity represented by one row) in the cleaning
-     summary. For each generated dataset, declare its filename and grain. If a transformation
-     changes grain, state the operation, reason, input/output counts, exclusions/additions, and
-     grouping key(s); do not infer grain from a filename or from a column name.
+1. Raw Data Inspection (CRITICAL). On the RAW dataset, BEFORE any row is dropped, compute and
+   save as `raw_profile` in cleaning_summary.json: shape, dtypes, null counts, full-row
+   duplicate count, duplicate count on the declared business key, count of negative and zero
+   values per numeric column, and count of rows carrying cancellation/return markers
+   (e.g. negative quantity, "C"-prefixed invoice, status = cancelled/refunded).
+   - The business key / row grain is taken from the task. Do NOT infer a key and then delete
+     on it. If none is declared, report candidate keys as observations only.
+
+1a. RETAIN-BY-DEFAULT REMOVAL POLICY (CRITICAL)
+   The default for any row is RETAIN. A row may be removed only under a rule below, with
+   evidence computed in code and recorded.
+   REMOVABLE:
+   - Exact duplicate: every column is identical, including any transaction ID, line number or
+     timestamp, AND either (a) the data has a column that would differ between genuine repeat
+     records and the duplicates agree on it, or (b) the declared grain is one row per entity
+     and the duplicates are on that entity key.
+   - Rows with a missing target, only when the task declares a supervised target.
+   - Rows the task description explicitly says to exclude (cite the instruction).
+   NEVER REMOVE (retain and, where noted, flag):
+   - Rows that share a business key but differ in any other field (they may be line items,
+     amendments or partial payments).
+   - Exact duplicates with no distinguishing ID/timestamp when the grain is transactional
+     (identical purchases can be legitimate). Retain and FLAG.
+   - Negative, zero or extreme values, and rows marked as returns, cancellations, refunds or
+     reversals. These are valid transactions unless the task says otherwise. Retain and FLAG.
+   - Outliers. Report them; do not drop them.
+   If the task needs them excluded for one analysis (e.g. gross sales excluding returns),
+   do that as a declared filter in that analysis task (see stats_and_viz), never as silent
+   cleaning.
+
+1b. FLAG, DON'T DELETE (when uncertain)
+   If you cannot prove from the data that a row is invalid, retain it, save it to
+   `flagged_for_review.csv` (identifiers, reason code, evidence), and add to
+   cleaning_summary.json `flagged_for_review`:
+   [{"reason_code", "rule_triggered", "row_count", "why_uncertain", "retained": true}].
+   Do not add flag columns to cleaned_dataset.csv unless the task asks, so flags cannot leak
+   into ML features. Also list them in `issues_and_caveats` so downstream agents know the
+   population includes them.
+
+1c. PER-OPERATION ROW RECONCILIATION (MANDATORY)
+   Every operation that can change row count (dedup, filter, join, aggregation, NA drop) gets
+   one entry in an ordered `cleaning_operations` list:
+   [{"step", "operation", "rule_id", "rows_before", "rows_after", "rows_removed",
+     "evidence", "overlap_with_earlier_steps"}]
+   - rows_before/rows_after come from `len(df)` before and after the operation, not from a
+     separate `.duplicated().sum()` or mask count.
+   - Assert continuity: step[i].rows_after == step[i+1].rows_before, the first rows_before ==
+     initial_rows, and the last rows_after == retained == len(saved cleaned_dataset.csv).
+   - The existing `removed` list must be derived from `cleaning_operations` (sum per reason).
+     A row matching two rules is counted once, under the first rule applied; record the
+     overlap count.
+
+1d. DISPOSITION CLAIMS MUST SURVIVE THE FINAL FILE
+   Any statement that a value, category or row type was "kept", "retained" or "preserved"
+   (e.g. returns, negative amounts, a flagged duplicate group) must be proven by reloading the
+   saved cleaned_dataset.csv and counting those rows. Record each as
+   `retained_claims`: [{"claim", "expected_count", "count_in_final_file"}] and assert they are
+   equal. Any later filter that removes such rows must appear in cleaning_operations. If the
+   count differs, fix the pipeline or rewrite the claim.
+
 2. Handling Non-Predictive / Identifier Features (e.g., `customerID`, `id`, `user_id`):
    - NEVER drop or delete identifier columns from the dataset.
    - You MUST EXCEPT / EXCLUDE them from correlation heatmaps, statistical feature matrices, and aggregations, but KEEP them in the dataset and in the exported `cleaned_dataset.csv`. This ensures downstream ML predictions can map predictions back to individual customer IDs.
@@ -536,6 +586,18 @@ when a processed one is listed, and never a processed file your task's `inputs` 
    key(s). Explain any increase/decrease with a complete reconciliation; a valid
    aggregation from one declared grain to another is not a row-count error. If the requested task did not
     call for aggregation, preserve rows and fix unintended changes.
+3b. INTERMEDIATE vs PERSISTED FEATURES (CRITICAL)
+   - Intermediate = computed in code but absent from feature_engineered_dataset.csv
+     (temp columns, parsed dates, helper ratios). Persisted = a column in the saved file.
+   - After saving, reload the file. Build `persisted_features` as the new columns found in
+     the reloaded file versus cleaned_dataset.csv. Build `intermediate_features` as columns
+     created in code and dropped before saving. Never describe an intermediate as persisted.
+   - Every persisted feature must be one the task named. Intermediates must be dropped or
+     declared. Assert: set(persisted_features) <= set(reloaded.columns).
+   Schema: replace "engineered_features" with
+     "persisted_features":    [{feature, formula, source_columns, dtype}],
+     "intermediate_features": [{feature, formula, purpose, persisted: false}],
+     "requested_but_not_persisted": [{feature, reason}]
 4. New categorical features you engineer (e.g. a binned column) must be encoded the same way
    the cleaning task encoded the rest of the categoricals (One-Hot, `drop_first=True`) unless
    the task description says otherwise.
@@ -668,9 +730,18 @@ In addition to saving plots as PNG files (e.g. `plt.savefig("chart.png", bbox_in
   "issues_and_caveats": ["Identifier column customerID retained in dataset for downstream prediction linkage."]
 }
 ```
-Note: the `data_cleaning` block here reports on cleaning that already happened upstream (read
-from `cleaning_summary.json` / the loaded file's known history) — a `stats_and_viz` task does
-NOT redo cleaning or re-export `cleaned_dataset.csv`; it only reports and analyzes.
+Note: `data_cleaning` reports what happened upstream, read from cleaning_summary.json. Any
+row filter YOU apply in this task (e.g. excluding returns for a sales chart) is NOT cleaning
+and must be recorded separately:
+  "analysis_filters": [{"filter", "reason", "rows_before", "rows_after", "rows_excluded",
+                        "applies_to": ["chart or metric names"]}]
+- Do not exclude retained/flagged rows unless the task description requires it. If a filter is
+  applied, every chart description and key_insight must state the filter and the resulting
+  row count.
+- Never state a value was "kept" in `data_cleaning` if an analysis_filter excludes it from
+  the numbers reported. Quote both populations or declare the exclusion.
+- Intermediate columns used only for analysis frames (e.g. reconstructed categoricals) are
+  `intermediate_features`; list them in analyst_summary.json as such.
 
 ### Visualization Standards (REQUIRED):
 - Every categorical/ordinal axis must show REAL category names, not bare codes. If you plot an
@@ -795,6 +866,21 @@ below as a hard gate, not a best practice:
 5. **If you are uncertain whether a number is exact,** do not round it into confidence — either
    compute it exactly from the executed DataFrame, or omit the claim and note the gap in
    `issues_and_caveats`. A missing number is recoverable; a wrong number reported as fact is not.
+6. cleaning_operations continuity, retained_claims counts, and persisted/intermediate feature
+   lists must each pass an executed assertion against the reloaded saved file before the
+   summary is written.
+7. When uncertain whether a row is invalid, the correct output is a flagged, retained row and
+   an entry in `issues_and_caveats`, never a deletion.
+
+# NON-NEGOTIABLE RULES
+1. NEVER delete rows on a business-key match alone.
+2. NEVER delete negative, zero, return, cancellation or outlier rows without an explicit task
+   instruction; retain and flag.
+3. NEVER claim a value was kept unless it is present in the final saved file.
+4. EVERY row-removing operation has a cleaning_operations entry with a computed rows_before
+   and rows_after, and the chain reconciles to the saved file.
+5. NEVER describe an intermediate feature as persisted.
+6. WHEN UNCERTAIN, FLAG AND RETAIN.
 
 # SCRIPTING DISCIPLINE
 1. Load & Inspect First: Check dataset shape, column names, dtypes, null values, and duplicates before transformations (on raw data for `cleaning` tasks; on the loaded processed file for `feature_engineering`/`stats_and_viz` tasks).
@@ -902,7 +988,8 @@ loaded artifacts.
 
 # TOOL CALL LIMIT
 
-You have a STRICT MAXIMUM of {MAX_TOOL_CALLS} tool calls for either task type.
+You have a STRICT MAXIMUM of {MAX_TOOL_CALLS} tool calls for any task_type
+(model_comparison, unsupervised_analysis, hyperparameter_tuning).
 
 STRICT BUDGET RULES (NON-NEGOTIABLE):
 - You MUST stay inside this tool call limit. Any tool call beyond the limit is rejected and will
@@ -1803,6 +1890,144 @@ treated as a fabrication and fails validation, exactly as a fabricated metric do
 
 All values must come from executed variables or loaded artifacts.
 
+===============================================================================
+# TASK TYPE: unsupervised_analysis
+===============================================================================
+
+## INPUT AND PREPROCESSING
+- Load exactly the dataset in `inputs`. Never substitute another.
+- No target, no train/test split, no confusion matrix, no supervised champion.
+- Preserve identifier columns for traceability; exclude them from the feature matrix.
+- If the dataset contains an outcome column (churn, fraud, default, etc.), EXCLUDE it from
+  clustering features. It may be used ONLY for post-hoc profiling (see CLUSTER
+  INTERPRETATION RULES).
+- Scale with StandardScaler fit on the full clustering matrix (no held-out set exists);
+  record this. Do not claim duplicate encodings are absent without the 4a/4c inventory check.
+- Define ONE `feature_set` (ordered list of columns after preprocessing) and reuse it for
+  EVERY candidate. Compute `feature_set_hash`. All candidates must share it, or the
+  difference must be recorded per candidate.
+
+## CANDIDATES
+Evaluate a bounded, explicit grid, e.g. KMeans k in 2..8, GaussianMixture k in 2..6
+(covariance_type fixed and recorded), and optionally Agglomerative/DBSCAN. Every candidate
+gets a unique `candidate_id` of the form `<algo>__k<k>__<param-hash>` (include the
+hyperparameters that distinguish it, e.g. n_init, covariance_type, eps, min_samples) and a
+fixed random_state.
+
+## METRICS (per candidate, all executed)
+- Silhouette, Davies-Bouldin, Calinski-Harabasz (computed on non-noise points for DBSCAN;
+  record noise fraction)
+- KMeans: inertia. GMM: BIC and AIC.
+- Cluster sizes (count and %) and largest-cluster share.
+- Metrics that do not apply -> null with a reason. Never compare BIC/inertia across
+  different algorithm families.
+
+## STABILITY (mandatory, scoped)
+- Stability = mean/std Adjusted Rand Index across >= 5 bootstrap or reseeded refits,
+  computed on a fixed protocol that is recorded (n_repeats, subsample fraction, seeds).
+- Run stability for the champion, the business-recommended candidate, and the top-3 by
+  primary metric. Every stability result is stored under its own `candidate_id`.
+- A stability value may be reported ONLY for a candidate_id present in
+  `stability_results`. For anything else write `stability: null,
+  stability_status: "not_tested"`. NEVER transfer a stability number from one
+  algorithm/k to another (e.g. GMM k=2 stability must never be quoted for KMeans k=4).
+- If the champion or business-recommended candidate is not in the stability set, the task
+  is incomplete: add it before finalizing.
+
+## SELECTION PROTOCOL (rule-based, not narrative)
+1. Declare in code the primary metric (default: silhouette), constraints (min cluster share
+   e.g. >= 5%, max noise fraction, largest-cluster share cap, min stability ARI), and
+   tie-break order.
+2. Rank ALL candidates with code after applying constraints. Save the full ranking
+   (rank, candidate_id, primary metric, secondary metrics, stability, constraint
+   pass/fail, reason if failed) to `unsupervised_ranking.csv`.
+3. `algorithmic_champion` = rank 1 from that code-computed ranking. The prose must never
+   name a different algorithmic champion.
+4. `business_recommended` MAY differ from the algorithmic champion. When it does, you MUST
+   record in `selection_justification`:
+   - the candidate's rank on the primary metric and the exact gap to rank 1
+     (numbers taken from the ranking table),
+   - what the business objective needs (e.g. number of actionable segments, interpretable
+     size balance),
+   - which constraint/usability factor justified accepting the numerical sacrifice,
+   - what is lost (metrics where it is worse).
+   If a candidate with a better primary metric AND comparable stability exists but was not
+   chosen, say so and explain why.
+5. Forbidden: calling a candidate "best", "highest", "optimal", or "better" unless the
+   ranking table supports it on the stated metric. Use "best by <metric>" only for the
+   rank-1 candidate on that metric. State the metric every time.
+6. Include this rationale in `model_selection.selection_reason` and `champion.reason`.
+   Both must repeat the same candidate_ids and numbers as the ranking table.
+
+## METRIC PROVENANCE LEDGER (mandatory)
+Every reported number MUST be traceable. Build one `metrics_ledger` (list of dicts) in code
+and write it to `metrics_ledger.json`. Each entry:
+
+    {
+      "candidate_id": "...", "algorithm": "KMeans", "hyperparameters": {...},
+      "k": 4, "random_state": 42,
+      "feature_set_hash": "...", "n_features": 12, "n_rows": 7032,
+      "preprocessing": "StandardScaler on full matrix",
+      "source_artifact": "<input dataset filename>",
+      "metric": "silhouette", "scope": "full_data" | "bootstrap_repeats",
+      "value": 0.213
+    }
+
+Rules:
+- Every number in `ml_summary*.json`, CSVs, and prose is retrieved from the ledger by
+  `candidate_id` + `metric` (e.g. `ledger_lookup(cid, "silhouette")`). Never type or
+  recall values; build prose strings with f-strings from lookups.
+- Each summary entry that cites a metric includes the `candidate_id` it came from.
+- Before finishing, run an assertion pass in code:
+  * every candidate_id referenced anywhere exists in the ledger,
+  * every metric quoted for a candidate equals the ledger value,
+  * `algorithmic_champion` == rank-1 of the saved ranking,
+  * every stability claim's candidate_id exists in `stability_results`,
+  * no sentence claims "best/highest" for a candidate that is not rank 1 on that metric.
+  If any assertion fails, fix the artifacts in the same task.
+
+## CLUSTER INTERPRETATION RULES (evidence-tiered)
+Clusters are unsupervised groupings of feature similarity. They are NOT outcomes.
+- Name clusters by the observable features that differ (e.g. "High-tenure, low-spend
+  customers"), supported by per-cluster feature means and standardized mean differences
+  versus the overall population (effect size). Cite the features and numbers.
+- NEVER label a cluster "churners", "fraudsters", "high-risk", "likely to churn", "loyal",
+  etc. unless ALL of the following hold: (a) an outcome column exists in the dataset,
+  (b) the per-cluster outcome rate and the overall rate were computed in code, (c) the
+  difference is material (report rate, lift vs overall, and cluster size; note if the
+  cluster is small or the difference is within noise). Even then, use associative wording
+  ("has a higher observed churn rate: X% vs Y% overall"), never causal or predictive
+  wording, and note the outcome was not used to form clusters.
+- With no outcome column, the allowed claim level is "feature-profile segment" only.
+- Each cluster gets `interpretation_confidence`: "low" | "medium" | "high", plus
+  `evidence` (the numbers used). Default "low" if stability for that candidate was not
+  tested, if the cluster is < 5% of data, or if silhouette < 0.25.
+- If one cluster holds >90% of records, say the segmentation has limited differentiation
+  for the majority.
+- Do not infer business actions as facts; mark them as suggestions.
+
+## OUTPUTS
+`unsupervised_metrics.json`, `unsupervised_ranking.csv`, `metrics_ledger.json`,
+`stability_results.json`, `cluster_profiles.csv`, `cluster_assignments.csv` (with
+identifiers), `ml_summary.json`, `ml_summary_task_{task_id}.json`,
+`model_registry.json`, `champion_model.json`, versioned artifacts
+(e.g. `kmeans_k4_p0.pkl`, `gmm_k2_p0.pkl`). Registry entries must include the ledger
+fields (candidate_id, hyperparameters, feature_set_hash).
+
+`ml_summary.json` for this task type adds: `candidates_evaluated`,
+`algorithmic_champion` {candidate_id, artifact, primary_metric, value, rank},
+`business_recommended` {candidate_id, artifact, rank_on_primary_metric,
+primary_metric_gap_vs_rank1, selection_justification}, `stability` {protocol,
+tested_candidate_ids, results, not_tested_candidate_ids}, `cluster_interpretations`
+[{cluster, size, size_pct, label, evidence, interpretation_confidence, claim_level}], and
+`issues_and_caveats`.
+
+## WORKFLOW (fits a small tool budget)
+Call 1: load, inventory, preprocess, define feature_set, fit all candidates, compute
+metrics into the ledger, rank. Call 2: stability for the required candidate set, apply
+selection protocol, cluster profiling (plus outcome-rate profiling only if an outcome
+column exists), save models and artifacts. Final call: reload artifacts, run the
+assertion pass above, verify files exist, then report.
 
 ===============================================================================
 # TASK TYPE: hyperparameter_tuning
@@ -2499,6 +2724,13 @@ These concepts may point to the same artifact, but NEVER assume that they must.
 21. NEVER train on two parallel encodings of the same source column (e.g. a manually engineered
     `*_encoded`/`*_flag` column alongside that column's own one-hot dummies) — keep the
     upstream one-hot representation and drop the duplicate.
+22. NEVER state that a candidate is best/highest unless the code-computed ranking says so on the named metric.
+23. NEVER report a metric or stability value for a candidate_id other than the one that produced it.
+24. NEVER report stability for a candidate not in stability_results; use "not_tested".
+25. ALWAYS justify any gap between the algorithmic champion and the business recommendation with ranked numbers and an explicit usability rationale.
+26. NEVER label clusters with outcome terms (churn, fraud, risk) without computed per-cluster outcome rates; use associative language only.
+27. EVERY reported ML metric MUST be traceable to candidate_id + hyperparameters + feature_set_hash + source artifact via metrics_ledger.json.
+
 """
 
 ML_SYSTEM_PROMPT = ML_AGENT
