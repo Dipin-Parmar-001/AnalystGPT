@@ -427,6 +427,11 @@ def get_required_artifacts(agent_name: str, task_type: Optional[str] = None) -> 
                 "best_params.json",
                 "hyperparameter_tuning_summary.json"
             ]
+        elif task_type in {"model_evaluation", "evaluation", "testing_and_evaluation", "threshold_selection", "test_evaluation", "testing"}:
+            return [
+                "test_metrics.json",
+                "ml_summary.json"
+            ]
         else:
             return [
                 "model_comparison.csv",

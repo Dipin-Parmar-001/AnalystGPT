@@ -48,7 +48,9 @@ def test_preflight_does_not_reselect_or_repair_by_default(tmp_path, monkeypatch)
     monkeypatch.setattr(champion_selector, "select_champion", fail_if_called)
     result = run_preflight(str(run_dir))
 
-    assert result["champion"] == original_champion
+    assert result["champion"]["artifact_filename"] == original_champion["artifact_filename"]
+    assert result["champion"]["model_name"] == original_champion["model_name"]
+    assert json.loads((run_dir / "champion_model.json").read_text(encoding="utf-8")) == original_champion
     assert result["repairs_applied"] == []
     assert json.loads((run_dir / "model_registry.json").read_text(encoding="utf-8")) == original_registry
     assert any(f["code"] == "CHAMPION_REGISTRY_DISAGREEMENT" for f in result["findings"])
