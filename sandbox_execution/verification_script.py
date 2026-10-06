@@ -652,8 +652,17 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
             preds_df = pd.read_csv(pred_path)
             total_preds = int(len(preds_df))
             pred_summary: Dict[str, Any] = {"total_predictions": total_preds}
-            pred_col = next((c for c in preds_df.columns if "pred" in c.lower() or "target" in c.lower() or "label" in c.lower()), None)
-            if pred_col:
+            # Find the discrete prediction class column (exclude probabilities, scores, raw outputs, and ground-truth labels)
+            pred_candidates = [
+                c for c in preds_df.columns
+                if ("pred" in c.lower() or "target" in c.lower() or "label" in c.lower())
+                and not any(p in c.lower() for p in ["prob", "score", "raw", "true", "actual"])
+            ]
+            if not pred_candidates:
+                pred_candidates = [c for c in preds_df.columns if c.lower() in ["predicted", "pred", "y_pred", "prediction"]]
+
+            pred_col = pred_candidates[0] if pred_candidates else None
+            if pred_col and preds_df[pred_col].nunique() <= 20:
                 vc = preds_df[pred_col].value_counts()
                 pred_summary["class_distribution"] = {str(k): int(v) for k, v in vc.items()}
                 if len(vc) == 2:
@@ -661,6 +670,16 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                     pos_class = vc.index[1] if 1 in vc.index else vc.index[0]
                     pred_summary["positive_class_count"] = int(vc[pos_class])
                     pred_summary["positive_class_pct"] = round(float(vc[pos_class] / total_preds * 100), 2)
+            elif pred_col and pd.api.types.is_numeric_dtype(preds_df[pred_col]):
+                # Continuous prediction (e.g. regression)
+                series = pd.to_numeric(preds_df[pred_col], errors="coerce").dropna()
+                if len(series) > 0:
+                    pred_summary["continuous_stats"] = {
+                        "min": round(float(series.min()), 4),
+                        "max": round(float(series.max()), 4),
+                        "mean": round(float(series.mean()), 4),
+                        "median": round(float(series.median()), 4),
+                    }
             verified["predictions_summary"] = pred_summary
         except Exception as e:
             verified["predictions_summary_error"] = f"Failed to parse predictions.csv: {str(e)}"

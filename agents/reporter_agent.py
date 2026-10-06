@@ -234,6 +234,7 @@ class ReporterAgent:
 
         def _do_call():
             delays = [10, 20, 30]
+            last_err = None
             for attempt, delay in enumerate(delays + [0]):
                 try:
                     response = create_with_thinking_route(self.client, **kwargs)
@@ -251,6 +252,7 @@ class ReporterAgent:
 
                     return message
                 except Exception as err:
+                    last_err = err
                     err_str = str(err).lower()
                     # Provider rejected the OpenAI tool-calling message schema (e.g. Gemini:
                     # "Role 'function' is not supported") - retry with plain user/assistant
@@ -296,8 +298,8 @@ class ReporterAgent:
                         continue
 
                 if HAS_LOGFIRE:
-                    logfire.error("ReporterAgent LLM request failed", error=str(err))
-                raise RuntimeError(f"ReporterAgent LLM call failed: {err}") from err
+                    logfire.error("ReporterAgent LLM request failed", error=str(last_err))
+                raise RuntimeError(f"ReporterAgent LLM call failed: {last_err}") from last_err
 
         if HAS_LOGFIRE:
             with logfire.span("ReporterAgent LLM Call", model=self.model_name):
@@ -388,6 +390,9 @@ class ReporterAgent:
         # 1. Authoritative Ground Truth Verified Metrics
         if verified_metrics:
             verified_str = json.dumps(verified_metrics, indent=2, default=str)
+            if len(verified_str) > 200_000:
+                safe_vm = {k: v for k, v in verified_metrics.items() if k not in ("predictions_summary", "numeric_stats")}
+                verified_str = json.dumps(safe_vm, indent=2, default=str)[:200_000]
             user_content_parts.append(f"=== VERIFIED_METRICS (GROUND TRUTH — COMPUTED DIRECTLY FROM ARTIFACTS) ===\n{verified_str}\n")
             unsupervised_artifact = verified_metrics.get("unsupervised_metrics_artifact")
             if isinstance(unsupervised_artifact, dict):

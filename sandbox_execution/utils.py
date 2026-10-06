@@ -22,6 +22,9 @@ import contextlib
 import traceback
 from typing import Dict, List, Any, Optional, Union
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import modal
@@ -111,7 +114,10 @@ def build_sandbox_image(
         image = image.pip_install(*pip_packages)
 
     # Mount local python source into remote container so deserialization of sandbox_execution succeeds
-    image = image.add_local_python_source("sandbox_execution")
+    try:
+        image = image.add_local_python_source("sandbox_execution")
+    except Exception:
+        pass
 
     return image
 
@@ -321,7 +327,7 @@ def extract_created_files(
             filepath = os.path.join(root, filename)
             relative_path = os.path.relpath(filepath, tempdir).replace("\\", "/")
 
-            if relative_path in initial_filenames:
+            if relative_path in initial_filenames and relative_path != "__sandbox_session_state__.pkl":
                 continue
 
             try:
@@ -361,6 +367,8 @@ def save_returned_files(
     effective_target_dir = target_dir if (target_dir and os.path.isabs(target_dir)) else os.path.join(workspace_root, target_dir or "outputs")
 
     for filename, info in returned_files.items():
+        if filename == "__sandbox_session_state__.pkl":
+            continue
         local_path = os.path.join(effective_target_dir, filename)
         dir_name = os.path.dirname(local_path)
         if dir_name:
@@ -464,7 +472,10 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
             if dir_path:
                 os.makedirs(dir_path, exist_ok=True)
             with open(filename, "wb") as f:
-                f.write(content)
+                if isinstance(content, str):
+                    f.write(content.encode("utf-8"))
+                else:
+                    f.write(content)
 
         file_registry = build_file_registry(files)
 
@@ -490,6 +501,25 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
             "FILE_REGISTRY": file_registry,
             "get_file_path": get_file_path,
         }
+
+        # Restore persistent session state if available
+        session_file = "__sandbox_session_state__.pkl"
+        if os.path.exists(session_file):
+            try:
+                import joblib
+                with open(session_file, "rb") as f:
+                    saved_globals = joblib.load(f)
+                if isinstance(saved_globals, dict):
+                    local_globals.update(saved_globals)
+            except Exception:
+                try:
+                    import pickle
+                    with open(session_file, "rb") as f:
+                        saved_globals = pickle.load(f)
+                    if isinstance(saved_globals, dict):
+                        local_globals.update(saved_globals)
+                except Exception:
+                    pass
 
         initial_filenames = set(files.keys())
         success = False
@@ -518,6 +548,29 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
             error_str = traceback.format_exc()
         finally:
             os.chdir(cwd)
+
+        # Persist session state across consecutive calls
+        if success:
+            try:
+                import joblib
+                persisted = {}
+                skip_keys = {
+                    "__name__", "__doc__", "__package__", "__loader__", "__spec__",
+                    "__builtins__", "FILE_REGISTRY", "get_file_path"
+                }
+                for k, v in local_globals.items():
+                    if k in skip_keys or k.startswith("__"):
+                        continue
+                    try:
+                        joblib.dumps(v)
+                        persisted[k] = v
+                    except Exception:
+                        pass
+                if persisted:
+                    with open(os.path.join(tempdir, session_file), "wb") as f:
+                        joblib.dump(persisted, f)
+            except Exception:
+                pass
 
         # Extract generated files from workspace
         returned_files = extract_created_files(tempdir, initial_filenames)
@@ -563,8 +616,8 @@ def create_sandbox_executor(
     app: Optional[Any] = None,
     image: Optional[Any] = None,
     timeout: int = SANDBOX_TIMEOUT_S,
-    memory: int = 1024,
-    cpu: float = 1.0,
+    memory: int = 2048,
+    cpu: float = 2.0,
 ):
     """
     Creates and returns a Modal registered function for running Python code in the cloud sandbox.
@@ -574,7 +627,7 @@ def create_sandbox_executor(
             "The 'modal' package is not installed. Please install it using `pip install modal`."
         )
 
-    if app is None and image is None and timeout == SANDBOX_TIMEOUT_S and memory == 1024 and cpu == 1.0:
+    if app is None and image is None and timeout == SANDBOX_TIMEOUT_S and memory == 2048 and cpu == 2.0:
         return global_execute_python_in_sandbox
 
     if app is None:
@@ -606,8 +659,9 @@ def get_global_sandbox_manager(
     app_name: str = "analystGPT-sandbox",
     extra_packages: Optional[List[str]] = None,
     timeout: int = SANDBOX_TIMEOUT_S,
-    memory: int = 1024,
-    cpu: float = 1.0,
+    memory: int = 2048,
+    cpu: float = 2.0,
+    backend: Optional[str] = None,
     reset: bool = False,
 ) -> "ModalSandboxManager":
     """
@@ -626,6 +680,7 @@ def get_global_sandbox_manager(
             timeout=timeout,
             memory=memory,
             cpu=cpu,
+            backend=backend,
         )
         _GLOBAL_SANDBOX_MANAGER.initialize()
 
@@ -649,6 +704,7 @@ class ModalSandboxManager:
     """
     Stateful high-level manager class for Modal Cloud Sandbox & Python execution.
     Preserves container workspace files, generated charts/CSVs, and Python execution state across calls.
+    Supports running directly on Modal Cloud (`backend='modal'`) with automatic local fallback.
     """
 
     def __init__(
@@ -656,14 +712,16 @@ class ModalSandboxManager:
         app_name: str = "analystGPT-sandbox",
         extra_packages: Optional[List[str]] = None,
         timeout: int = SANDBOX_TIMEOUT_S,
-        memory: int = 1024,
-        cpu: float = 1.0,
+        memory: int = 2048,
+        cpu: float = 2.0,
+        backend: Optional[str] = None,
     ):
         self.app_name = app_name
         self.timeout = timeout
         self.memory = memory
         self.cpu = cpu
         self.extra_packages = extra_packages or []
+        self.backend = (backend or os.environ.get("SANDBOX_BACKEND", "modal")).strip().lower()
         self._app = None
         self._image = None
         self._executor = None
@@ -681,7 +739,7 @@ class ModalSandboxManager:
             self._known_files = set()
             self.file_registry = {}
 
-        if HAS_MODAL:
+        if self.backend == "modal" and HAS_MODAL:
             try:
                 self._app = get_modal_app(self.app_name)
                 self._image = build_sandbox_image(extra_pip_packages=self.extra_packages)
@@ -693,11 +751,17 @@ class ModalSandboxManager:
                     cpu=self.cpu,
                 )
             except Exception as err:
+                print(f"[Modal Sandbox Notice] Initialization error: {err}", flush=True)
                 if HAS_LOGFIRE:
                     logfire.warn("Modal app initialization notice", error=str(err))
 
         if HAS_LOGFIRE:
-            logfire.info("Initialized Stateful Sandbox Manager", app_name=self.app_name, workspace=self._sandbox_dir)
+            logfire.info(
+                "Initialized Stateful Sandbox Manager",
+                app_name=self.app_name,
+                backend=self.backend,
+                workspace=self._sandbox_dir,
+            )
 
     def prepare_files(
         self, files: Union[List[str], Dict[str, Union[str, bytes]]]
@@ -735,7 +799,8 @@ class ModalSandboxManager:
     ) -> Dict[str, Any]:
         """
         Executes Python code inside the persistent sandbox environment.
-        Retains generated files, uploaded datasets, and executed variable state across consecutive calls.
+        When backend='modal', routes execution to Modal Cloud with cloud containers.
+        Falls back to isolated local execution if configured or if remote execution is unavailable.
         """
         if not self._sandbox_dir or not os.path.exists(self._sandbox_dir):
             self.initialize()
@@ -763,7 +828,88 @@ class ModalSandboxManager:
                 else:
                     f.write(content)
 
-        # 3. Inject FILE_REGISTRY and get_file_path into global state
+        # 3. Modal Cloud Execution
+        if self.backend == "modal":
+            if not HAS_MODAL:
+                print("[Modal Sandbox] 'modal' package not installed. Falling back to local execution...", flush=True)
+                return self._execute_local(code, input_files)
+
+            if self._executor is None or self._app is None:
+                self.initialize()
+
+            if self._executor is None or self._app is None:
+                print("[Modal Sandbox] Modal executor not initialized. Falling back to local execution...", flush=True)
+                return self._execute_local(code, input_files)
+
+            # Gather all workspace files to sync with Modal Cloud container
+            all_files: Dict[str, bytes] = {}
+            for root, _, filenames in os.walk(self._sandbox_dir):
+                for fname in filenames:
+                    rel = os.path.relpath(os.path.join(root, fname), self._sandbox_dir).replace("\\", "/")
+                    full_p = os.path.join(root, fname)
+                    try:
+                        with open(full_p, "rb") as f:
+                            all_files[rel] = f.read()
+                    except Exception:
+                        pass
+
+            try:
+                print(f"[Modal Sandbox] Executing code remotely on Modal Cloud (app: {self.app_name}, files: {len(all_files)})...", flush=True)
+                start_modal_t = time.time()
+                with self._app.run():
+                    result = self._executor.remote(code, all_files)
+                elapsed_modal = time.time() - start_modal_t
+                status_str = "SUCCESS" if result.get("status") else "FAILED"
+                print(f"[Modal Sandbox] Remote execution finished in {round(elapsed_modal, 2)}s. Status: {status_str}", flush=True)
+
+                # Persist any returned files from remote container into host sandbox workspace
+                returned_files = result.get("files", {})
+                for filename, file_info in returned_files.items():
+                    content = file_info.get("content")
+                    if content is not None:
+                        target_path = os.path.join(self._sandbox_dir, filename)
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                        with open(target_path, "wb") as f:
+                            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+                        self._known_files.add(filename)
+
+                # Update registry with returned files
+                new_files_reg = build_file_registry(list(returned_files.keys()))
+                self.file_registry.update(new_files_reg)
+
+                if HAS_LOGFIRE:
+                    logfire.info(
+                        "Modal Cloud Sandbox execution completed",
+                        status=result.get("status", False),
+                        elapsed=elapsed_modal,
+                        returned_files=list(returned_files.keys()),
+                    )
+                return result
+
+            except Exception as modal_err:
+                print(f"[Modal Sandbox Error] Remote execution on Modal Cloud failed: {modal_err}", flush=True)
+                if HAS_LOGFIRE:
+                    logfire.warn("Modal Cloud execution error", error=str(modal_err))
+                if os.environ.get("SANDBOX_FALLBACK_TO_LOCAL", "true").lower() in ("true", "1", "yes"):
+                    print("[Modal Sandbox] Falling back to local sandbox execution...", flush=True)
+                    return self._execute_local(code, input_files)
+                else:
+                    return format_execution_result(
+                        status=False,
+                        stdout="",
+                        stderr=f"ModalCloudExecutionError: {modal_err}",
+                        execution_time=0.0,
+                        error=str(modal_err),
+                    )
+
+        # 4. Local Execution
+        return self._execute_local(code, input_files)
+
+    def _execute_local(self, code: str, input_files: Dict[str, bytes]) -> Dict[str, Any]:
+        """
+        Executes Python code locally in an isolated thread worker.
+        """
+        # Inject FILE_REGISTRY and get_file_path into global state
         self._globals["FILE_REGISTRY"] = self.file_registry
         self._globals["get_file_path"] = self.get_file_path
 
@@ -784,9 +930,6 @@ class ModalSandboxManager:
             error_str = ""
             timed_out = False
 
-            # CRITICAL FIX: Set matplotlib to use 'Agg' backend (non-interactive) BEFORE executing user code.
-            # This prevents Tkinter threading errors ("main thread is not in main loop") that occur when
-            # matplotlib uses a GUI backend in a background thread (Modal sandbox).
             matplotlib_setup_code = (
                 "import os\n"
                 "os.environ['MPLBACKEND'] = 'Agg'\n"
@@ -794,24 +937,15 @@ class ModalSandboxManager:
                 "matplotlib.use('Agg')\n"
             )
 
-            # Per-call timeout watchdog. The user code runs in a worker thread; if it
-            # exceeds self.timeout seconds we inject an exception into THAT thread only.
-            # The stateful manager (workspace dir, file registry, persistent globals)
-            # stays alive so subsequent tool calls continue from the same state.
             exec_holder: Dict[str, Any] = {"error": None}
 
             def _run_user_code() -> None:
                 try:
-                    # First execute matplotlib backend setup
                     exec(matplotlib_setup_code, self._globals)
-                    # Then execute user code
                     exec(code, self._globals)
                 except BaseException:
                     exec_holder["error"] = traceback.format_exc()
 
-            # sys.stdout/sys.stderr are process-global; redirect them here in the
-            # CALLING thread (not the worker) and always restore them in finally,
-            # so a timed-out worker can never leave the process streams captured.
             real_stdout, real_stderr = sys.stdout, sys.stderr
             try:
                 os.chdir(self._sandbox_dir)
@@ -821,10 +955,6 @@ class ModalSandboxManager:
                 worker.join(self.timeout)
                 if worker.is_alive():
                     timed_out = True
-                    # Ask the worker thread to raise SystemExit at its next bytecode
-                    # boundary. Uninterruptible C extensions (some solvers) may delay
-                    # this, but the container itself is still capped by the Modal
-                    # function timeout.
                     ctypes.pythonapi.PyThreadState_SetAsyncExc(
                         ctypes.c_long(worker.ident), ctypes.py_object(SystemExit)
                     )

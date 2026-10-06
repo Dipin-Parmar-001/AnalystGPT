@@ -51,6 +51,7 @@ def execute_python(
     output_dir: Optional[str] = None,
     timeout: int = SANDBOX_TIMEOUT_S,
     extra_packages: Optional[List[str]] = None,
+    backend: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Executes Python code with input files statefully inside a Modal cloud sandbox environment.
@@ -88,6 +89,7 @@ def execute_python(
             app_name="analystGPT-agent-sandbox",
             extra_packages=extra_packages,
             timeout=timeout,
+            backend=backend,
         )
 
         # 3. Run code statefully inside Modal container sandbox
