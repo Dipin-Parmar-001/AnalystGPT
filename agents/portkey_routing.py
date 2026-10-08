@@ -5,25 +5,28 @@ from typing import Any, Dict
 
 
 def create_with_thinking_route(client: Any, **request_params: Any) -> Any:
-    """Use the dedicated Nvidia route without sending an inline Portkey config."""
+    """Use standard/thinking route without routing to Nvidia slug."""
     params = dict(request_params)
-    params["model"] = "nvidia/nemotron-3-ultra-550b-a55b"
+    model = str(params.get("model") or "")
+    if model.startswith("nvidia/"):
+        params["model"] = model[len("nvidia/"):] or "nemotron-3-ultra-550b-a55b"
+    elif not model:
+        params["model"] = "nemotron-3-ultra-550b-a55b"
     params["extra_body"] = {
         **(params.get("extra_body") or {}),
         "chat_template_kwargs": {"enable_thinking": True},
     }
     headers = dict(params.get("extra_headers") or {})
-    # Portkey blocks inline configs on many workspaces. Prefer the dedicated
-    # saved config slug, then the workspace's configured saved slug; direct
-    # virtual-key routing is available when no saved slug is configured.
-    config_slug = (os.getenv("PORTKEY_NVIDIA_CONFIG_ID") or
-                   os.getenv("PORTKEY_THINKING_CONFIG_ID") or
+    # Portkey blocks inline configs on many workspaces. Prefer the saved
+    # config slug; direct virtual-key routing (OpenRouter) is available
+    # when no saved slug is configured.
+    config_slug = (os.getenv("PORTKEY_THINKING_CONFIG_ID") or
                    os.getenv("PORTKEY_CONFIG_ID"))
     if config_slug:
         headers["x-portkey-config"] = config_slug
         headers.pop("x-portkey-virtual-key", None)
     else:
-        headers["x-portkey-virtual-key"] = "analystgpt-nvidia"
+        headers["x-portkey-virtual-key"] = "analystgpt-openrouter"
     params["extra_headers"] = headers
     return client.chat.completions.create(**params)
 

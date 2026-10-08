@@ -20,7 +20,8 @@ import mimetypes
 import tempfile
 import contextlib
 import traceback
-from typing import Dict, List, Any, Optional, Union
+import hashlib
+from typing import Dict, List, Any, Optional, Union, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -126,14 +127,15 @@ def build_sandbox_image(
 # 2. File Registry & File Input Utilities
 # ==========================================
 
-def resolve_file_path(file_path: Union[str, Path]) -> str:
+def resolve_file_path(file_path: Union[str, Path], extra_dirs: Optional[List[str]] = None) -> str:
     """
     Robustly resolves a file path across:
     1. Direct absolute/relative path
-    2. Project workspace root
-    3. uploads/ folder
-    4. outputs/ folder
-    5. Case-insensitive filename match in uploads/
+    2. Optional extra directories (active output_dir, sandbox_dir, etc.)
+    3. Project workspace root
+    4. uploads/ folder
+    5. outputs/ folder and run_* subfolders
+    6. Case-insensitive filename match in uploads/
     """
     if not file_path:
         raise FileNotFoundError("Empty file path provided.")
@@ -145,7 +147,24 @@ def resolve_file_path(file_path: Union[str, Path]) -> str:
     workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     base_name = os.path.basename(p_str)
 
-    candidates = [
+    candidates = []
+    if extra_dirs:
+        for ed in extra_dirs:
+            if ed and os.path.exists(ed):
+                candidates.append(os.path.join(ed, p_str))
+                candidates.append(os.path.join(ed, base_name))
+
+    # Also check active sandbox dir if global manager is initialized
+    try:
+        if _GLOBAL_SANDBOX_MANAGER and _GLOBAL_SANDBOX_MANAGER._sandbox_dir:
+            sb = _GLOBAL_SANDBOX_MANAGER._sandbox_dir
+            if os.path.exists(sb):
+                candidates.append(os.path.join(sb, p_str))
+                candidates.append(os.path.join(sb, base_name))
+    except Exception:
+        pass
+
+    candidates.extend([
         os.path.join(workspace_root, p_str),
         os.path.join(workspace_root, "uploads", base_name),
         os.path.join(workspace_root, "uploads", p_str),
@@ -155,8 +174,23 @@ def resolve_file_path(file_path: Union[str, Path]) -> str:
         os.path.join(os.getcwd(), "outputs", base_name),
         os.path.join(os.getcwd(), "..", "uploads", base_name),
         os.path.join(os.getcwd(), "..", "outputs", base_name),
-    ]
+    ])
 
+    # Check subfolders in outputs/ (e.g. outputs/run_*/base_name) - most recent first
+    outputs_root = os.path.join(workspace_root, "outputs")
+    if os.path.exists(outputs_root):
+        try:
+            subdirs = sorted([d for d in os.listdir(outputs_root) if os.path.isdir(os.path.join(outputs_root, d))], reverse=True)
+            for sub in subdirs:
+                candidates.append(os.path.join(outputs_root, sub, base_name))
+        except Exception:
+            pass
+
+    for cand in candidates:
+        if os.path.exists(cand) and not os.path.isdir(cand) and os.path.getsize(cand) > 0:
+            return os.path.abspath(cand)
+
+    # Secondary check for candidates that exist even if size is 0 (as fallback)
     for cand in candidates:
         if os.path.exists(cand) and not os.path.isdir(cand):
             return os.path.abspath(cand)
@@ -170,7 +204,7 @@ def resolve_file_path(file_path: Union[str, Path]) -> str:
                 if os.path.exists(cand_upload) and not os.path.isdir(cand_upload):
                     return os.path.abspath(cand_upload)
 
-    raise FileNotFoundError(f"File not found: '{file_path}'. Checked workspace and uploads folder.")
+    raise FileNotFoundError(f"File not found: '{file_path}'. Checked workspace, outputs subdirectories, and uploads folder.")
 
 
 def build_file_registry(
@@ -244,22 +278,25 @@ def format_file_registry_prompt(files: Optional[Union[List[str], Dict[str, Any]]
         "- Load directly by registry filename: e.g. pd.read_csv('filename.csv')",
         "- Or use the available helper function: e.g. pd.read_csv(get_file_path('filename.csv'))",
         "- Do NOT use directory prefixes like 'uploads/' or 'data/' unless specified in the registry.",
+        "- Datasets in FILE_REGISTRY are already present in the workspace: in execute_python, supply only the 'code' parameter (do not pass 'files').",
     ]
     return "\n".join(lines) + "\n"
 
 
-def read_file_as_bytes(file_path: str) -> bytes:
+def read_file_as_bytes(file_path: str, extra_dirs: Optional[List[str]] = None) -> bytes:
     """
     Reads a local file and returns its content as binary bytes.
-    Automatically resolves file location across project root, uploads/, and outputs/ directories.
+    Automatically resolves file location across project root, uploads/, outputs/, and extra directories.
     """
-    resolved_path = resolve_file_path(file_path)
+    resolved_path = resolve_file_path(file_path, extra_dirs=extra_dirs)
     with open(resolved_path, "rb") as f:
         return f.read()
 
 
 def prepare_input_files(
-    files: Union[List[str], Dict[str, Union[str, bytes, Path]]]
+    files: Union[List[str], Dict[str, Union[str, bytes, Path]]],
+    output_dir: Optional[str] = None,
+    sandbox_dir: Optional[str] = None,
 ) -> Dict[str, bytes]:
     """
     Prepares input files into a key-value byte map (`filename -> bytes`) for sending to the sandbox.
@@ -267,11 +304,14 @@ def prepare_input_files(
 
     Args:
         files: Either a list of file paths OR a dict mapping filename -> path/bytes.
+        output_dir: Optional active output directory to look up existing files.
+        sandbox_dir: Optional active sandbox directory to check for already-existing files.
 
     Returns:
         Dict[str, bytes]: Filename to raw file binary contents.
     """
     input_files_map: Dict[str, bytes] = {}
+    extra_dirs = [d for d in [output_dir, sandbox_dir] if d and os.path.exists(d)]
 
     if isinstance(files, list):
         for file_path in files:
@@ -279,7 +319,7 @@ def prepare_input_files(
                 continue
             file_name = os.path.basename(str(file_path))
             try:
-                content = read_file_as_bytes(file_path)
+                content = read_file_as_bytes(file_path, extra_dirs=extra_dirs)
                 input_files_map[file_name] = content
                 # If path has a subfolder like uploads/file.csv, provide subpath too
                 rel_path = str(file_path).replace("\\", "/")
@@ -289,16 +329,57 @@ def prepare_input_files(
                 print(f"[prepare_input_files Warning] Could not read file '{file_path}': {e}")
     elif isinstance(files, dict):
         for file_name, content in files.items():
+            if not file_name:
+                continue
+            base_fname = os.path.basename(str(file_name))
             if isinstance(content, bytes):
                 input_files_map[file_name] = content
-            elif isinstance(content, str):
+            elif content is None or (isinstance(content, str) and not content.strip()):
+                # Placeholder or empty string from model (e.g. {"creditcard.csv": None} or {"cleaned_dataset.csv": ""})
+                # DO NOT encode as b"". Attempt to resolve the real file on disk.
                 try:
-                    input_files_map[file_name] = read_file_as_bytes(content)
+                    resolved_content = read_file_as_bytes(file_name, extra_dirs=extra_dirs)
+                    if resolved_content:
+                        input_files_map[file_name] = resolved_content
                 except Exception:
-                    # Assume text string content
+                    # If the file already exists in sandbox_dir, do NOT supply empty bytes to truncate it!
+                    if sandbox_dir and os.path.exists(os.path.join(sandbox_dir, base_fname)):
+                        continue
+                    print(f"[prepare_input_files Warning] Skipping empty/unresolvable file placeholder: '{file_name}'")
+            elif isinstance(content, str):
+                # Could be a path, filename, or actual text content
+                resolved_content = None
+                try:
+                    resolved_content = read_file_as_bytes(content, extra_dirs=extra_dirs)
+                except Exception:
+                    try:
+                        resolved_content = read_file_as_bytes(file_name, extra_dirs=extra_dirs)
+                    except Exception:
+                        pass
+
+                if resolved_content is not None and len(resolved_content) > 0:
+                    input_files_map[file_name] = resolved_content
+                else:
+                    # Check if string looks like an unresolvable path or placeholder
+                    str_clean = content.strip()
+                    is_placeholder = (
+                        str_clean == file_name.strip()
+                        or "content would be loaded" in str_clean.lower()
+                        or str_clean.endswith(".csv")
+                        or str_clean.endswith(".json")
+                        or str_clean.endswith(".parquet")
+                    )
+                    if is_placeholder:
+                        # If file already in sandbox, preserve it
+                        if sandbox_dir and os.path.exists(os.path.join(sandbox_dir, base_fname)):
+                            continue
+                        print(f"[prepare_input_files Warning] Unresolved path/placeholder string for '{file_name}': '{content}'. Skipping.")
+                        continue
+
+                    # Treat as legitimate text string content
                     input_files_map[file_name] = content.encode("utf-8")
             else:
-                raise TypeError(f"Unsupported content type for file {file_name}: {type(content)}")
+                print(f"[prepare_input_files Warning] Unsupported content type for file {file_name}: {type(content)}. Skipping.")
 
     return input_files_map
 
@@ -307,35 +388,100 @@ def prepare_input_files(
 # 3. File Output / Receiving Utilities
 # ==========================================
 
+def snapshot_directory_files(directory: str) -> Dict[str, Tuple[int, float, str]]:
+    """
+    Snapshots file metadata (size, mtime, md5 hash) for all files in a directory.
+    Enables detecting modified files in addition to newly created files.
+    """
+    snapshot: Dict[str, Tuple[int, float, str]] = {}
+    if not directory or not os.path.exists(directory):
+        return snapshot
+
+    for root, _, filenames in os.walk(directory):
+        for fname in filenames:
+            if fname == "__sandbox_session_state__.pkl" or fname.endswith(".pyc") or "__pycache__" in root:
+                continue
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, directory).replace("\\", "/")
+            try:
+                stat = os.stat(fpath)
+                if stat.st_size < 25 * 1024 * 1024:
+                    with open(fpath, "rb") as f:
+                        fhash = hashlib.md5(f.read()).hexdigest()
+                else:
+                    fhash = f"{stat.st_size}_{stat.st_mtime}"
+                snapshot[rel] = (stat.st_size, stat.st_mtime, fhash)
+            except Exception:
+                pass
+    return snapshot
+
+
 def extract_created_files(
-    tempdir: str, initial_filenames: set
+    tempdir: str,
+    initial_filenames: Union[set, Dict[str, Any]],
+    initial_snapshots: Optional[Dict[str, Tuple[int, float, str]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Scans the temporary sandbox execution directory for newly created or modified files.
 
     Args:
         tempdir: Temporary workspace directory path inside the sandbox container.
-        initial_filenames: Set of input file relative paths to exclude.
+        initial_filenames: Set of input file relative paths (or snapshot dict).
+        initial_snapshots: Optional snapshot dict mapping rel_path -> (size, mtime, hash).
 
     Returns:
         Dict mapping relative filepath -> file info metadata dict.
     """
     returned_files: Dict[str, Dict[str, Any]] = {}
 
+    snapshots = initial_snapshots
+    if snapshots is None and isinstance(initial_filenames, dict):
+        snapshots = initial_filenames
+        initial_names = set(initial_filenames.keys())
+    elif isinstance(initial_filenames, (set, list, tuple)):
+        initial_names = set(initial_filenames)
+    else:
+        initial_names = set()
+
     for root, _, filenames in os.walk(tempdir):
         for filename in filenames:
+            if filename == "__sandbox_session_state__.pkl" or filename.endswith(".pyc") or "__pycache__" in root:
+                continue
             filepath = os.path.join(root, filename)
             relative_path = os.path.relpath(filepath, tempdir).replace("\\", "/")
 
-            if relative_path in initial_filenames and relative_path != "__sandbox_session_state__.pkl":
-                continue
+            is_initial = relative_path in initial_names
 
             try:
-                with open(filepath, "rb") as f:
-                    data = f.read()
+                stat = os.stat(filepath)
+                # Check if an initial file was modified
+                if is_initial:
+                    if snapshots and relative_path in snapshots:
+                        old_size, old_mtime, old_hash = snapshots[relative_path]
+                        if stat.st_size < 25 * 1024 * 1024:
+                            with open(filepath, "rb") as f:
+                                current_data = f.read()
+                            current_hash = hashlib.md5(current_data).hexdigest()
+                        else:
+                            current_data = None
+                            current_hash = f"{stat.st_size}_{stat.st_mtime}"
+
+                        # Skip if UNMODIFIED
+                        if stat.st_size == old_size and current_hash == old_hash:
+                            continue
+
+                        # If modified, retain data
+                        if current_data is None:
+                            with open(filepath, "rb") as f:
+                                current_data = f.read()
+                        data = current_data
+                    else:
+                        continue
+                else:
+                    with open(filepath, "rb") as f:
+                        data = f.read()
 
                 mime, _ = mimetypes.guess_type(relative_path)
-
                 returned_files[relative_path] = {
                     "content": data,
                     "size": len(data),
@@ -521,7 +667,8 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-        initial_filenames = set(files.keys())
+        initial_snapshots = snapshot_directory_files(tempdir)
+        initial_filenames = set(files.keys()).union(set(initial_snapshots.keys()))
         success = False
         error_str = ""
 
@@ -572,8 +719,8 @@ def _raw_execute_python(code: str, files: Dict[str, bytes]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # Extract generated files from workspace
-        returned_files = extract_created_files(tempdir, initial_filenames)
+        # Extract generated or modified files from workspace
+        returned_files = extract_created_files(tempdir, initial_filenames, initial_snapshots=initial_snapshots)
 
     execution_time = time.time() - start_time
 
@@ -805,10 +952,8 @@ class ModalSandboxManager:
         if not self._sandbox_dir or not os.path.exists(self._sandbox_dir):
             self.initialize()
 
-        if isinstance(files, list):
-            input_files = prepare_input_files(files)
-        elif isinstance(files, dict):
-            input_files = files
+        if files:
+            input_files = prepare_input_files(files, sandbox_dir=self._sandbox_dir)
         else:
             input_files = {}
 
@@ -822,11 +967,41 @@ class ModalSandboxManager:
             dir_path = os.path.dirname(file_path)
             if dir_path:
                 os.makedirs(dir_path, exist_ok=True)
+
+            # SAFETY GUARD: Never write empty/zero-byte content into sandbox workspace!
+            content_len = len(content) if isinstance(content, (bytes, str)) else 0
+            if content_len == 0:
+                print(f"[Sandbox Safety] Skipping write of 0-byte input content for '{filename}'.", flush=True)
+                continue
+
             with open(file_path, "wb") as f:
                 if isinstance(content, str):
                     f.write(content.encode("utf-8"))
                 else:
                     f.write(content)
+
+        # 2b. Sync existing non-empty files from registry/host if missing or 0 bytes in sandbox
+        for reg_name, reg_meta in list(self.file_registry.items()):
+            sb_path = os.path.join(self._sandbox_dir, reg_name)
+            if not os.path.exists(sb_path) or os.path.getsize(sb_path) == 0:
+                cand_paths = []
+                if isinstance(reg_meta, dict) and reg_meta.get("path"):
+                    cand_paths.append(reg_meta["path"])
+                try:
+                    cand_paths.append(resolve_file_path(reg_name))
+                except Exception:
+                    pass
+
+                for cp in cand_paths:
+                    if cp and os.path.exists(cp) and not os.path.isdir(cp) and os.path.getsize(cp) > 0:
+                        try:
+                            import shutil
+                            os.makedirs(os.path.dirname(sb_path), exist_ok=True)
+                            shutil.copy2(cp, sb_path)
+                            print(f"[Sandbox Sync] Restored '{reg_name}' from host ({os.path.getsize(cp)} bytes) into sandbox.", flush=True)
+                            break
+                        except Exception:
+                            pass
 
         # 3. Modal Cloud Execution
         if self.backend == "modal":
@@ -920,11 +1095,8 @@ class ModalSandboxManager:
             cwd = os.getcwd()
 
             # Record files in directory before execution
-            initial_files = set()
-            for root, _, filenames in os.walk(self._sandbox_dir):
-                for fname in filenames:
-                    rel = os.path.relpath(os.path.join(root, fname), self._sandbox_dir).replace("\\", "/")
-                    initial_files.add(rel)
+            initial_snapshots = snapshot_directory_files(self._sandbox_dir)
+            initial_files = set(initial_snapshots.keys())
 
             success = False
             error_str = ""
@@ -982,7 +1154,12 @@ class ModalSandboxManager:
             execution_time = time.time() - start_t
 
             # Extract newly generated or modified files
-            returned_files = extract_created_files(self._sandbox_dir, self._known_files.union(set(input_files.keys())))
+            all_known = self._known_files.union(set(input_files.keys())).union(initial_files)
+            returned_files = extract_created_files(
+                self._sandbox_dir,
+                initial_filenames=all_known,
+                initial_snapshots=initial_snapshots,
+            )
 
             # Update set of known files in sandbox
             for root, _, filenames in os.walk(self._sandbox_dir):

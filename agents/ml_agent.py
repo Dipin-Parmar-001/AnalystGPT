@@ -76,7 +76,14 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import (
+    reset_global_sandbox_manager,
+    extract_code_from_content,
+    extract_action_code_from_content,
+    create_synthetic_execute_tool_call,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
+)
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
@@ -146,7 +153,7 @@ class MLAgent:
 
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 7,
         keep_last_tool_pairs: int = 2,
@@ -191,7 +198,7 @@ class MLAgent:
         from agents.observability import instrument_openai_client
         instrument_openai_client(self.client, agent_name="MLAgent")
 
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
         self.agent_name = "MLAgent"
@@ -515,9 +522,18 @@ class MLAgent:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn}", task_id=task_id if isinstance(task_id, int) else None)
 
-            thought = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            assistant_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=assistant_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+                step_callback=_safe_callback,
+            )
 
+            thought = assistant_msg.content or ""
             if thought:
                 _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
 
@@ -584,12 +600,9 @@ class MLAgent:
                     if gf not in generated_files:
                         generated_files.append(gf)
 
-                try:
-                    args_dict = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else fn_args_raw
-                    if "code" in args_dict:
-                        executed_codes.append(args_dict["code"])
-                except Exception:
-                    pass
+                ok_args, args_dict, _ = parse_and_clean_tool_args(fn_args_raw)
+                if ok_args and "code" in args_dict:
+                    executed_codes.append(args_dict["code"])
 
                 memory_manager.append_tool_result(
                     tool_call_id=tc_id,

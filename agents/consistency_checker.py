@@ -803,7 +803,7 @@ def check_threshold_analysis(output_dir: str) -> List[Finding]:
     """
     findings: List[Finding] = []
     ta = _load_json_safe(os.path.join(output_dir, "threshold_analysis.json"))
-    if not isinstance(ta, dict) or ta.get("applicable") is not True:
+    if not isinstance(ta, dict) or ta.get("applicable") is False or ("recommended_threshold" not in ta and ta.get("applicable") is not True):
         return findings
 
     rec_metrics = ta.get("recommended_metrics") or {}

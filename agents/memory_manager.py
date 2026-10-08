@@ -138,9 +138,13 @@ def extract_actions_from_code(code: str) -> List[str]:
 
 def _extract_code_from_tool_call(tool_call: Dict[str, Any]) -> str:
     try:
+        from agents.fallback_parser import parse_and_clean_tool_args
         fn = tool_call.get("function", {})
-        args = json.loads(fn.get("arguments", "{}"))
-        return args.get("code", "")
+        raw_args = fn.get("arguments", "{}")
+        ok, args, _ = parse_and_clean_tool_args(raw_args)
+        if ok and isinstance(args, dict):
+            return args.get("code", "")
+        return ""
     except Exception:
         return ""
 
@@ -181,8 +185,9 @@ def convert_to_plain_chat(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
                 args_str = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
                 try:
-                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
-                    if isinstance(args, dict) and "code" in args:
+                    from agents.fallback_parser import parse_and_clean_tool_args
+                    ok, args, _ = parse_and_clean_tool_args(args_str)
+                    if ok and isinstance(args, dict) and "code" in args:
                         content += f"\n\n```python\n{args['code']}\n```"
                 except Exception:
                     pass
@@ -287,16 +292,45 @@ def sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 sanitized_conv.append(msg)
                 i += 1
             else:
+                from agents.fallback_parser import parse_and_clean_tool_args
+                valid_tcs = []
+                for tc in tool_calls:
+                    tc_dict = tc.copy() if isinstance(tc, dict) else (tc.model_dump() if hasattr(tc, "model_dump") else dict(tc))
+                    fn = tc_dict.get("function", {}) if isinstance(tc_dict, dict) else getattr(tc_dict, "function", {})
+                    args_val = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
+                    ok, parsed_args, _ = parse_and_clean_tool_args(args_val)
+                    if ok:
+                        canonical_json = json.dumps(parsed_args)
+                        if isinstance(fn, dict):
+                            fn["arguments"] = canonical_json
+                            tc_dict["function"] = fn
+                        elif hasattr(fn, "arguments"):
+                            fn.arguments = canonical_json
+                        valid_tcs.append(tc_dict)
+
+                if not valid_tcs:
+                    # All tool_calls in this message had unparseable arguments.
+                    # Convert to plain assistant content to avoid sending malformed arguments to providers.
+                    plain_content = str(msg.get("content") or "Attempted tool execution with unparseable arguments.")
+                    sanitized_conv.append({"role": "assistant", "content": plain_content})
+                    i += 1
+                    # Skip any subsequent tool responses corresponding to dropped calls
+                    while i < len(raw_conv_messages) and raw_conv_messages[i].get("role") == "tool":
+                        i += 1
+                    continue
+
                 # Assistant with tool_calls: MUST come after 'user' or 'tool'
                 if not sanitized_conv or sanitized_conv[-1].get("role") not in ("user", "tool"):
                     sanitized_conv.append({"role": "user", "content": "Please execute the next required tool call."})
 
-                sanitized_conv.append(msg)
+                clean_msg = dict(msg)
+                clean_msg["tool_calls"] = valid_tcs
+                sanitized_conv.append(clean_msg)
                 i += 1
 
                 # Gather expected tool_call_ids
                 expected_ids: Dict[str, str] = {}
-                for tc in tool_calls:
+                for tc in valid_tcs:
                     tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
                     fn_name = ""
                     if isinstance(tc, dict):

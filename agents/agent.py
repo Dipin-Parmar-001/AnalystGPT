@@ -68,7 +68,14 @@ if sys.stderr.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import (
+    reset_global_sandbox_manager,
+    extract_code_from_content,
+    extract_action_code_from_content,
+    create_synthetic_execute_tool_call,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
+)
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 
@@ -226,7 +233,7 @@ class DataAnalystAgent:
         else:
             sanitized_messages = sanitize_messages(messages)
         kwargs = {
-            "model": "nvidia/nemotron-3-ultra-550b-a55b",
+            "model": "nemotron-3-ultra-550b-a55b",
             "messages": sanitized_messages,
         }
         effective_tools = tools if tools is not None else self.tool_manager.get_tool_specs()
@@ -291,7 +298,7 @@ class DataAnalystAgent:
 
                         plain_msgs = convert_to_plain_chat(messages)
                         fallback_kwargs = {
-                            "model": kwargs.get("model", "nvidia/nemotron-3-ultra-550b-a55b"),
+                            "model": kwargs.get("model", "nemotron-3-ultra-550b-a55b"),
                             "messages": plain_msgs,
                         }
                         if effective_tools:
@@ -375,7 +382,15 @@ class DataAnalystAgent:
 
                 def _do_turn():
                     response_msg = self._call_llm(self.memory_manager.messages, tools=self.tool_manager.get_tool_specs())
-                    self.memory_manager.append_assistant_response(response_msg)
+
+                    response_msg, tool_calls = validate_or_retry_tool_calls(
+                        agent_name="Agent",
+                        assistant_msg=response_msg,
+                        memory_manager=self.memory_manager,
+                        call_llm_fn=self._call_llm,
+                        tool_specs=self.tool_manager.get_tool_specs(),
+                        step_callback=_safe_callback,
+                    )
 
                     if response_msg.content:
                         if HAS_LOGFIRE:
@@ -384,7 +399,6 @@ class DataAnalystAgent:
                             print(f"\n[AI Assistant Thought]:\n{response_msg.content.strip()}\n", flush=True)
                         _safe_callback("llm_thought", {"turn": turn + 1, "thought": response_msg.content.strip()})
 
-                    tool_calls = response_msg.tool_calls
                     if not tool_calls:
                         fallback_code = extract_action_code_from_content(response_msg.content or "")
                         if fallback_code:
@@ -395,11 +409,14 @@ class DataAnalystAgent:
                             synthetic_tc = create_synthetic_execute_tool_call(fallback_code, f"fallback_call_{turn + 1}")
                             tool_calls = [synthetic_tc]
                         else:
+                            self.memory_manager.append_assistant_response(response_msg)
                             if HAS_LOGFIRE:
                                 logfire.info("Agent turn loop finished with final response")
                             _safe_callback("turn_finished", {"turn": turn + 1, "response": response_msg.content or ""})
                             return response_msg.content or ""
 
+
+                    self.memory_manager.append_assistant_response(response_msg)
 
                     if HAS_LOGFIRE:
                         logfire.info("Agent requested tool execution", tool_count=len(tool_calls))

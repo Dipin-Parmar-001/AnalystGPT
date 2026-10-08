@@ -78,7 +78,14 @@ if sys.stdout.encoding != 'utf-8':
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import (
+    reset_global_sandbox_manager,
+    extract_code_from_content,
+    extract_action_code_from_content,
+    create_synthetic_execute_tool_call,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
+)
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
@@ -144,7 +151,7 @@ from agents.prompts import DATA_ANALYST_AGENT, DATA_ANALYST_SYSTEM_PROMPT, resol
 class DataAnalystAgent:
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 7,
         keep_last_tool_pairs: int = 2,
@@ -189,7 +196,7 @@ class DataAnalystAgent:
         from agents.observability import instrument_openai_client
         instrument_openai_client(self.client, agent_name="DataAnalystAgent")
 
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
         self.agent_name = "DataAnalystAgent"
@@ -503,37 +510,28 @@ class DataAnalystAgent:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn + 1}", task_id=task_id)
 
-            msg_dict: Dict[str, Any] = {"role": "assistant"}
-            if response_msg.content:
-                msg_dict["content"] = response_msg.content
-            if response_msg.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in response_msg.tool_calls
-                ]
-
-            memory_manager.append_assistant(msg_dict)
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            response_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=response_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+                step_callback=_safe_callback,
+            )
 
             if response_msg.content:
                 _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn + 1, "thought": response_msg.content.strip()})
 
-            tool_calls = response_msg.tool_calls
-
-            # Structural turn classification from the provider response:
-            # - tool_calls present  -> pass to the execution layer below
-            # - content only        -> non-execution response (markdown/JSON
-            #   summary or prose). It is NEVER executed as code; the loop ends
-            #   and task completion is decided by actual execution results.
-            # Only a provider-issued 'Malformed function call:' body is parsed
-            # for recoverable code.
             if not tool_calls:
+                # Structural turn classification from the provider response:
+                # - tool_calls present  -> pass to the execution layer below
+                # - content only        -> non-execution response (markdown/JSON
+                #   summary or prose). It is NEVER executed as code; the loop ends
+                #   and task completion is decided by actual execution results.
+                # Only a provider-issued 'Malformed function call:' body is parsed
+                # for recoverable code.
                 fallback_code = extract_action_code_from_content(response_msg.content or "")
                 if fallback_code and tool_calls_count < effective_max_calls:
                     if HAS_LOGFIRE:
@@ -544,7 +542,27 @@ class DataAnalystAgent:
                     tool_calls = [synthetic_tc]
                 else:
                     final_response = response_msg.content or ""
+                    msg_dict: Dict[str, Any] = {"role": "assistant", "content": final_response}
+                    memory_manager.append_assistant(msg_dict)
                     break
+
+            msg_dict: Dict[str, Any] = {"role": "assistant"}
+            if response_msg.content:
+                msg_dict["content"] = response_msg.content
+            if tool_calls:
+                msg_dict["tool_calls"] = [
+                    tc.model_dump() if hasattr(tc, "model_dump") else (tc if isinstance(tc, dict) else {
+                        "id": getattr(tc, "id", f"call_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(tc.function, "name", "") if hasattr(tc, "function") else tc.get("function", {}).get("name", ""),
+                            "arguments": getattr(tc.function, "arguments", "{}") if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+                        }
+                    })
+                    for i, tc in enumerate(tool_calls)
+                ]
+
+            memory_manager.append_assistant(msg_dict)
 
 
             # Process requested tool calls
@@ -566,12 +584,9 @@ class DataAnalystAgent:
                     )
                     continue
 
-                try:
-                    parsed_args = json.loads(raw_args)
-                    if "code" in parsed_args:
-                        executed_code_blocks.append(parsed_args["code"])
-                except Exception:
-                    pass
+                ok_args, parsed_args, _ = parse_and_clean_tool_args(raw_args)
+                if ok_args and "code" in parsed_args:
+                    executed_code_blocks.append(parsed_args["code"])
 
                 _safe_callback("tool_executing", {
                     "agent": self.agent_name,

@@ -59,6 +59,7 @@ class PlanStatus(str, Enum):
     CONFIRMED = "confirmed"
     MODIFIED = "modified"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
 
 
 def is_model_training_title(title: str) -> bool:
@@ -740,7 +741,7 @@ class PlannerAgent:
     def __init__(
         self,
         available_agents: Optional[List[str]] = None,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         max_tool_calls_per_task: int = 7
     ):
         if not PORTKEY_API_KEY:
@@ -748,17 +749,15 @@ class PlannerAgent:
 
         setup_logfire()
 
-        # create_with_thinking_route applies a saved config slug or Nvidia
-        # virtual key per request. Do not attach an inline fallback config to
-        # client defaults; Portkey rejects it when block_inline_config is on.
         headers = {"x-portkey-api-key": PORTKEY_API_KEY}
         if PORTKEY_CONFIG_ID:
+            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
             if HAS_LOGFIRE:
                 logfire.info("PlannerAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
             else:
                 print(f"[PlannerAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-        elif HAS_LOGFIRE:
-            logfire.info("PlannerAgent will route through the configured Nvidia virtual key")
+        else:
+            headers["x-portkey-virtual-key"] = "analystgpt-openrouter"
 
         self.client = OpenAI(
             base_url="https://api.portkey.ai/v1",
@@ -771,7 +770,7 @@ class PlannerAgent:
         instrument_openai_client(self.client, agent_name="PlannerAgent")
 
         self.available_agents = available_agents or DEFAULT_AVAILABLE_AGENTS
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.max_tool_calls_per_task = max_tool_calls_per_task
 
     def create_plan(

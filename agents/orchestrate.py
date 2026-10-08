@@ -158,10 +158,10 @@ class WorkflowOrchestrator:
     def __init__(
         self,
         tool_manager: Optional[ToolManager] = None,
-        planner_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
-        analyst_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
-        ml_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
-        reporter_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        planner_model: str = "nemotron-3-ultra-550b-a55b",
+        analyst_model: str = "nemotron-3-ultra-550b-a55b",
+        ml_model: str = "nemotron-3-ultra-550b-a55b",
+        reporter_model: str = "nemotron-3-ultra-550b-a55b",
     ):
         setup_logfire()
 

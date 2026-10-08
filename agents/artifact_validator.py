@@ -25,7 +25,7 @@ class ValidationResult:
     report_structure_issues: List[str]
 
 
-def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
+def extract_claimed_artifacts(agent_response: Any) -> List[str]:
     """
     Extract claimed artifacts from agent response.
 
@@ -35,6 +35,17 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
     - Any JSON field containing artifact filenames
     """
     claimed = []
+    if not agent_response:
+        return claimed
+    if isinstance(agent_response, list):
+        for item in agent_response:
+            if isinstance(item, str) and any(item.endswith(ext) for ext in ('.csv', '.json', '.png', '.pkl', '.md', '.txt')):
+                claimed.append(item)
+            elif isinstance(item, dict):
+                claimed.extend(extract_claimed_artifacts(item))
+        return list(set(claimed))
+    if not isinstance(agent_response, dict):
+        return claimed
 
     # Direct generated_files field
     if "generated_files" in agent_response:
@@ -94,13 +105,15 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
     return list(set(claimed))
 
 
-def detect_fallback_generation(agent_response: Dict[str, Any], output_dir: str) -> Tuple[bool, List[str]]:
+def detect_fallback_generation(agent_response: Any, output_dir: str) -> Tuple[bool, List[str]]:
     """
     Detect if fallback generation was used instead of actual artifact creation.
 
     Returns (fallback_detected, fallback_indicators)
     """
     fallback_indicators = []
+    if not isinstance(agent_response, dict):
+        return False, []
 
     # No response-text keyword scanning: analysis prose routinely contains words
     # like "missing" ("no missing values"), causing false fallback flags.
@@ -345,7 +358,7 @@ def validate_artifacts(
     report_structure_valid = True
     report_structure_issues = []
     if agent_name == "ReporterAgent":
-        report = agent_response.get("final_report", "") or agent_response.get("response", "")
+        report = (agent_response.get("final_report", "") or agent_response.get("response", "")) if isinstance(agent_response, dict) else ""
         report_structure_valid, report_structure_issues = validate_report_structure(report)
 
     # Build hallucination warnings

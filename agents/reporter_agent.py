@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
 from openai import OpenAI
 from agents.logger import setup_logfire, HAS_LOGFIRE
+from agents.tools import validate_or_retry_tool_calls, parse_and_clean_tool_args
 
 
 def is_fragmented_or_unparsable_response(message: Any) -> bool:
@@ -66,6 +67,37 @@ def is_fragmented_or_unparsable_response(message: Any) -> bool:
 
     return False
 
+
+def clean_thinking_sentences(report_text: str) -> str:
+    """
+    Deterministically cleans internal thinking sentences, conversational self-corrections,
+    and deliberation phrases leaked into the generated report text.
+    """
+    if not report_text or not isinstance(report_text, str):
+        return report_text
+
+    cleaned = report_text
+
+    # 1. Clean parenthesized internal monologue containing thinking triggers
+    thinking_paren_pattern = re.compile(
+        r"\s*\([^)]*?\b(?:Wait\s*—|Wait\s*,|Let me check|Let's see|Let me see|Actually\s*,?\s*looking|Actually\s*,?\s*the FACT_SHEET)[^)]*?\)",
+        flags=re.IGNORECASE,
+    )
+    cleaned = thinking_paren_pattern.sub("", cleaned)
+
+    # 2. Clean standalone sentences beginning with thinking/deliberation markers
+    thinking_sentence_pattern = re.compile(
+        r"(?:(?<=\.\s)|(?<=\n)|^)[ \t]*(?:Wait\s*—|Wait\s*,|Let me check\b|Let's see\b|Let me see\b|Thinking:\s*)[^\n\.]*?(?:\.|\n|$)",
+        flags=re.IGNORECASE,
+    )
+    cleaned = thinking_sentence_pattern.sub("", cleaned)
+
+    # Clean up leftover double periods or orphan spaces
+    cleaned = re.sub(r"\.\s*\.", ".", cleaned)
+    cleaned = re.sub(r"[ \t]+(?=\n|$)", "", cleaned)
+
+    return cleaned
+
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
     try:
@@ -81,7 +113,7 @@ from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT, REPORT_REPAIR
 from agents.memory_manager import MessageHistoryManager, sanitize_messages, convert_to_plain_chat
 from agents.portkey_routing import create_with_thinking_route, extract_reasoning_text
 from agents.planner_agent import ExecutionPlan
-from agents.cancellation import CancellationToken, WorkflowCancelledException
+from agents.cancellation import CancellationToken, WorkflowCancelledException, WorkflowPausedException
 from agents.numeric_verifier import verify_report_numbers, attach_verification_warning
 from agents.fact_sheet import fill_blanks, extract_blanks, replace_unresolved_blanks
 
@@ -147,7 +179,7 @@ class ReporterAgent:
 
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 10,
         keep_last_tool_pairs: int = 2,
@@ -161,17 +193,15 @@ class ReporterAgent:
 
         setup_logfire()
 
-        # The thinking route applies a saved config slug or Nvidia virtual key
-        # per request. Never put an inline config on client defaults: it is sent
-        # on every request and is rejected by workspaces with block_inline_config.
         headers = {"x-portkey-api-key": PORTKEY_API_KEY}
         if PORTKEY_CONFIG_ID:
+            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
             if HAS_LOGFIRE:
                 logfire.info("ReporterAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
             else:
                 print(f"[ReporterAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-        elif HAS_LOGFIRE:
-            logfire.info("ReporterAgent will route through the configured Nvidia virtual key")
+        else:
+            headers["x-portkey-virtual-key"] = "analystgpt-openrouter"
 
         self.client = OpenAI(
             base_url="https://api.portkey.ai/v1",
@@ -189,7 +219,7 @@ class ReporterAgent:
         from agents.observability import instrument_openai_client
         instrument_openai_client(self.client, agent_name="ReporterAgent")
 
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
         self.agent_name = "ReporterAgent"
@@ -492,8 +522,18 @@ class ReporterAgent:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn}")
 
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            assistant_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=assistant_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+                step_callback=_safe_callback,
+            )
+
             thought = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
             reasoning = extract_reasoning_text(assistant_msg)
 
             if thought or reasoning:
@@ -629,7 +669,7 @@ class ReporterAgent:
                         logfire.info("ReporterAgent retrieved final report from saved artifact", path=candidate_path, length=len(file_report))
                     else:
                         print(f"[ReporterAgent] Retrieved final report from saved artifact: {candidate_path} ({len(file_report)} chars)")
-                    final_report = file_report
+                    final_report = clean_thinking_sentences(file_report)
                     break
             except Exception as read_err:
                 print(f"[ReporterAgent Warning] Could not read {candidate_path}: {read_err}.")
@@ -666,7 +706,7 @@ class ReporterAgent:
                         final_report = repaired_report
                         memory_manager.append_assistant({"role": "assistant", "content": final_report})
                         fill = fill_blanks(final_report, fact_sheet)
-                except WorkflowCancelledException:
+                except (WorkflowCancelledException, WorkflowPausedException):
                     raise
                 except Exception as blank_err:
                     print(f"[ReporterAgent Warning] blank repair turn failed: {blank_err}")
@@ -677,6 +717,7 @@ class ReporterAgent:
                     final_report = fill["report"]
             else:
                 final_report = fill["report"]
+        final_report = clean_thinking_sentences(final_report)
 
         # ==============================================================================
         # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
@@ -771,6 +812,7 @@ class ReporterAgent:
         # file even when the sandbox only exports newly created filenames.
         try:
             if final_report:
+                final_report = clean_thinking_sentences(final_report)
                 os.makedirs(output_dir, exist_ok=True)
                 for artifact_path in (report_filepath, delivery_filepath):
                     with open(artifact_path, "w", encoding="utf-8") as rf:
@@ -887,8 +929,18 @@ class ReporterAgent:
                 cancellation_token.check_cancelled(step_name=f"ReporterAgent repair turn {turn}")
 
             assistant_msg = self._call_llm(memory_manager.messages, tools=self.tool_manager.get_tool_specs())
+
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            assistant_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=assistant_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+            )
+
             thought = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
             reasoning = extract_reasoning_text(assistant_msg)
 
             if thought or reasoning:

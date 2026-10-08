@@ -124,12 +124,14 @@ def load_registry(path: str) -> ModelRegistry:
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    if not isinstance(data, dict):
-        raise ValueError(f"model_registry.json root must be an object, got {type(data).__name__}")
-
-    models_data = data.get('models')
-    if not isinstance(models_data, list):
-        raise ValueError(f"model_registry.json 'models' must be a list, got {type(models_data).__name__}")
+    if isinstance(data, list):
+        models_data = data
+    elif isinstance(data, dict):
+        models_data = data.get('models')
+        if not isinstance(models_data, list):
+            raise ValueError(f"model_registry.json 'models' must be a list, got {type(models_data).__name__}")
+    else:
+        raise ValueError(f"model_registry.json root must be a list or an object, got {type(data).__name__}")
 
     # Validate each entry with backward compatibility
     models = []

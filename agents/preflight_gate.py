@@ -144,6 +144,17 @@ def _finding(severity: str, code: str, message: str, artifacts: List[str], stage
     return PreflightFinding(severity=severity, code=code, message=message, artifacts=artifacts, stage=stage)
 
 
+def _extract_registry_models(reg: Any) -> List[Dict[str, Any]]:
+    """Safely extracts the list of model entries whether model_registry.json is a list or dict."""
+    if isinstance(reg, list):
+        return [m for m in reg if isinstance(m, dict)]
+    elif isinstance(reg, dict):
+        models = reg.get("models")
+        if isinstance(models, list):
+            return [m for m in models if isinstance(m, dict)]
+    return []
+
+
 # ----------------------------------------------------------------------------
 # Checks (each returns a list of PreflightFinding)
 # ----------------------------------------------------------------------------
@@ -204,10 +215,11 @@ def _check_champion(output_dir: str, champ: Optional[Dict[str, Any]], selector_r
     # champion_model.json is authoritative; the registry must point to the same
     # artifact with exactly one champion status.
     registry = _load_json_safe(os.path.join(output_dir, "model_registry.json"))
-    if isinstance(registry, dict):
+    if registry is not None:
+        models = _extract_registry_models(registry)
         registry_champions = [
             item.get("artifact_filename") or item.get("model")
-            for item in (registry.get("models") or [])
+            for item in models
             if isinstance(item, dict) and str(item.get("status", "")).lower() == "champion"
         ]
         if registry_champions != [art]:
@@ -511,7 +523,9 @@ def _check_stale_threshold_analysis(output_dir: str, champ: Optional[Dict[str, A
         return findings
     winner = (champ.get("_winner_metrics") or {})
 
-    def _matches(metrics: Dict[str, Any], tol: float = 0.01) -> bool:
+    def _matches(metrics: Any, tol: float = 0.01) -> bool:
+        if not isinstance(metrics, dict) or not isinstance(dm, dict):
+            return False
         compared = [m for m in ("recall", "precision", "f1")
                     if isinstance(dm.get(m), (int, float)) and isinstance(metrics.get(m), (int, float))]
         return bool(compared) and all(abs(float(dm[m]) - float(metrics[m])) <= tol for m in compared)
@@ -521,7 +535,7 @@ def _check_stale_threshold_analysis(output_dir: str, champ: Optional[Dict[str, A
     # (b) match against non-champion registry entries (superseded baselines).
     superseded_match = False
     reg = _load_json_safe(os.path.join(output_dir, "model_registry.json")) or {}
-    for entry in (reg.get("models") or []):
+    for entry in _extract_registry_models(reg):
         if not isinstance(entry, dict) or entry.get("status") == "champion":
             continue
         entry_art = entry.get("artifact_filename") or entry.get("model")
@@ -579,14 +593,73 @@ def annotate_stale_threshold_analysis(output_dir: str, champ: Optional[Dict[str,
     return _dump_json(os.path.join(output_dir, "threshold_analysis.json"), ta)
 
 
+def _sync_threshold_analysis_ml_summary(output_dir: str, champ: Optional[Dict[str, Any]]) -> List[str]:
+    """Check threshold_analysis and ml_summary.json alignment.
+
+    If they are improving the same key metric (or threshold analysis belongs to the champion),
+    sync ml_summary.json's threshold block to match threshold_analysis.json.
+    If there are discrepancies, log a warning to logs/logfire ONLY without giving a warning
+    to the next step (reporter).
+    """
+    repairs: List[str] = []
+    ta_path = os.path.join(output_dir, "threshold_analysis.json")
+    ta = _load_json_safe(ta_path)
+    if not isinstance(ta, dict) or ta.get("applicable") is False:
+        return repairs
+
+    champ_art = (champ.get("artifact_filename") or champ.get("model")) if isinstance(champ, dict) else None
+    ta_art = ta.get("model_artifact") or ta.get("artifact_filename")
+    if champ_art and ta_art and ta_art != champ_art:
+        return repairs
+
+    primary_metric = champ.get("primary_metric") if isinstance(champ, dict) else "recall"
+
+    for fname in sorted(os.listdir(output_dir)) if os.path.isdir(output_dir) else []:
+        if fname.startswith("ml_summary") and fname.endswith(".json"):
+            path = os.path.join(output_dir, fname)
+            summary = _load_json_safe(path)
+            if not isinstance(summary, dict):
+                continue
+            ml_ta = summary.get("threshold_analysis")
+            if isinstance(ml_ta, dict):
+                ta_rec = ta.get("recommended_threshold")
+                ml_rec = ml_ta.get("recommended_threshold")
+                if ta_rec is not None and ml_rec is not None and abs(float(ta_rec) - float(ml_rec)) > 0.001:
+                    # Log warning to logs only, do NOT raise or propagate warning to next step
+                    if logfire:
+                        logfire.warn(
+                            f"{fname} and threshold_analysis.json recommended threshold mismatch",
+                            threshold_analysis=ta_rec,
+                            ml_summary=ml_rec,
+                            primary_metric=primary_metric
+                        )
+                    else:
+                        print(f"[PreflightGate] Note: {fname} (threshold {ml_rec}) and threshold_analysis.json (threshold {ta_rec}) differ. Syncing ml_summary to threshold_analysis.")
+                    # Sync ml_summary.json to match threshold_analysis.json
+                    summary["threshold_analysis"] = {
+                        "applicable": ta.get("applicable", True),
+                        "reason_if_not_applicable": ta.get("reason_if_not_applicable"),
+                        "default_threshold": ta.get("default_threshold", 0.5),
+                        "default_metrics": ta.get("default_metrics", {}),
+                        "recommended_threshold": ta.get("recommended_threshold"),
+                        "recommended_metrics": ta.get("recommended_metrics", {}),
+                        "selection_rationale": ta.get("selection_rationale", "")
+                    }
+                    if _dump_json(path, summary):
+                        repairs.append(f"{fname}: threshold_analysis synced to match threshold_analysis.json")
+    return repairs
+
+
 def _repair_registry_champion(output_dir: str, champ: Dict[str, Any]) -> bool:
     """Make the registry reflect champion_model.json, the canonical pointer."""
     path = os.path.join(output_dir, "model_registry.json")
     registry = _load_json_safe(path)
-    if not isinstance(registry, dict) or not isinstance(registry.get("models"), list):
+    if not isinstance(registry, (dict, list)):
         return False
     artifact = champ.get("artifact_filename") or champ.get("model")
-    models = registry["models"]
+    models = _extract_registry_models(registry)
+    if not models and not isinstance(registry, list):
+        return False
     matched = False
     for entry in models:
         if not isinstance(entry, dict):
@@ -599,7 +672,7 @@ def _repair_registry_champion(output_dir: str, champ: Dict[str, Any]) -> bool:
             return False
         model_id = os.path.splitext(os.path.basename(str(artifact)))[0]
         family = model_id.rsplit("_p", 1)[0] if "_p" in model_id else model_id
-        models.append({
+        new_entry = {
             "model_id": model_id,
             "model_family": family,
             "artifact_filename": artifact,
@@ -608,7 +681,11 @@ def _repair_registry_champion(output_dir: str, champ: Dict[str, Any]) -> bool:
             "evaluation_metrics": {},
             "primary_selection_metric": champ.get("primary_metric") or "",
             "status": "champion",
-        })
+        }
+        if isinstance(registry, list):
+            registry.append(new_entry)
+        elif isinstance(registry, dict):
+            registry.setdefault("models", []).append(new_entry)
     return _dump_json(path, registry)
 
 
@@ -661,7 +738,7 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
 
     reg = _load_json_safe(os.path.join(output_dir, "model_registry.json")) or {}
     reg_champs = [m.get("artifact_filename") or m.get("model")
-                  for m in (reg.get("models") or [])
+                  for m in _extract_registry_models(reg)
                   if isinstance(m, dict) and m.get("status") == "champion"]
     if reg_champs != [champ_art]:
         result["findings"].append(_finding(
@@ -689,6 +766,10 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
                     block["stale_for_current_champion"] = True
                     block["stale_reason"] = "Threshold analysis belongs to a different model artifact than champion_model.json."
                     _dump_json(path, summary)
+
+    # 4. Sync threshold analysis to ml_summary.json if applicable
+    if repair:
+        result["repairs"].extend(_sync_threshold_analysis_ml_summary(output_dir, champ))
 
     result["consistent"] = len(result["findings"]) == 0
 
@@ -881,6 +962,9 @@ def run_preflight(output_dir: str, goal_text: str = "", repair: bool = False) ->
                             block["stale_for_current_champion"] = True
                             block["stale_reason"] = "Threshold analysis belongs to a different model artifact than champion_model.json."
                             _dump_json(path, summary)
+
+            # Sync threshold analysis to ml_summary.json if applicable
+            repairs.extend(_sync_threshold_analysis_ml_summary(output_dir, champ))
 
         result.repairs_applied = repairs
 

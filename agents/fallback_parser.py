@@ -8,7 +8,13 @@ or HTTP response envelopes) and extracts executable Python code or JSON payloads
 
 import re
 import json
-from typing import Optional, Dict, Any, Union, List
+from typing import Optional, Dict, Any, Union, List, Tuple, Callable
+
+try:
+    import logfire
+    HAS_LOGFIRE = True
+except ImportError:
+    HAS_LOGFIRE = False
 
 
 class SyntheticFunction:
@@ -377,3 +383,235 @@ def create_synthetic_execute_tool_call(code: str, call_id: Optional[str] = None)
         name="execute_python",
         arguments={"code": code}
     )
+
+
+def repair_json_escapes(raw_str: str) -> str:
+    r"""
+    Repairs invalid escape sequences in JSON strings.
+    RFC 8259 allows only \", \\, \/, \b, \f, \n, \r, \t, and \uXXXX.
+    LLMs frequently output Python code with lone backslashes (line continuations '\\ ', '\\\n'),
+    escaped single quotes (\\'), or regex escapes (\\d, \\w, \\s, etc.) which cause JSONDecodeError.
+    This replaces any backslash NOT followed by a valid JSON escape character with double-backslash (\\\\).
+    """
+    if not raw_str:
+        return raw_str
+    pattern = r'\\(?!(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))'
+    return re.sub(pattern, r'\\\\', raw_str)
+
+
+def parse_and_clean_tool_args(raw_args: Any) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    """
+    Robustly parses and sanitizes LLM tool call arguments into a Python dictionary.
+
+    Returns:
+        (is_valid, parsed_dict, error_message)
+    """
+    if isinstance(raw_args, dict):
+        return True, raw_args, None
+
+    if raw_args is None:
+        return True, {}, None
+
+    raw_str = str(raw_args).strip()
+    if not raw_str or raw_str == "{}":
+        return True, {}, None
+
+    # Check for provider prefix "Malformed function call: ..."
+    if re.match(r"^Malformed function call:?\s*", raw_str, re.IGNORECASE):
+        code = extract_code_from_content(raw_str)
+        if code:
+            return True, {"code": code}, None
+
+    # Attempt 1: Standard json.loads
+    first_err = None
+    try:
+        parsed = json.loads(raw_str)
+        if isinstance(parsed, dict):
+            return True, parsed, None
+    except Exception as e1:
+        first_err = e1
+
+    # Attempt 2: json.loads with strict=False (allows unescaped control characters)
+    try:
+        parsed = json.loads(raw_str, strict=False)
+        if isinstance(parsed, dict):
+            return True, parsed, None
+    except Exception:
+        pass
+
+    # Attempt 3: Repair invalid backslash escapes + strict=False
+    try:
+        repaired = repair_json_escapes(raw_str)
+        parsed = json.loads(repaired, strict=False)
+        if isinstance(parsed, dict):
+            return True, parsed, None
+    except Exception:
+        pass
+
+    # Attempt 4: If JSON was wrapped in markdown ```json ... ``` fences
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_str)
+    if fence_match:
+        fenced_content = fence_match.group(1).strip()
+        try:
+            parsed = json.loads(fenced_content, strict=False)
+            if isinstance(parsed, dict):
+                return True, parsed, None
+        except Exception:
+            try:
+                repaired = repair_json_escapes(fenced_content)
+                parsed = json.loads(repaired, strict=False)
+                if isinstance(parsed, dict):
+                    return True, parsed, None
+            except Exception:
+                pass
+
+    # Attempt 5: Extraction of "code" field if it looks like an execute_python tool call
+    code_field_match = re.search(r'["\']code["\']\s*:\s*(?:"""|\'\'\'|")([\s\S]*?)(?:"""|\'\'\'|")\s*(?:,\s*["\']files["\']|\}\s*$)', raw_str)
+    if code_field_match:
+        extracted = code_field_match.group(1).strip()
+        if looks_like_python_code(extracted, lenient=True):
+            return True, {"code": extracted}, None
+
+    err_msg = f"{type(first_err).__name__}: {str(first_err)}" if first_err else "Failed to parse tool arguments as JSON"
+    return False, {}, err_msg
+
+
+def validate_or_retry_tool_calls(
+    agent_name: str,
+    assistant_msg: Any,
+    memory_manager: Any,
+    call_llm_fn: Callable[[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]], Any],
+    tool_specs: Optional[List[Dict[str, Any]]] = None,
+    max_retries: int = 2,
+    cancellation_token: Optional[Any] = None,
+    step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> Tuple[Any, List[Any]]:
+    """
+    Validates tool call arguments on assistant_msg.
+    If parsing fails for any tool call:
+    - Retries immediately with the LLM providing the exact JSON parse error.
+    - NEVER adds the unparseable tool call or its failed execution to memory_manager,
+      preventing message history corruption.
+    - Returns (final_assistant_msg, clean_tool_calls).
+    """
+    curr_msg = assistant_msg
+    curr_tool_calls = getattr(curr_msg, "tool_calls", None) or []
+    if not curr_tool_calls and isinstance(curr_msg, dict):
+        curr_tool_calls = curr_msg.get("tool_calls", []) or []
+
+    if not curr_tool_calls:
+        return curr_msg, []
+
+    for retry_idx in range(max_retries + 1):
+        if cancellation_token:
+            cancellation_token.check_cancelled(step_name=f"{agent_name} validate tool calls (retry {retry_idx})")
+
+        all_valid = True
+        first_bad_tool = None
+        first_bad_err = None
+
+        cleaned_tool_calls = []
+        for tc in curr_tool_calls:
+            fn_name = tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", "")
+            raw_args = tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+
+            ok, parsed_args, err = parse_and_clean_tool_args(raw_args)
+            if not ok:
+                all_valid = False
+                first_bad_tool = (fn_name, raw_args)
+                first_bad_err = err
+                break
+            else:
+                canonical_args = json.dumps(parsed_args)
+                if hasattr(tc, "function"):
+                    tc.function.arguments = canonical_args
+                elif isinstance(tc, dict) and "function" in tc:
+                    tc["function"]["arguments"] = canonical_args
+                cleaned_tool_calls.append(tc)
+
+        if all_valid:
+            if hasattr(curr_msg, "tool_calls"):
+                curr_msg.tool_calls = cleaned_tool_calls
+            elif isinstance(curr_msg, dict):
+                curr_msg["tool_calls"] = cleaned_tool_calls
+            return curr_msg, cleaned_tool_calls
+
+        # If retries exhausted, exit retry loop
+        if retry_idx >= max_retries:
+            break
+
+        # A tool call failed parsing: DO NOT add to memory_manager!
+        fn_name, raw_args = first_bad_tool
+        err_msg = str(first_bad_err)
+
+        if HAS_LOGFIRE:
+            logfire.warn(
+                f"{agent_name} tool argument parse error, retrying without corrupting history",
+                agent=agent_name,
+                tool=fn_name,
+                parse_error=err_msg,
+                raw_args_snippet=str(raw_args)[:300],
+                retry_attempt=retry_idx + 1,
+                max_retries=max_retries,
+            )
+        else:
+            print(
+                f"[{agent_name} Parse Error] Tool '{fn_name}' arguments failed to parse ({err_msg}). "
+                f"Retrying LLM (attempt {retry_idx + 1}/{max_retries}) without corrupting history...",
+                flush=True
+            )
+
+        if step_callback:
+            try:
+                step_callback("tool_parse_error", {
+                    "agent": agent_name,
+                    "tool": fn_name,
+                    "error": err_msg,
+                    "raw_args": str(raw_args)[:300],
+                    "retry_attempt": retry_idx + 1,
+                })
+            except Exception:
+                pass
+
+        retry_prompt = (
+            f"[SYSTEM ERROR: Tool Call Argument Parsing Failed]\n"
+            f"Your previous attempt to call tool '{fn_name}' failed because the arguments were malformed or invalid JSON:\n"
+            f"Error: {err_msg}\n\n"
+            f"Raw arguments received:\n{str(raw_args)[:500]}\n\n"
+            f"Please retry immediately and re-issue the tool call with strictly valid, properly escaped JSON (RFC 8259). "
+            f"Ensure all quotes, newlines, and backslashes in code or arguments are properly escaped."
+        )
+
+        # Construct retry messages from clean memory_manager history
+        base_messages = getattr(memory_manager, "messages", memory_manager)
+        retry_messages = list(base_messages)
+        thought_content = (getattr(curr_msg, "content", None) or (curr_msg.get("content") if isinstance(curr_msg, dict) else "") or "").strip()
+        if thought_content:
+            retry_messages.append({"role": "assistant", "content": thought_content})
+        retry_messages.append({"role": "user", "content": retry_prompt})
+
+        curr_msg = call_llm_fn(retry_messages, tools=tool_specs)
+        curr_tool_calls = getattr(curr_msg, "tool_calls", None) or []
+        if not curr_tool_calls and isinstance(curr_msg, dict):
+            curr_tool_calls = curr_msg.get("tool_calls", []) or []
+
+        if not curr_tool_calls:
+            return curr_msg, []
+
+    # If retries exhausted and still invalid:
+    fn_name, raw_args = first_bad_tool
+    fallback_code = extract_action_code_from_content(str(raw_args)) or extract_action_code_from_content(getattr(curr_msg, "content", None) or "")
+    if fallback_code and (fn_name == "execute_python" or fn_name == "unknown" or not fn_name):
+        if HAS_LOGFIRE:
+            logfire.info(f"{agent_name} recovered unparseable tool call via fallback parser after retries")
+        else:
+            print(f"[{agent_name} Fallback] Recovered unparseable tool call via fallback code extraction.", flush=True)
+        synthetic_tc = create_synthetic_execute_tool_call(fallback_code, "fallback_call_repair")
+        return curr_msg, [synthetic_tc]
+
+    print(f"[{agent_name} Error] Tool arguments could not be parsed after {max_retries} retries. Skipping corrupted tool call to preserve history.", flush=True)
+    if hasattr(curr_msg, "tool_calls"):
+        curr_msg.tool_calls = []
+    elif isinstance(curr_msg, dict):
+        curr_msg["tool_calls"] = []
+    return curr_msg, []

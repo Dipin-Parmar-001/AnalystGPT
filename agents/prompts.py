@@ -432,6 +432,7 @@ MANDATORY sections below explicitly require.
 - Tool: `execute_python` (executes stateful Python code in a secure Modal Cloud Sandbox).
 - Available Packages: pandas, numpy, matplotlib, seaborn, scipy, statsmodels, openpyxl, scikit-learn.
 - File Registry & Paths: Available datasets are registered in `FILE_REGISTRY`. Load them directly by their filename (e.g. `pd.read_csv("data.csv")`) or via helper `pd.read_csv(get_file_path("data.csv"))`. Never prepend directory paths like "uploads/data.csv".
+- Tool Parameters: In `execute_python`, pass ONLY the `code` parameter. Do NOT pass `files` — all datasets in `FILE_REGISTRY` and created artifacts are already mounted in the workspace.
 - Tool Call Limit: You have a STRICT MAXIMUM limit of {MAX_TOOL_CALLS} tool calls.
 - STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this tool call limit. Any tool call
   beyond the limit is rejected and will NOT be executed. You MUST complete ALL work — inspection,
@@ -980,6 +981,8 @@ It runs code in an isolated Modal sandbox.
 The sandbox has pandas, numpy, scikit-learn, joblib, and, when relevant,
 xgboost/lightgbm pre-installed.
 
+In `execute_python`, pass ONLY the `code` parameter. Do NOT supply the `files` parameter — all datasets in `FILE_REGISTRY` and created artifacts are already mounted in the workspace.
+
 Write self-contained, re-runnable Python code.
 
 All reported numerical results MUST originate from executed Python variables or
@@ -998,6 +1001,22 @@ STRICT BUDGET RULES (NON-NEGOTIABLE):
   verification — within this budget. Never assume extra calls will be granted.
 - Plan the execution efficiently: combine related steps into single self-contained scripts and
   always reserve your last call for verification and final artifact saving.
+
+===============================================================================
+# TIMEOUTS, PARTIAL SCRIPT FAILURES, AND INCREMENTAL WORK (CRITICAL)
+===============================================================================
+
+1. **Preserve and reuse partial progress:**
+   If a script execution encounters a timeout (300s limit) or fails partway through with an error:
+   - Carefully inspect stdout, stderr, and the workspace to determine which sub-tasks ALREADY SUCCEEDED and what artifacts or variables were ALREADY created.
+   - The execution environment is STATEFUL. Completed computations, intermediate datasets (`.csv`), charts (`.png`), and summary files (`.json`) persist across tool calls.
+2. **Do NOT blindly re-run the entire script from scratch:**
+   - If earlier steps succeeded (e.g., initial data inspection, basic cleaning, partial chart generation), DO NOT re-execute them! Re-running completed work wastes your strict tool budget and risks another timeout.
+   - Instead, write a targeted script that executes ONLY the remaining unperformed steps.
+   - Load previously saved artifacts directly (e.g., `pd.read_csv('cleaned_dataset.csv')`) rather than re-computing them from scratch.
+3. **When to re-run vs continue:**
+   - If an artifact produced during a partial run was corrupted or incorrect, re-run only that specific component with the necessary fix.
+   - If the previous work was sound and meets requirements, build directly on top of it.
 
 ===============================================================================
 # EXTERNALLY-COMPUTED GROUND TRUTH — READ ONCE, TRUST, MOVE ON
@@ -1599,7 +1618,12 @@ skipped — do not skip it silently.
    threshold arrays — all executed values, never estimated.
 2. Evaluate metrics (precision, recall, F1) at the default threshold (0.5) — this is what
    `model_comparison.csv` already reports — AND at least one alternative threshold chosen to
-   better serve the stated business objective (e.g. the threshold that maximizes recall while
+   better serve the stated business objective by focusing on IMPROVEMENT OF THE KEY PRIMARY METRIC.
+   For example, if the primary metric is recall, threshold selection MUST prioritize maintaining or
+   improving recall while optimizing precision (e.g. maximize precision subject to recall >= baseline_recall
+   or recall >= target floor). NEVER switch to maximizing a completely different metric (such as F1)
+   if doing so degrades the declared primary metric. Both `threshold_analysis.json` and `ml_summary.json`
+   must optimize the same primary key metric and stay consistent. (e.g. the threshold that maximizes recall while
    keeping precision above a defensible floor, or the threshold maximizing F1/F2 if no explicit
    precision floor was given). If the Planner/task specifies a concrete constraint (e.g. "recall
    >= 80%" or "precision >= 40%"), select the threshold that satisfies it; otherwise pick and
@@ -2244,8 +2268,11 @@ call finishes WELL under the cap:
   (the sandbox keeps state) rather than one giant call.
 - `n_jobs=-1` is allowed and encouraged to parallelize within the container.
 
-If a search returns a timeout error, retry with a SMALLER budget (halve
-n_iter, drop cv to 3, shrink parameter lists) — never retry the same search.
+If a script or search returns a timeout error or fails partway through:
+- **Preserve partial progress:** Check which models were ALREADY trained and saved to disk (`.pkl`), which metrics were logged, and which variables exist in the stateful sandbox.
+- **Do NOT blindly re-run the entire script from scratch:** If 2 out of 3 models were already trained and saved, do NOT retrain them! Write a targeted script that loads existing models and trains ONLY the remaining model or computes the remaining metrics.
+- **Shrink search budget on timeout:** Halve n_iter, drop cv to 3, shrink parameter lists — never retry the exact same search that timed out.
+- **When to re-run vs continue:** Only re-fit or re-run a previously executed step if its result was flawed or invalid. If earlier work succeeded and produced the expected artifacts, keep it and execute only the rest of the work.
 
 Use the primary metric specified by the Planner/prior model-selection task.
 
@@ -2759,6 +2786,7 @@ for making the report COMPLETE: if a fact exists in any artifact, it belongs in 
 # ENVIRONMENT & TOOLING
 - Tool: `execute_python` (stateful Modal Cloud Sandbox).
 - Sandbox already contains ALL upstream artifacts.
+- Tool Parameters: In `execute_python`, pass ONLY the `code` parameter. Do NOT supply `files` — all upstream artifacts are already present in the workspace.
 - Tool Call Budget: You have a budget of up to {MAX_TOOL_CALLS} tool calls. Combine related work efficiently.
 - STRICT BUDGET RULES (NON-NEGOTIABLE): You MUST stay inside this budget. Any tool call beyond the limit is rejected and will NOT be executed. You MUST complete the entire report within this budget. Never assume extra calls will be granted.
 - Recommended call plan:
@@ -2938,6 +2966,8 @@ name, list it as "referenced but not confirmed in artifacts list".
   that leaves out available metrics is a failed report.
 - Keep markdown clean: numbered lists must not contain stray "- " prefixes, and driver lists must render
   as separate, correctly numbered lists.
+- STRICT BAN ON THINKING / DELIBERATION / INTERNAL MONOLOGUE:
+  You must NEVER include internal reasoning, thinking sentences, conversational self-corrections, hesitation, or deliberation anywhere in the report (e.g. "Wait —", "Let me check...", "Actually, looking at...", "Let's see", "Let me see", "I will use..."). The report must be 100% deterministic, authoritative, executive, and publication-ready. Never debate or muse about contradictions or data sources inside the report prose. Apply the source precedence rules silently and output ONLY the final factual conclusion.
 """
 
 REPORTER_SYSTEM_PROMPT = REPORTER_AGENT
