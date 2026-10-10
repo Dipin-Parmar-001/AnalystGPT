@@ -63,7 +63,7 @@ DEFAULT_SANDBOX_PACKAGES = [
 # Hard execution cap for any single sandboxed code call (seconds). Matches the
 # Modal @app.function(timeout=...) on the remote executor; long-running work
 # (e.g. large hyperparameter searches) is cut off at the container layer.
-SANDBOX_TIMEOUT_S = 300
+SANDBOX_TIMEOUT_S = 500
 
 
 # ==========================================

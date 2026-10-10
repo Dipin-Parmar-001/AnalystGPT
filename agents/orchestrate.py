@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import copy
 import traceback
 from typing import List, Dict, Any, Optional, Union, Callable
 from dataclasses import asdict
@@ -37,7 +38,7 @@ from agents.planner_agent import PlannerAgent, ExecutionPlan, TaskItem, PlanStat
 from agents.data_analyst_agent import DataAnalystAgent
 from agents.ml_agent import MLAgent
 from agents.reporter_agent import ReporterAgent
-from agents.cancellation import CancellationToken, WorkflowCancelledException
+from agents.cancellation import CancellationToken, WorkflowCancelledException, WorkflowPausedException
 from agents.artifact_validator import (
     validate_artifacts,
     validate_and_get_warning,
@@ -196,6 +197,8 @@ class WorkflowOrchestrator:
         self.final_report: str = ""
         self.current_output_dir: str = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token: Optional[CancellationToken] = None
+        self.last_pause_checkpoint: Optional[Dict[str, Any]] = None
+        self.current_active_task: Optional[Any] = None
 
         # Persist model names for later use (e.g. the consistency judge defaults
         # to reporter_model when judge_model is not set).
@@ -240,6 +243,8 @@ class WorkflowOrchestrator:
         self.final_report = ""
         self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token = None
+        self.last_pause_checkpoint = None
+        self.current_active_task = None
         self.last_run_findings = []
         self.last_run_manifest = {}
         self.consistency_report = None
@@ -267,6 +272,135 @@ class WorkflowOrchestrator:
             "status": "idle",
             "message": "No active execution was running to cancel."
         }
+
+    def pause_execution(self, reason: str = "User paused the workflow") -> Dict[str, Any]:
+        """
+        Immediately signals pause to the running workflow.
+        Halts in-progress agent task, tool execution, or LLM wait immediately.
+        The interrupted task is NOT marked as complete and will be re-executed upon resume.
+        """
+        active_tid = self.current_active_task.task_id if getattr(self, "current_active_task", None) else None
+        if self.cancellation_token:
+            self.cancellation_token.pause(
+                reason=reason,
+                step=f"Task #{active_tid}" if active_tid else "active step",
+                task_id=active_tid
+            )
+            # Create a provisional checkpoint immediately so last_pause_checkpoint is non-null
+            try:
+                if self.current_plan and not self.last_pause_checkpoint:
+                    paused_task_id = active_tid or 1
+                    safe_plan_dict = None
+                    try:
+                        safe_plan_dict = self.current_plan.to_dict()
+                    except Exception:
+                        safe_plan_dict = {"plan_id": getattr(self.current_plan, "plan_id", "wf_plan"), "tasks": []}
+
+                    safe_results = []
+                    try:
+                        for tr in list(self.completed_task_results or []):
+                            if isinstance(tr, dict):
+                                safe_results.append(dict(tr))
+                            else:
+                                safe_results.append(tr)
+                    except Exception:
+                        safe_results = []
+
+                    self.last_pause_checkpoint = {
+                        "workflow_id": getattr(self.current_plan, "plan_id", None) or f"wf_{int(time.time())}",
+                        "status": "paused",
+                        "paused_at": datetime.now().isoformat(),
+                        "paused_task_id": paused_task_id,
+                        "paused_step": f"Task #{paused_task_id}",
+                        "reason": reason,
+                        "user_query": getattr(self.current_plan, "query", ""),
+                        "input_files": list(getattr(self, "uploaded_files", []) or []),
+                        "output_dir": self.current_output_dir,
+                        "plan": safe_plan_dict,
+                        "completed_task_results": safe_results,
+                        "generated_artifacts": list(self.generated_artifacts or []),
+                        "final_report": self.final_report or "",
+                    }
+            except Exception as snap_err:
+                print(f"[Orchestrator Warning] Provisional pause checkpoint creation skipped: {snap_err}")
+
+            return {
+                "status": "paused",
+                "message": f"Pause signal dispatched: {reason}",
+                "plan_id": self.current_plan.plan_id if self.current_plan else None,
+                "task_id": active_tid
+            }
+        return {
+            "status": "idle",
+            "message": "No active execution was running to pause."
+        }
+
+    def save_checkpoint_to_disk(self, filepath: str, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Saves workflow state checkpoint to a JSON file on disk (in workflows/).
+        Allows user to shut down sessions and resume the paused workflow later.
+        """
+        data = checkpoint or self.last_pause_checkpoint
+        if not data:
+            if not self.current_plan:
+                raise ValueError("No active plan or paused workflow to save.")
+            data = {
+                "workflow_id": self.current_plan.plan_id or f"wf_{int(time.time())}",
+                "status": "paused",
+                "paused_at": datetime.now().isoformat(),
+                "paused_task_id": 1,
+                "paused_step": "paused_state",
+                "reason": "Manual save to disk",
+                "user_query": self.current_plan.query,
+                "input_files": getattr(self, "uploaded_files", []),
+                "output_dir": self.current_output_dir,
+                "plan": self.current_plan.to_dict(),
+                "completed_task_results": copy.deepcopy(self.completed_task_results),
+                "generated_artifacts": list(self.generated_artifacts),
+                "final_report": self.final_report,
+            }
+
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+        print(f"[Orchestrator] Saved workflow checkpoint to {filepath}")
+        return {
+            "status": "saved",
+            "filepath": filepath,
+            "workflow_id": data.get("workflow_id"),
+            "paused_task_id": data.get("paused_task_id")
+        }
+
+    def load_checkpoint_from_disk(self, filepath: str) -> Dict[str, Any]:
+        """
+        Loads saved workflow checkpoint from disk and restores state in orchestrator.
+        """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Workflow checkpoint file not found: {filepath}")
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.last_pause_checkpoint = data
+        if "plan" in data and isinstance(data["plan"], dict):
+            self.current_plan = ExecutionPlan.from_dict(data["plan"])
+            self.current_plan.status = PlanStatus.PAUSED
+        if "completed_task_results" in data:
+            self.completed_task_results = data["completed_task_results"]
+        if "generated_artifacts" in data:
+            self.generated_artifacts = data["generated_artifacts"]
+        if "final_report" in data:
+            self.final_report = data["final_report"]
+        if "output_dir" in data:
+            self.current_output_dir = data["output_dir"]
+            if hasattr(self.tool_manager, "set_output_dir"):
+                self.tool_manager.set_output_dir(self.current_output_dir)
+        if "input_files" in data:
+            self.uploaded_files = data["input_files"]
+
+        print(f"[Orchestrator] Loaded workflow checkpoint from {filepath} (paused at Task #{data.get('paused_task_id')})")
+        return data
 
     def _get_consistency_judge(self):
         """Lazily instantiates the LLM consistency judge (hybrid verification layer)."""
@@ -790,20 +924,27 @@ class WorkflowOrchestrator:
         max_tool_calls_per_agent: int = 10,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
+        resume_from_task_id: Optional[int] = None,
+        resume_checkpoint: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes each task in the plan using its assigned specialized agent.
-        Supports instant cancellation, explicit failure/completion telemetry,
+        Supports instant cancellation, pausing/resuming, explicit failure/completion telemetry,
         and artifact preservation.
         """
         from datetime import datetime
 
-        active_plan = plan or self.current_plan
+        if resume_checkpoint and not plan and "plan" in resume_checkpoint:
+            active_plan = ExecutionPlan.from_dict(resume_checkpoint["plan"])
+            self.current_plan = active_plan
+        else:
+            active_plan = plan or self.current_plan
+
         if not active_plan:
             raise ValueError("No active plan provided for execution.")
 
-        query_text = user_query or active_plan.query
-        files_list = files or []
+        query_text = user_query or (resume_checkpoint.get("user_query") if resume_checkpoint else None) or active_plan.query
+        files_list = files or (resume_checkpoint.get("input_files") if resume_checkpoint else None) or []
         self.uploaded_files = list(files_list)
 
         # One run = one JSONL file in logs/. If create_plan already started the
@@ -813,10 +954,44 @@ class WorkflowOrchestrator:
         # Setup cancellation token
         self.cancellation_token = cancellation_token or CancellationToken()
 
-        # Create new unique run output directory
+        # Handle directory and state retention for resume vs fresh run
         run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs", f"run_{run_timestamp}")
-        os.makedirs(self.current_output_dir, exist_ok=True)
+        if resume_checkpoint:
+            self.current_output_dir = resume_checkpoint.get("output_dir", self.current_output_dir)
+            if self.current_output_dir:
+                dir_name = os.path.basename(self.current_output_dir)
+                if dir_name.startswith("run_"):
+                    run_timestamp = dir_name[4:]
+            if resume_from_task_id is None:
+                resume_from_task_id = resume_checkpoint.get("paused_task_id", 1)
+            # Retain only results completed strictly before resume_from_task_id
+            self.completed_task_results = [
+                tr for tr in resume_checkpoint.get("completed_task_results", [])
+                if tr.get("task_id", 0) < (resume_from_task_id or 1)
+            ]
+            self.generated_artifacts = list(resume_checkpoint.get("generated_artifacts", []))
+            self.final_report = resume_checkpoint.get("final_report", "")
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            print(f"[Orchestrator] Resuming workflow from checkpoint at Task #{resume_from_task_id} in {self.current_output_dir}")
+        elif resume_from_task_id is not None:
+            # Resuming in-memory: preserve output dir, keep prior completed tasks
+            if self.current_output_dir:
+                dir_name = os.path.basename(self.current_output_dir)
+                if dir_name.startswith("run_"):
+                    run_timestamp = dir_name[4:]
+            self.completed_task_results = [
+                tr for tr in self.completed_task_results
+                if tr.get("task_id", 0) < resume_from_task_id
+            ]
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            print(f"[Orchestrator] Resuming in-memory workflow at Task #{resume_from_task_id} in {self.current_output_dir}")
+        else:
+            # Fresh execution: create new unique run output directory
+            self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs", f"run_{run_timestamp}")
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            self.completed_task_results = []
+            self.generated_artifacts = []
+            self.final_report = ""
 
         if hasattr(self.tool_manager, "set_output_dir"):
             self.tool_manager.set_output_dir(self.current_output_dir)
@@ -855,10 +1030,12 @@ class WorkflowOrchestrator:
                 "plan_id": active_plan.plan_id,
                 "total_tasks": len(active_plan.tasks),
                 "selected_agents": active_plan.selected_agents,
-                "output_dir": self.current_output_dir
+                "output_dir": self.current_output_dir,
+                "resumed_from_task": resume_from_task_id
             })
 
-            self.completed_task_results = []
+            if resume_from_task_id is None:
+                self.completed_task_results = []
             has_reporter_task = False
             current_active_task: Optional[TaskItem] = None
 
@@ -867,8 +1044,21 @@ class WorkflowOrchestrator:
                 self.cancellation_token.check_cancelled(step_name="Workflow start")
 
                 for task in active_plan.tasks:
+                    # If resuming, skip tasks strictly before resume_from_task_id that were already completed
+                    if resume_from_task_id is not None and task.task_id < resume_from_task_id:
+                        if task.status == "completed" or any(tr.get("task_id") == task.task_id for tr in self.completed_task_results):
+                            task.status = "completed"
+                            print(f"[Orchestrator] Skipping already completed Task #{task.task_id}: {task.title}")
+                            continue
+
+                    # If resuming, ensure tasks after the resumed task remain pending
+                    if resume_from_task_id is not None and task.task_id > resume_from_task_id:
+                        if task.status in ["in_progress", "paused"]:
+                            task.status = "pending"
+
+                    self.current_active_task = task
                     current_active_task = task
-                    # Check cancellation before starting each task
+                    # Check cancellation or pause before starting each task
                     self.cancellation_token.check_cancelled(
                         step_name=f"Before Task #{task.task_id}: {task.title}",
                         task_id=task.task_id
@@ -1818,6 +2008,74 @@ class WorkflowOrchestrator:
                     "run_manifest": run_manifest
                 }
 
+            except WorkflowPausedException as pause_err:
+                active_plan.status = PlanStatus.PAUSED
+                paused_task_id = pause_err.task_id or (current_active_task.task_id if current_active_task else 1)
+
+                # Mark the currently running task as "paused", NOT completed!
+                if current_active_task:
+                    current_active_task.status = "paused"
+                    current_active_task.result = f"Paused during execution ({pause_err.step or 'in-progress step'}). Will re-execute on resume."
+
+                # Keep subsequent tasks in pending state
+                for t in active_plan.tasks:
+                    if t.task_id > paused_task_id and t.status in ["in_progress", "paused"]:
+                        t.status = "pending"
+
+                # Filter out any incomplete result for paused_task_id or later
+                self.completed_task_results = [
+                    tr for tr in self.completed_task_results
+                    if tr.get("task_id", 0) < paused_task_id
+                ]
+
+                pause_msg = (
+                    f"Workflow paused at {pause_err.step or (f'Task #{paused_task_id}' if paused_task_id else 'in-progress step')}. "
+                    f"In-progress step halted immediately and will be re-executed upon resuming."
+                )
+
+                checkpoint = {
+                    "workflow_id": active_plan.plan_id or f"wf_{int(time.time())}",
+                    "status": "paused",
+                    "paused_at": datetime.now().isoformat(),
+                    "paused_task_id": paused_task_id,
+                    "paused_step": pause_err.step or f"Task #{paused_task_id}",
+                    "reason": pause_err.message,
+                    "user_query": query_text,
+                    "input_files": files_list,
+                    "output_dir": self.current_output_dir,
+                    "plan": active_plan.to_dict(),
+                    "completed_task_results": copy.deepcopy(self.completed_task_results),
+                    "generated_artifacts": list(self.generated_artifacts),
+                    "final_report": self.final_report,
+                }
+                self.last_pause_checkpoint = checkpoint
+
+                _safe_callback("workflow_paused", {
+                    "status": "paused",
+                    "plan_id": active_plan.plan_id,
+                    "task_id": paused_task_id,
+                    "step": pause_err.step,
+                    "message": pause_msg,
+                    "output_dir": self.current_output_dir,
+                    "artifacts": self.generated_artifacts,
+                    "completed_tasks": len(self.completed_task_results),
+                    "checkpoint": checkpoint,
+                })
+
+                if HAS_LOGFIRE:
+                    logfire.info("Workflow Paused by User", reason=pause_err.message, step=pause_err.step, task_id=paused_task_id)
+
+                return {
+                    "status": "paused",
+                    "message": pause_msg,
+                    "plan": active_plan.to_dict(),
+                    "task_results": self.completed_task_results,
+                    "generated_artifacts": self.generated_artifacts,
+                    "output_dir": self.current_output_dir,
+                    "paused_task_id": paused_task_id,
+                    "checkpoint": checkpoint,
+                }
+
             except WorkflowCancelledException as cancel_err:
                 active_plan.status = PlanStatus.CANCELLED
                 # Mark current task and remaining tasks as cancelled
@@ -1915,6 +2173,7 @@ class WorkflowOrchestrator:
                     workflow_result = _execute_workflow()
             return workflow_result
         finally:
+            self.current_active_task = None
             # Close the run: writes the run_summary event + run_metrics.json.
             try:
                 status = workflow_result.get("status") if isinstance(workflow_result, dict) else "failed"

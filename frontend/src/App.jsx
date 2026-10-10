@@ -10,6 +10,7 @@ import ReportViewer from './components/ReportViewer';
 import ArtifactsGallery from './components/ArtifactsGallery';
 import DatasetPreviewModal from './components/DatasetPreviewModal';
 import FindingsPanel from './components/FindingsPanel';
+import WorkflowsModal from './components/WorkflowsModal';
 import WorkspaceView from './views/WorkspaceView';
 
 import {
@@ -62,6 +63,10 @@ export default function App() {
   // Termination Confirmation Modal
   const [terminateModalOpen, setTerminateModalOpen] = useState(false);
   const [isTerminating, setIsTerminating] = useState(false);
+
+  // Saved Workflows Modal & Paused Checkpoint
+  const [workflowsModalOpen, setWorkflowsModalOpen] = useState(false);
+  const [pausedCheckpoint, setPausedCheckpoint] = useState(null);
 
   // WebSocket Connection
   const [wsConnected, setWsConnected] = useState(false);
@@ -185,6 +190,50 @@ export default function App() {
       loadFindings();
       // Route the user to the outcome: failed verification -> findings, else report
       navigate(verifiedStatus === 'failed-consistency' ? 'findings' : 'report');
+    } else if (event === 'workflow_pausing') {
+      setIsRunning(true);
+      setCurrentStatus('pausing');
+      setStatusMessage(payload.message || data?.message || 'Pausing workflow... waiting for active step to halt.');
+      const cp = payload.checkpoint || data?.checkpoint;
+      if (cp) setPausedCheckpoint(cp);
+    } else if (event === 'workflow_paused') {
+      setIsRunning(false);
+      setCurrentStatus('paused');
+      setStatusMessage(payload.message || data?.message || 'Workflow paused by user.');
+      const cp = payload.checkpoint || data?.checkpoint;
+      if (cp) setPausedCheckpoint(cp);
+      if (cp?.plan) setPlan(cp.plan);
+      loadArtifacts();
+    } else if (event === 'workflow_resumed') {
+      setIsRunning(true);
+      setCurrentStatus('executing');
+      const resumeTid = payload.resume_from_task || data?.resume_from_task;
+      setStatusMessage(`Resumed execution from Task #${resumeTid || '...'}`);
+      if (resumeTid) {
+        setPlan((prevPlan) => {
+          if (!prevPlan || !prevPlan.tasks) return prevPlan;
+          return {
+            ...prevPlan,
+            tasks: prevPlan.tasks.map((t) => {
+              if (t.task_id < resumeTid) {
+                return { ...t, status: 'completed' };
+              } else if (t.task_id === resumeTid) {
+                return { ...t, status: 'in_progress' };
+              } else {
+                return { ...t, status: 'pending' };
+              }
+            })
+          };
+        });
+      }
+      navigate('console');
+    } else if (event === 'workflow_loaded') {
+      setIsRunning(false);
+      setCurrentStatus('paused');
+      setStatusMessage(payload.message || `Loaded workflow ${payload.workflow_id}`);
+      if (payload.plan) setPlan(payload.plan);
+      if (payload.checkpoint) setPausedCheckpoint(payload.checkpoint);
+      navigate('plan');
     } else if (event === 'workflow_cancelled') {
       setIsRunning(false);
       setCurrentStatus('cancelled');
@@ -291,6 +340,9 @@ export default function App() {
           if (typeof data.repair_attempts_used === 'number') setRepairAttemptsUsed(data.repair_attempts_used);
         } else if (data.final_report) {
           loadFindings();
+        }
+        if (data.last_pause_checkpoint) {
+          setPausedCheckpoint(data.last_pause_checkpoint);
         }
       }
     } catch (err) {
@@ -433,6 +485,132 @@ export default function App() {
     }
   };
 
+  // Pause Workflow Trigger
+  const handlePause = async () => {
+    try {
+      setStatusMessage('Pausing workflow...');
+      const res = await fetch('/api/workflow/pause', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'Paused by user via dashboard' }),
+      });
+      const data = await res.json();
+      if (data.status === 'paused') {
+        setIsRunning(false);
+        setCurrentStatus('paused');
+        setStatusMessage(data.message || 'Workflow paused.');
+        if (data.checkpoint) {
+          setPausedCheckpoint(data.checkpoint);
+        }
+      } else if (data.status === 'pausing') {
+        setIsRunning(true);
+        setCurrentStatus('pausing');
+        setStatusMessage(data.message || 'Pausing workflow... waiting for active step to halt.');
+        if (data.checkpoint) {
+          setPausedCheckpoint(data.checkpoint);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to pause workflow", err);
+    }
+  };
+
+  // Resume Workflow Trigger
+  const handleResume = async () => {
+    if (isRunning && currentStatus !== 'paused') return;
+
+    setIsRunning(true);
+    setCurrentStatus('executing');
+    setStatusMessage('Resuming workflow execution...');
+    setLastError('');
+
+    try {
+      const res = await fetch('/api/workflow/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          max_tool_calls_per_agent: maxToolCalls,
+          resume_from_task_id: pausedCheckpoint?.paused_task_id || undefined,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Resume failed to start');
+      }
+      navigate('console');
+    } catch (err) {
+      setIsRunning(false);
+      setCurrentStatus('paused');
+      setStatusMessage(`Resume failed: ${err.message}`);
+      setLastError(err.message);
+    }
+  };
+
+  // Save Paused Workflow to Disk Trigger (in workflows/ folder)
+  const handleSaveWorkflow = async () => {
+    try {
+      const res = await fetch('/api/workflow/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: query || (plan ? plan.query : 'Saved Workflow'),
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to save workflow');
+      }
+
+      const data = await res.json();
+      setStatusMessage(data.message || `Saved to workflows/${data.filename}`);
+      alert(`Workflow successfully saved to disk (workflows/${data.filename})!\nYou can now close or restart the system and continue anytime.`);
+    } catch (err) {
+      alert(`Error saving workflow to disk: ${err.message}`);
+    }
+  };
+
+  // Load Saved Workflow from Disk
+  const handleLoadWorkflow = async (workflowId) => {
+    try {
+      const res = await fetch(`/api/workflows/${workflowId}/load`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to load workflow');
+      }
+      const data = await res.json();
+      if (data.plan) setPlan(data.plan);
+      if (data.checkpoint) setPausedCheckpoint(data.checkpoint);
+      setCurrentStatus('paused');
+      setStatusMessage(data.message || `Loaded workflow ${workflowId}`);
+      navigate('plan');
+    } catch (err) {
+      alert(`Error loading workflow: ${err.message}`);
+    }
+  };
+
+  // Load and Resume Saved Workflow from Disk
+  const handleResumeLoadedWorkflow = async (workflowId) => {
+    try {
+      const res = await fetch(`/api/workflows/${workflowId}/load`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to load workflow');
+      }
+      const data = await res.json();
+      if (data.plan) setPlan(data.plan);
+      if (data.checkpoint) setPausedCheckpoint(data.checkpoint);
+      setCurrentStatus('paused');
+
+      setTimeout(() => {
+        handleResume();
+      }, 250);
+    } catch (err) {
+      alert(`Error resuming loaded workflow: ${err.message}`);
+    }
+  };
+
   // Reset Sandbox & Workflow
   const handleResetWorkflow = async () => {
     if (window.confirm("Reset sandbox state and current workflow?")) {
@@ -443,6 +621,7 @@ export default function App() {
         setFinalReport('');
         setCurrentStatus('idle');
         setStatusMessage('System reset to idle.');
+        setPausedCheckpoint(null);
         setRunStatus(null);
         setSeverityCounts(null);
         setFindings([]);
@@ -487,6 +666,10 @@ export default function App() {
           isRunning={isRunning}
           onReset={handleResetWorkflow}
           onOpenTerminate={handleOpenTerminateModal}
+          onPause={handlePause}
+          onResume={handleResume}
+          onSaveWorkflow={handleSaveWorkflow}
+          onOpenWorkflows={() => setWorkflowsModalOpen(true)}
         />
 
         {/* Global status banner */}
@@ -577,6 +760,14 @@ export default function App() {
         onClose={() => setTerminateModalOpen(false)}
         onConfirm={handleConfirmTerminate}
         terminating={isTerminating}
+      />
+
+      {/* Saved Workflows Directory Modal */}
+      <WorkflowsModal
+        isOpen={workflowsModalOpen}
+        onClose={() => setWorkflowsModalOpen(false)}
+        onLoadWorkflow={handleLoadWorkflow}
+        onResumeWorkflow={handleResumeLoadedWorkflow}
       />
 
       {/* Dataset Preview Modal */}

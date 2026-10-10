@@ -1,7 +1,25 @@
 import React from 'react';
-import { CheckCircle2, AlertTriangle, ShieldAlert, Flame, Loader2 } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, ShieldAlert, Flame, Loader2, PauseCircle } from 'lucide-react';
 
 const BANNERS = {
+  pausing: {
+    cls: 'bg-amber-500/10 border-amber-500/30',
+    icon: Loader2,
+    iconCls: 'bg-amber-500/15 text-amber-500 border-amber-500/30 animate-spin',
+    titleCls: 'text-amber-500',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Pausing...', cls: 'bg-amber-500 text-white' },
+    fallback: 'Workflow is pausing. Halting the active step and saving checkpoint...',
+  },
+  paused: {
+    cls: 'bg-amber-500/10 border-amber-500/30',
+    icon: PauseCircle,
+    iconCls: 'bg-amber-500/15 text-amber-500 border-amber-500/30',
+    titleCls: 'text-amber-500',
+    textCls: 'text-ink-soft',
+    chip: { label: 'Paused', cls: 'bg-amber-500 text-white' },
+    fallback: 'Workflow is paused. You can resume anytime or save to disk to continue tomorrow or after restart.',
+  },
   completed: {
     cls: 'bg-accent-wash border-accent-edge',
     icon: CheckCircle2,
@@ -65,6 +83,7 @@ export default function StatusAlertBanner({ status, message, error, cancelledSte
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2.5 flex-wrap">
           <h4 className={`text-[14px] font-semibold ${b.titleCls}`}>
+            {status === 'paused' && 'Workflow paused'}
             {status === 'completed' && 'Workflow completed'}
             {status === 'completed_with_warnings' && 'Completed with warnings'}
             {status === 'failed-consistency' && 'Run not cleared for delivery'}

@@ -210,7 +210,7 @@ sizing tasks correctly is as important as scoping them correctly.
    applied to search space instead of chart count — an `n_iter` the named grid can't
    support is the same failure in the other direction.
    Additionally, the search must be RESOURCE-BOUNDED: sandbox executions are hard-capped
-   at 300 seconds, so keep `n_iter * cv <= 100` and the enumerated grid itself
+   at 500 seconds, so keep `n_iter * cv <= 100` and the enumerated grid itself
    <= 100 combinations. Name `cv` too (prefer 3 for large datasets or slow learners).
    A tuning task whose stated grid implies hundreds of fits is misplanned — shrink it.
 6. **State your budget accounting in `notes`.** For any task you judge to be near the limit,
@@ -1007,7 +1007,7 @@ STRICT BUDGET RULES (NON-NEGOTIABLE):
 ===============================================================================
 
 1. **Preserve and reuse partial progress:**
-   If a script execution encounters a timeout (300s limit) or fails partway through with an error:
+   If a script execution encounters a timeout (500s limit) or fails partway through with an error:
    - Carefully inspect stdout, stderr, and the workspace to determine which sub-tasks ALREADY SUCCEEDED and what artifacts or variables were ALREADY created.
    - The execution environment is STATEFUL. Completed computations, intermediate datasets (`.csv`), charts (`.png`), and summary files (`.json`) persist across tool calls.
 2. **Do NOT blindly re-run the entire script from scratch:**
@@ -2245,9 +2245,9 @@ with:
 
     cv=5
 
-**RESOURCE EFFICIENCY — HARD LIMITS (every execution is capped at 300 seconds):**
+**RESOURCE EFFICIENCY — HARD LIMITS (every execution is capped at 500 seconds):**
 
-Each execute_python call is hard-terminated after 300 seconds. Training that
+Each execute_python call is hard-terminated after 500 seconds. Training that
 exceeds the cap fails and wastes the tool call. Design every search so a single
 call finishes WELL under the cap:
 
@@ -2757,6 +2757,53 @@ These concepts may point to the same artifact, but NEVER assume that they must.
 25. ALWAYS justify any gap between the algorithmic champion and the business recommendation with ranked numbers and an explicit usability rationale.
 26. NEVER label clusters with outcome terms (churn, fraud, risk) without computed per-cluster outcome rates; use associative language only.
 27. EVERY reported ML metric MUST be traceable to candidate_id + hyperparameters + feature_set_hash + source artifact via metrics_ledger.json.
+
+## Common mistakes to avoid
+
+1. Mistake: Finishing with artifacts that name different champions, or
+   changing the champion in one file but not the others.
+   Why it happens: A tuning run changes (or keeps) the champion, but one of
+   the files you write still carries the earlier decision.
+   Instead:
+   - Read champion_model.json once at the start and hold the values in
+     variables. Change it only when improved = true.
+   - After your last write, reload every file you wrote that names a
+     champion (champion_model.json, model_registry.json, ml_summary*.json,
+     hyperparameter_tuning_summary.json, model_comparison.csv,
+     tuned_model_comparison.csv, threshold_analysis.json). Assert that they
+     all reference the same artifact filename, that exactly one registry
+     entry has status "champion", and that the file exists and loads.
+   - If improved = false, assert champion_model.json is unchanged and the
+     challenger is "rejected" in every file.
+   - If improved = true, recompute threshold_analysis.json for the new
+     champion, or state in ml_summary.json that its threshold must not be
+     quoted for it.
+   - If any assertion fails, fix the metadata in the same task. Never finish
+     with a mismatch.
+   Bad:  champion_model.json -> <parent>.pkl, tuning summary says
+         new_champion = <challenger>.pkl.
+   Good: Every file names the same artifact and the same decision.
+
+2. Mistake: Declaring a tuning improvement (or no improvement) when parent
+   and challenger were not measured under the same conditions.
+   Why it happens: Parent metrics come from the earlier task and challenger
+   metrics from a new search, and they differ in CV folds, split, feature
+   set, or scoring.
+   Instead:
+   - Before computing any delta, build a comparison_basis for both models
+     and assert it matches: dataset filename, target, feature list (checked
+     against the loaded parent's n_features_in_), random_state and
+     stratified split sizes, primary_metric, CV folds, and test threshold.
+   - Decide improvement from CV mean of the primary metric on training data
+     only. Report test-set deltas for reporting, never as the decision.
+   - If any basis field differs, set improved = false, write
+     "NOT_COMPARABLE: <fields>" as the reason, and keep the champion.
+   - Read every metric and delta input from artifacts or executed variables
+     (delta = tuned - parent).
+   Bad:  Parent CV_Mean from 5 folds vs tuned best_cv_score from 3 folds,
+         then "improved".
+   Good: Both CV scores use the same folds and scoring, and the basis is
+         saved in hyperparameter_tuning_summary.json.
 
 """
 

@@ -179,25 +179,23 @@ export default function PlanViewer({ plan, isRunning, onExecutePlan, onModifyPla
             return (
               <li
                 key={task.task_id || idx}
-                className={`flex gap-3.5 p-4 rounded-lg border transition-colors ${
-                  inProgress
+                className={`flex gap-3.5 p-4 rounded-lg border transition-colors ${inProgress
                     ? 'bg-accent-wash/60 border-accent-edge'
                     : task.status === 'failed'
-                    ? 'bg-caution-wash/50 border-caution-edge'
-                    : task.status === 'cancelled'
-                    ? 'bg-paper border-edge-soft opacity-70'
-                    : 'bg-card border-edge hover:border-edge-strong'
-                }`}
+                      ? 'bg-caution-wash/50 border-caution-edge'
+                      : task.status === 'cancelled'
+                        ? 'bg-paper border-edge-soft opacity-70'
+                        : 'bg-card border-edge hover:border-edge-strong'
+                  }`}
               >
                 {/* Step indicator */}
                 <span
-                  className={`w-6 h-6 rounded-full border flex items-center justify-center text-[11px] font-semibold shrink-0 mt-0.5 ${
-                    task.status === 'completed'
+                  className={`w-6 h-6 rounded-full border flex items-center justify-center text-[11px] font-semibold shrink-0 mt-0.5 ${task.status === 'completed'
                       ? 'bg-accent border-accent text-white'
                       : inProgress
-                      ? 'bg-accent-wash border-accent text-accent-deep'
-                      : 'bg-paper border-edge-strong text-ink-faint'
-                  }`}
+                        ? 'bg-accent-wash border-accent text-accent-deep'
+                        : 'bg-paper border-edge-strong text-ink-faint'
+                    }`}
                 >
                   {task.status === 'completed' ? <CheckCircle2 className="w-3.5 h-3.5" /> : task.task_id || idx + 1}
                 </span>

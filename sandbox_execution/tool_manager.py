@@ -38,7 +38,7 @@ except ImportError as err:
     reset_global_sandbox_manager = None
     prepare_input_files = None
     HAS_MODAL = False
-    SANDBOX_TIMEOUT_S = 300
+    SANDBOX_TIMEOUT_S = 500
 
 
 # ==========================================
