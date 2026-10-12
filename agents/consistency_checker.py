@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, asdict
 
 from agents.run_context import build_dataset_profile
 from agents.logger import setup_logfire
+from agents.preflight_gate import _match_artifact, _find_matching_artifact
 
 try:
     import logfire
@@ -358,6 +359,8 @@ def check_ml_result_consistency(output_dir: str, report_text: str = "") -> List[
     best = _load_json_safe(os.path.join(output_dir, "best_params.json"))
     if isinstance(tuning, dict) and isinstance(best, dict):
         expected = tuning.get("best_params") or (tuning.get("challenger_model") or {})
+        if isinstance(expected, dict) and "best_parameters" in expected and isinstance(expected["best_parameters"], dict):
+            expected = expected["best_parameters"]
         actual = best.get("best_parameters") or best.get("best_params") or {}
         if isinstance(expected, dict) and isinstance(actual, dict):
             keys = set(expected) | set(actual)
@@ -367,7 +370,7 @@ def check_ml_result_consistency(output_dir: str, report_text: str = "") -> List[
                 findings.append(Finding(
                     SEVERITY_CRITICAL, "tuning_parameter_disagreement",
                     "best_params.json and hyperparameter_tuning_summary.json disagree on "
-                    + ", ".join(f"{k} ({expected[k]} vs {actual[k]})" for k in mismatches)
+                    + ", ".join(f"{k} ({expected.get(k, 'missing')} vs {actual.get(k, 'missing')})" for k in mismatches)
                     + ". Use the executed search result and model metadata as ground truth.",
                     ["best_params.json", "hyperparameter_tuning_summary.json"],
                 ))
@@ -554,7 +557,7 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
     champion = _load_json_safe(os.path.join(output_dir, "champion_model.json"))
     if isinstance(champion, dict):
         champ_artifact = champion.get("artifact_filename") or champion.get("model")
-        if champ_artifact and champ_artifact not in pkl_files:
+        if champ_artifact and not _find_matching_artifact(champ_artifact, pkl_files):
             findings.append(Finding(
                 SEVERITY_CRITICAL, "stale_champion_pointer",
                 f"champion_model.json points to '{champ_artifact}', which does not exist on disk. Available: {', '.join(sorted(pkl_files)) or 'none'}.",
@@ -577,7 +580,7 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
                                   if k in {"n_clusters", "eps", "min_samples", "linkage", "init", "n_init"}
                                   and v is not None}
                     artifact_parameter_map.setdefault(artifact, []).append((str(entry.get("model_id", "?")), comparable))
-                if artifact and artifact not in pkl_files:
+                if artifact and not _find_matching_artifact(artifact, pkl_files):
                     findings.append(Finding(
                         SEVERITY_CRITICAL, "registry_missing_artifact",
                         f"model_registry.json entry '{entry.get('model_id', '?')}' references '{artifact}', which does not exist on disk.",
@@ -599,7 +602,7 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
 
         if isinstance(champion, dict) and registry_champion_artifacts:
             champ_artifact = champion.get("artifact_filename") or champion.get("model")
-            if champ_artifact and champ_artifact not in registry_champion_artifacts:
+            if champ_artifact and not any(_match_artifact(champ_artifact, reg_art) for reg_art in registry_champion_artifacts):
                 findings.append(Finding(
                     SEVERITY_CRITICAL, "champion_registry_disagreement",
                     f"champion_model.json points to '{champ_artifact}' but model_registry.json marks {sorted(registry_champion_artifacts)} as champion. All artifacts must agree on the champion.",
@@ -607,7 +610,7 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
                 ))
 
             champion_entry = next((e for e in entries if isinstance(e, dict) and
-                                   (e.get("artifact_filename") or e.get("artifact")) == champ_artifact and
+                                   _match_artifact(e.get("artifact_filename") or e.get("artifact"), champ_artifact) and
                                    str(e.get("status", "")).lower() == "champion"), None)
             if champion_entry:
                 champ_params = champion_entry.get("model_parameters") or {}

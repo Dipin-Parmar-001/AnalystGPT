@@ -187,6 +187,12 @@ def _load_comparison_rows(output_dir: str) -> List[Dict[str, Any]]:
             family, phase = _extract_phase_and_family(name)
             key = f"{family}_{phase}"
 
+            # Attempt artifact resolution if artifact not provided or not directly found on disk
+            if not _validate_artifact_exists(output_dir, artifact):
+                resolved = _resolve_model_artifact(output_dir, artifact, name, phase)
+                if resolved:
+                    artifact = resolved
+
             rec = {
                 "model": name,
                 "model_family": family,
@@ -199,6 +205,93 @@ def _load_comparison_rows(output_dir: str) -> List[Dict[str, Any]]:
             rows_by_key[key] = rec
 
     return list(rows_by_key.values())
+
+
+def _clean_str(s: Any) -> str:
+    """Lowercase string with only alphanumeric characters, stripping extension if any."""
+    if not s:
+        return ""
+    stem = Path(str(s)).stem
+    return re.sub(r"[^a-z0-9]", "", stem.lower())
+
+
+def _resolve_model_artifact(
+    output_dir: str,
+    candidate_artifact: Optional[str] = None,
+    model_name: Optional[str] = None,
+    phase: str = "p0",
+) -> Optional[str]:
+    """Resolve the actual on-disk .pkl artifact for a model candidate.
+
+    Handles naming variations:
+    - underscores vs no underscores (logistic_regression_p0.pkl vs logisticregression_p0.pkl)
+    - case differences (LogisticRegression.pkl vs logisticregression.pkl)
+    - missing phase or extension (LogisticRegression -> logisticregression_p0.pkl)
+    - missing artifact column in comparison CSV (resolves from model_name)
+    """
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+
+    # 1. Exact match on disk
+    if candidate_artifact:
+        cand_str = str(candidate_artifact).strip()
+        if cand_str and os.path.isfile(os.path.join(output_dir, cand_str)):
+            return cand_str
+
+    pkl_files = [f for f in os.listdir(output_dir) if f.lower().endswith(".pkl")]
+    if not pkl_files:
+        return None
+
+    clean_cand = _clean_str(candidate_artifact) if candidate_artifact else ""
+    clean_model = _clean_str(model_name) if model_name else ""
+    norm_phase = (phase or "p0").lower().strip()
+
+    # 2. Try matching candidate_artifact by clean stem (e.g. logisticregressionp0)
+    if clean_cand:
+        for f in pkl_files:
+            if _clean_str(f) == clean_cand:
+                return f
+
+    # 3. Try matching via normalize_model_family from preflight_gate
+    try:
+        from agents.preflight_gate import normalize_model_family
+        target_family = None
+        if candidate_artifact:
+            target_family = normalize_model_family(candidate_artifact)
+        if not target_family or target_family == "unknown":
+            if model_name:
+                target_family = normalize_model_family(model_name)
+
+        if target_family:
+            matching = [f for f in pkl_files if normalize_model_family(f) == target_family]
+            if len(matching) == 1:
+                return matching[0]
+            elif len(matching) > 1:
+                # Disambiguate by phase (e.g. p0, p1)
+                phase_matching = [f for f in matching if norm_phase in f.lower()]
+                if phase_matching:
+                    return phase_matching[0]
+                return matching[0]
+    except Exception:
+        pass
+
+    # 4. Try matching model_name + phase by clean stem
+    if clean_model:
+        target_clean = f"{clean_model}{norm_phase}"
+        for f in pkl_files:
+            clean_f = _clean_str(f)
+            if clean_f == target_clean:
+                return f
+        for f in pkl_files:
+            clean_f = _clean_str(f)
+            if clean_f.startswith(clean_model) and norm_phase in clean_f:
+                return f
+        for f in pkl_files:
+            clean_f = _clean_str(f)
+            if clean_f.startswith(clean_model):
+                return f
+
+    return None
 
 
 def _pick_metric(metrics: Dict[str, float], goal_text: str, primary_metric: Optional[str] = None) -> Optional[str]:
@@ -247,6 +340,18 @@ def _build_champion_record(
     """Build champion record with validation."""
     artifact = winner.get("artifact")
 
+    # If artifact is missing or not directly on disk, attempt resolution
+    if not _validate_artifact_exists(output_dir, artifact):
+        resolved = _resolve_model_artifact(
+            output_dir,
+            candidate_artifact=artifact,
+            model_name=winner.get("model"),
+            phase=winner.get("phase", "p0"),
+        )
+        if resolved:
+            artifact = resolved
+            winner["artifact"] = resolved
+
     # Validation gate: artifact must exist
     if not _validate_artifact_exists(output_dir, artifact):
         return None
@@ -289,8 +394,13 @@ def _update_registry_with_champion(output_dir: str, champ: Dict[str, Any], rows:
 
     matched = False
     for entry in registry.models:
-        is_champ = bool(champ_art) and _entry_art(entry) == champ_art and not matched
+        entry_art = _entry_art(entry)
+        is_champ = bool(champ_art) and (
+            entry_art == champ_art
+            or (entry_art and _clean_str(entry_art) == _clean_str(champ_art))
+        ) and not matched
         if is_champ:
+            entry.artifact_filename = champ_art
             entry.status = ModelStatus.CHAMPION
             matched = True
         elif entry.status == ModelStatus.CHAMPION:
@@ -299,7 +409,7 @@ def _update_registry_with_champion(output_dir: str, champ: Dict[str, Any], rows:
     # Register champion artifact if not already registered
     if not matched and champ_art:
         winner_row = next(
-            (r for r in rows if (r.get("artifact") or r["model"]) == champ_art),
+            (r for r in rows if (r.get("artifact") or r["model"]) == champ_art or _clean_str(r.get("artifact")) == _clean_str(champ_art)),
             None,
         )
         entry = ModelEntry(
@@ -406,7 +516,12 @@ def evaluate_challenger(output_dir: str, goal_text: str = "", primary_metric: Op
         if challenger_wins:
             winner = challenger
         else:
-            winner = next((r for r in rows if r.get("artifact") == current.artifact_filename or r["model"] == current.model_name), None)
+            winner = next((
+                r for r in rows
+                if r.get("artifact") == current.artifact_filename
+                or r["model"] == current.model_name
+                or (r.get("artifact") and _clean_str(r.get("artifact")) == _clean_str(current.artifact_filename))
+            ), None)
             if winner is None:
                 return ChampionSelectionResult(ChampionSelectionStatus.NO_VALID_CANDIDATES, champion=current.dict(), error_code="CURRENT_CHAMPION_NOT_IN_COMPARISON", error_message="Current champion has no comparison row", stage="challenger")
         champ = _build_champion_record(winner, metric, goal_text, output_dir, primary_metric)

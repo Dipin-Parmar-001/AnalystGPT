@@ -574,7 +574,7 @@ def build_repair_prompt(
         parts.append("")
         parts.append("  Validator failure details:")
         for reason in failure_reasons[:5]:
-            parts.append(f"     - {reason[:200]}")
+            parts.append(f"     - {reason[:600]}")
 
     parts.extend([
         "",

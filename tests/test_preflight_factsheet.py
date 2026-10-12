@@ -98,6 +98,33 @@ class TestChampionSelector:
         assert statuses["logistic_regression_p0.pkl"] == "champion"
         assert statuses["random_forest_p0.pkl"] != "champion"
 
+    def test_champion_selection_resolves_unhyphenated_artifact(self, tmp_path):
+        from agents.champion_selector import select_initial_champion
+        d = tmp_path
+        # CSV with LogisticRegression and no artifact column (or mismatched name)
+        pd.DataFrame({
+            "model": ["LogisticRegression", "RandomForest"],
+            "Recall": [0.85, 0.70],
+            "ROC_AUC": [0.92, 0.88],
+        }).to_csv(d / "model_comparison.csv", index=False)
+        (d / "logisticregression_p0.pkl").write_bytes(b"dummy_lr")
+        (d / "randomforest_p0.pkl").write_bytes(b"dummy_rf")
+        with open(d / "model_registry.json", "w", encoding="utf-8") as f:
+            json.dump({"models": []}, f)
+
+        res = select_initial_champion(str(d), goal_text="catch churners")
+        assert res.is_success()
+        assert res.champion is not None
+        assert res.champion["artifact_filename"] == "logisticregression_p0.pkl"
+        assert (d / "champion_model.json").exists()
+
+    def test_orchestrator_load_json_safe(self, tmp_path):
+        from agents.orchestrate import _load_json_safe
+        p = tmp_path / "test.json"
+        p.write_text('{"status": "ok"}', encoding="utf-8")
+        assert _load_json_safe(str(p)) == {"status": "ok"}
+        assert _load_json_safe(str(tmp_path / "nonexistent.json")) is None
+
 
 class TestPreflightGate:
     def test_repairs_and_never_stops(self, run_dir):
@@ -118,6 +145,39 @@ class TestPreflightGate:
         # residual findings appear as warnings, not as a stop
         residual = [w for w in result["warnings"] if "missing_chart.png" in w]
         assert residual, "phantom file should surface as a warning"
+
+    def test_preflight_and_consistency_no_false_positive_on_unhyphenated_naming(self, tmp_path):
+        from agents.consistency_checker import check_model_artifact_consistency
+        from agents.preflight_gate import _check_champion
+        d = tmp_path
+        (d / "logisticregression_p0.pkl").write_bytes(b"dummy")
+        champ = {
+            "model": "logistic_regression_p0.pkl",
+            "artifact_filename": "logistic_regression_p0.pkl",
+            "model_name": "Logistic Regression",
+            "primary_metric": "recall",
+            "score": 0.8947,
+            "selection_basis": "highest RECALL",
+            "selected_by": "code",
+        }
+        with open(d / "champion_model.json", "w", encoding="utf-8") as f:
+            json.dump(champ, f)
+
+        with open(d / "model_registry.json", "w", encoding="utf-8") as f:
+            json.dump({"models": [
+                {"model_id": "logistic_regression", "artifact_filename": "logisticregression_p0.pkl", "status": "champion"}
+            ]}, f)
+
+        with open(d / "ml_summary.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "best_model": {"name": "LogisticRegression"}
+            }, f)
+
+        champ_findings = _check_champion(str(d), champ)
+        assert len([f for f in champ_findings if f.severity in ("error", "critical")]) == 0
+
+        consistency_findings = check_model_artifact_consistency(str(d))
+        assert len(consistency_findings) == 0
 
     def test_confusion_matrix_mismatch_repaired_from_predictions(self, tmp_path):
         d = tmp_path

@@ -107,5 +107,45 @@ class TestJudgeGuardrails(unittest.TestCase):
         self.assertEqual(findings[-1]["severity"], "minor")
 
 
+class TestReportRepairFindings(unittest.TestCase):
+    def test_repair_final_report_updates_verification_and_findings(self):
+        import tempfile
+        from unittest.mock import MagicMock
+        from agents.orchestrate import WorkflowOrchestrator
+
+        orch = object.__new__(WorkflowOrchestrator)
+        orch.max_repair_attempts = 2
+        orch.final_report = "# Repaired Report"
+        orch.current_output_dir = tempfile.mkdtemp()
+        orch.cancellation_token = None
+        orch.severity_thresholds = {"max_critical_findings": 0}
+        orch.completed_task_results = []
+        orch.reporter_agent = MagicMock()
+        orch.reporter_agent.repair_report.return_value = "# Repaired Report New"
+
+        # First verification has 4 critical findings
+        initial_verification = {
+            "findings": [
+                {"severity": "critical", "code": "judge_contradicted_claim", "message": f"error {i}"}
+                for i in range(4)
+            ]
+        }
+
+        # Second verification (after repair) returns 0 findings
+        orch._run_final_verification = MagicMock(return_value={"findings": []})
+
+        updated_verification = orch._repair_final_report(initial_verification, files_list=[])
+
+        # Verify findings are cleared both in updated_verification and mutated initial_verification
+        self.assertEqual(len(updated_verification["findings"]), 0)
+        self.assertEqual(len(initial_verification["findings"]), 0)
+        self.assertEqual(orch.repair_attempts_used, 1)
+
+        # Verify classification marks it as completed, NOT failed-consistency
+        classification = orch._classify_run_status(updated_verification["findings"])
+        self.assertEqual(classification["status"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -48,7 +48,7 @@ from agents.artifact_validator import (
 )
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
 from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
-from agents.preflight_gate import run_preflight, verify_champion_consistency
+from agents.preflight_gate import run_preflight, verify_champion_consistency, _load_json_safe
 from agents.champion_selector import select_initial_champion, evaluate_challenger, ChampionSelectionResult
 from agents.fact_sheet import build_facts
 from agents.observability import (
@@ -63,6 +63,17 @@ try:
     import logfire
 except ImportError:
     logfire = None
+
+
+def _load_json_safe(path: str) -> Optional[Any]:
+    """Safely load JSON file, returning None on missing file or parse error."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def build_post_verification_retry_prompt(unverified_errors: List[str]) -> str:
@@ -140,8 +151,13 @@ def _normalize_champion_pointer(output_dir: str) -> Optional[str]:
     target = _canon(champ_artifact)
     matches = [f for f in pkl_files if _canon(f) == target]
     if len(matches) != 1:
+        # Also match by stripping underscores/non-alphanumerics completely
+        clean_target = _re.sub(r"[^a-z0-9]", "", target[:-4] if target.endswith(".pkl") else target)
+        matches = [f for f in pkl_files if _re.sub(r"[^a-z0-9]", "", f[:-4] if f.endswith(".pkl") else f) == clean_target]
+    if len(matches) != 1:
         return None
     champ["model"] = matches[0]
+    champ["artifact_filename"] = matches[0]
     champ["pointer_normalized_from"] = champ_artifact
     with open(champ_path, "w", encoding="utf-8") as f:
         json.dump(champ, f, indent=2)
@@ -572,13 +588,13 @@ class WorkflowOrchestrator:
             }
 
     def _repair_final_report(self, verification: Dict[str, Any], files_list: List[str],
-                             step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> int:
+                             step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """
         Post-report repair loop. While critical findings remain and attempts are
         left: combine ALL findings (numeric + consistency + judge) into ONE
         correction prompt and repair via a compact agent turn with a dedicated
         5-call sandbox budget, then re-verify with all methods. Returns the
-        number of repair attempts used.
+        updated verification dictionary.
         """
         def _cb(event: str, data: Dict[str, Any]):
             if step_callback:
@@ -589,7 +605,7 @@ class WorkflowOrchestrator:
 
         repair_attempts_used = 0
         while repair_attempts_used < self.max_repair_attempts:
-            critical = [f for f in verification["findings"] if f.get("severity") == "critical"]
+            critical = [f for f in verification.get("findings", []) if f.get("severity") == "critical"]
             if not critical:
                 break
 
@@ -625,15 +641,20 @@ class WorkflowOrchestrator:
                 logfire.warn("Orchestrator: could not build dataset profile for repair prompt", error=str(profile_err))
                 profile_block = ""
 
-            corrected = self.reporter_agent.repair_report(
-                current_report=self.final_report,
-                findings=verification["findings"],
-                verified_metrics=verification.get("verified_metrics") or {},
-                profile_block=profile_block,
-                max_tool_calls=5,
-                cancellation_token=self.cancellation_token,
-                step_callback=step_callback,
-            )
+            try:
+                corrected = self.reporter_agent.repair_report(
+                    current_report=self.final_report,
+                    findings=verification.get("findings", []),
+                    verified_metrics=verification.get("verified_metrics") or {},
+                    profile_block=profile_block,
+                    max_tool_calls=5,
+                    cancellation_token=self.cancellation_token,
+                    step_callback=step_callback,
+                )
+            except Exception as repair_err:
+                logfire.error("Orchestrator: report repair encountered exception", error=str(repair_err))
+                print(f"[Orchestrator Error] Report repair failed: {repair_err}")
+                break
 
             if not corrected or corrected == self.final_report:
                 logfire.warn("Orchestrator: repair produced no changed report; stopping repair loop",
@@ -659,11 +680,13 @@ class WorkflowOrchestrator:
                 "report_length": len(self.final_report),
             })
 
-            # Re-verify the repaired report with ALL methods
-            verification = self._run_final_verification(query_text="", active_plan=None)
+            # Re-verify the repaired report with ALL methods and update verification in-place
+            new_verification = self._run_final_verification(query_text="", active_plan=None)
+            verification.clear()
+            verification.update(new_verification)
 
         self.repair_attempts_used = repair_attempts_used
-        return repair_attempts_used
+        return verification
 
     def _classify_run_status(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -1112,6 +1135,13 @@ class WorkflowOrchestrator:
                         last_missing_artifacts: list = []  # Missing artifacts from the previous attempt (drives targeted repair)
                         last_fallback_detected = False  # Fallback flag from the previous attempt
 
+                        # Snapshot pre-task champion before ML task runs (e.g. initial champion before HPT)
+                        pre_ml_champion = None
+                        if isinstance(agent_instance, MLAgent) or getattr(task, "task_type", None) in ("model_comparison", "hyperparameter_tuning"):
+                            champ_file_path = os.path.join(self.current_output_dir, "champion_model.json")
+                            if os.path.isfile(champ_file_path):
+                                pre_ml_champion = _load_json_safe(champ_file_path)
+
                         while attempt <= max_retries and not validation_passed and not task_validation_failed:
                             _attempt_t0 = time.perf_counter()
                             if attempt > 0:
@@ -1449,6 +1479,22 @@ class WorkflowOrchestrator:
                                         [f"Unverified numeric claim in report (must match VERIFIED_METRICS verbatim): '{c}'" for c in unverified[:10]]
                                         or [f"Post-verification failed: {pv.get('unverified_count', 'unknown')} unverified numeric claims in the report."]
                                     )
+                            elif isinstance(agent_instance, MLAgent) or getattr(task, "task_type", None) in ("model_comparison", "hyperparameter_tuning"):
+                                ml_verif = verify_champion_consistency(
+                                    output_dir=self.current_output_dir,
+                                    goal_text=query_text,
+                                    repair=False,
+                                    task_type=getattr(task, "task_type", None),
+                                    pre_task_champion=pre_ml_champion,
+                                    primary_metric=getattr(task, "primary_metric", None),
+                                )
+                                if not ml_verif.get("consistent", True):
+                                    post_verification_failed = True
+                                    post_verification_errors = [
+                                        f.message if hasattr(f, "message") else (f.get("message") if isinstance(f, dict) else str(f))
+                                        for f in ml_verif.get("findings", [])
+                                        if (getattr(f, "severity", None) or (f.get("severity") if isinstance(f, dict) else "")) == "error"
+                                    ] or ["Post-ML verification failed: champion and artifact consistency requirements were not met."]
 
                             if validation_result.is_valid and not post_verification_failed:
                                 # Validation passed!
@@ -1498,7 +1544,7 @@ class WorkflowOrchestrator:
                                     last_missing_artifacts = list(validation_result.missing_artifacts or [])
                                     last_fallback_detected = validation_result.fallback_detected
                                 else:
-                                    failure_kind = "post_verification"
+                                    failure_kind = "post_ml_verification" if (isinstance(agent_instance, MLAgent) or getattr(task, "task_type", None) in ("model_comparison", "hyperparameter_tuning")) else "post_verification"
                                     last_validation_errors = post_verification_errors
                                 last_failure_kind = failure_kind
 
@@ -1877,8 +1923,8 @@ class WorkflowOrchestrator:
                 # calls per attempt), re-verifying with all methods after each.
                 with task_context(agent="ReporterAgent", phase="repair"):
                     with get_recorder().step_timer("report_repair"):
-                        self._repair_final_report(verification, files_list, step_callback=step_callback)
-                findings = verification["findings"]
+                        verification = self._repair_final_report(verification, files_list, step_callback=step_callback)
+                findings = verification.get("findings", [])
 
                 classification = self._classify_run_status(findings)
                 workflow_status = classification["status"]

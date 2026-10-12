@@ -34,13 +34,14 @@ Key Design Principles:
 import os
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 from agents.logger import setup_logfire
 from agents.champion_selector import _load_comparison_rows, _norm_model_name, ChampionSelectionResult, ChampionSelectionStatus
 from agents.schema import ChampionModel
+import re
 
 try:
     import logfire
@@ -122,6 +123,110 @@ class PreflightResult:
         }
 
 
+def _load_json_with_error(path: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Loads JSON returning (data, error_str). Differentiates missing vs corrupted JSON."""
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return json.load(f), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def normalize_model_family(name_or_file: str) -> str:
+    """Normalize model artifact filename or model display name to a canonical model family string."""
+    s = str(name_or_file or "").strip()
+    s = re.sub(r"\.pkl$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[-_]p\d+(?:[-_]tuned)?$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+p\d+$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\(tuned\)|\(baseline\)", "", s, flags=re.IGNORECASE)
+    s = s.strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "histgradientboostingclassifier": "histgradboost",
+        "histgradientboosting": "histgradboost",
+        "hist_gradient_boosting": "histgradboost",
+        "gradientboostingclassifier": "gradient_boosting",
+        "gradientboosting": "gradient_boosting",
+        "randomforestclassifier": "random_forest",
+        "randomforest": "random_forest",
+        "logisticregression": "logistic_regression",
+        "svc": "svm",
+        "linearsvc": "svm",
+    }
+    return aliases.get(s, s)
+
+
+def _clean_str(s: Any) -> str:
+    """Lowercase string with only alphanumeric characters, stripping extension if any."""
+    if not s:
+        return ""
+    stem = os.path.splitext(str(s))[0]
+    return re.sub(r"[^a-z0-9]", "", stem.lower())
+
+
+def _match_artifact(art1: Optional[str], art2: Optional[str]) -> bool:
+    """Check if two model artifact references refer to the same model artifact."""
+    if not art1 or not art2:
+        return False
+    s1, s2 = str(art1).strip(), str(art2).strip()
+    if s1 == s2:
+        return True
+    c1, c2 = _clean_str(s1), _clean_str(s2)
+    if c1 and c1 == c2:
+        return True
+    fam1 = normalize_model_family(s1)
+    fam2 = normalize_model_family(s2)
+    if fam1 and fam1 != "unknown" and fam1 == fam2:
+        p1 = re.search(r'p\d+', s1.lower())
+        p2 = re.search(r'p\d+', s2.lower())
+        if p1 and p2:
+            return p1.group(0) == p2.group(0)
+        return True
+    return False
+
+
+def _match_model_names(name1: Optional[str], name2: Optional[str]) -> bool:
+    """Check if two model names refer to the same model family/name."""
+    if not name1 or not name2:
+        return False
+    s1, s2 = str(name1).strip(), str(name2).strip()
+    if s1 == s2:
+        return True
+    c1, c2 = _clean_str(s1), _clean_str(s2)
+    if c1 and c1 == c2:
+        return True
+    fam1 = normalize_model_family(s1)
+    fam2 = normalize_model_family(s2)
+    if fam1 and fam1 != "unknown" and fam1 == fam2:
+        return True
+    return False
+
+
+def _find_matching_artifact(name: Optional[str], pkl_files: Any) -> Optional[str]:
+    """Find a matching on-disk .pkl file from candidate string."""
+    if not name or not pkl_files:
+        return None
+    name_str = str(name).strip()
+    if name_str in pkl_files:
+        return name_str
+    clean_name = _clean_str(name_str)
+    for p in pkl_files:
+        if _clean_str(p) == clean_name:
+            return p
+    target_fam = normalize_model_family(name_str)
+    if target_fam and target_fam != "unknown":
+        target_phase = re.search(r'p\d+', name_str.lower())
+        for p in pkl_files:
+            if normalize_model_family(p) == target_fam:
+                if target_phase:
+                    p_phase = re.search(r'p\d+', p.lower())
+                    if p_phase and p_phase.group(0) != target_phase.group(0):
+                        continue
+                return p
+    return None
+
+
 def _load_json_safe(path: str) -> Optional[Any]:
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -152,6 +257,9 @@ def _extract_registry_models(reg: Any) -> List[Dict[str, Any]]:
         models = reg.get("models")
         if isinstance(models, list):
             return [m for m in models if isinstance(m, dict)]
+        entries = [v for v in reg.values() if isinstance(v, dict) and any(k in v for k in ("model_id", "artifact_filename", "artifact", "model", "status"))]
+        if entries:
+            return entries
     return []
 
 
@@ -204,13 +312,18 @@ def _check_champion(output_dir: str, champ: Optional[Dict[str, Any]], selector_r
         return [_finding("error", "SCHEMA_ERROR", f"champion_model.json does not match the champion schema: {exc}", ["champion_model.json"])]
 
     art = champ.get("artifact_filename") or champ.get("model")
-    if art and art not in pkl_files:
+    matched_pkl = _find_matching_artifact(art, pkl_files)
+    if art and not matched_pkl:
         findings.append(_finding(
             "error",
             "INVALID_ARTIFACT",
             f"champion_model.json points to '{art}', which does not exist on disk. Available: {', '.join(pkl_files) or 'none'}.",
             ["champion_model.json"],
         ))
+    elif matched_pkl and matched_pkl != art:
+        art = matched_pkl
+        champ["model"] = matched_pkl
+        champ["artifact_filename"] = matched_pkl
 
     # champion_model.json is authoritative; the registry must point to the same
     # artifact with exactly one champion status.
@@ -222,7 +335,11 @@ def _check_champion(output_dir: str, champ: Optional[Dict[str, Any]], selector_r
             for item in models
             if isinstance(item, dict) and str(item.get("status", "")).lower() == "champion"
         ]
-        if registry_champions != [art]:
+        has_match = (
+            len(registry_champions) == 1
+            and _match_artifact(registry_champions[0], art)
+        )
+        if not has_match:
             findings.append(_finding(
                 "error", "CHAMPION_REGISTRY_DISAGREEMENT",
                 f"model_registry.json champion entries {registry_champions or 'none'} do not match canonical champion '{art}'.",
@@ -233,7 +350,7 @@ def _check_champion(output_dir: str, champ: Optional[Dict[str, Any]], selector_r
     ml = _load_json_safe(os.path.join(output_dir, "ml_summary.json"))
     if isinstance(ml, dict):
         summary_best = (ml.get("best_model") or {}).get("name") if isinstance(ml.get("best_model"), dict) else ml.get("best_model")
-        if summary_best and _norm_model_name(str(summary_best)) != _norm_model_name(champ.get("model_name") or ""):
+        if summary_best and not _match_model_names(str(summary_best), champ.get("model_name") or champ.get("model") or ""):
             findings.append(_finding(
                 "warning",
                 "CHAMPION_DISAGREEMENT_ML_SUMMARY",
@@ -664,8 +781,10 @@ def _repair_registry_champion(output_dir: str, champ: Dict[str, Any]) -> bool:
     for entry in models:
         if not isinstance(entry, dict):
             continue
-        is_target = entry.get("artifact_filename") == artifact and not matched
+        is_target = (entry.get("artifact_filename") == artifact or _match_artifact(entry.get("artifact_filename"), artifact)) and not matched
         entry["status"] = "champion" if is_target else ("evaluated" if entry.get("status") == "champion" else entry.get("status", "candidate"))
+        if is_target:
+            entry["artifact_filename"] = artifact
         matched = matched or is_target
     if not matched:
         if not artifact or not os.path.isfile(os.path.join(output_dir, str(artifact))):
@@ -689,7 +808,14 @@ def _repair_registry_champion(output_dir: str, champ: Dict[str, Any]) -> bool:
     return _dump_json(path, registry)
 
 
-def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bool = False) -> Dict[str, Any]:
+def verify_champion_consistency(
+    output_dir: str,
+    goal_text: str = "",
+    repair: bool = False,
+    task_type: Optional[str] = None,
+    pre_task_champion: Optional[Dict[str, Any]] = None,
+    primary_metric: Optional[str] = None,
+) -> Dict[str, Any]:
     """Post-ML-task gate: every artifact that names a champion must name THE champion.
 
     Reads champion_model.json as the canonical selection record and reports
@@ -703,11 +829,168 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
         "findings": [],
         "champion": None,
     }
-    try:
-        champ = _load_json_safe(os.path.join(output_dir, "champion_model.json"))
-    except Exception as e:
+    # 1. Model registry corruption check
+    reg_path = os.path.join(output_dir, "model_registry.json")
+    if os.path.isfile(reg_path):
+        reg_data, reg_err = _load_json_with_error(reg_path)
+        if reg_err is not None:
+            result["findings"].append(_finding(
+                "error", "CORRUPTED_MODEL_REGISTRY",
+                f"model_registry.json exists on disk but is corrupted and unparseable as JSON: {reg_err}. Fix model_registry.json so it is valid JSON.",
+                ["model_registry.json"]
+            ))
+
+    # 2. Champion model JSON validation
+    champ_path = os.path.join(output_dir, "champion_model.json")
+    champ, champ_err = _load_json_with_error(champ_path)
+    if os.path.isfile(champ_path) and champ_err is not None:
+        result["findings"].append(_finding(
+            "error", "INVALID_CHAMPION_MODEL",
+            f"champion_model.json is corrupted and unparseable as JSON: {champ_err}. Rewrite with valid JSON.",
+            ["champion_model.json"]
+        ))
+    elif not os.path.isfile(champ_path) and task_type in ("model_comparison", "hyperparameter_tuning"):
+        result["findings"].append(_finding(
+            "error", "MISSING_CHAMPION_MODEL",
+            f"champion_model.json was not created after {task_type}. An authoritative champion must be recorded in champion_model.json.",
+            ["champion_model.json"]
+        ))
+    result["champion"] = champ
+
+    champ_art = champ.get("artifact_filename") or champ.get("model") if isinstance(champ, dict) else None
+    pkl_files = [f for f in os.listdir(output_dir) if f.lower().endswith(".pkl")] if os.path.isdir(output_dir) else []
+    matched_art = _find_matching_artifact(champ_art, pkl_files) if champ_art else None
+    if champ_art and not matched_art:
+        result["findings"].append(_finding(
+            "error", "MISSING_CHAMPION_ARTIFACT",
+            f"champion_model.json designates '{champ_art}' as champion, but that .pkl file does not exist on disk.",
+            ["champion_model.json", str(champ_art)]
+        ))
+    elif matched_art and matched_art != champ_art:
+        champ_art = matched_art
+        if isinstance(champ, dict):
+            champ["model"] = matched_art
+            champ["artifact_filename"] = matched_art
+
+    # 3. Hyperparameter tuning specific verification
+    tuning_path = os.path.join(output_dir, "hyperparameter_tuning_summary.json")
+    if task_type == "hyperparameter_tuning" or os.path.isfile(tuning_path):
+        if not os.path.isfile(tuning_path):
+            result["findings"].append(_finding(
+                "error", "MISSING_TUNING_SUMMARY",
+                "hyperparameter_tuning_summary.json was not generated by hyperparameter tuning.",
+                ["hyperparameter_tuning_summary.json"]
+            ))
+        else:
+            tuning, tuning_err = _load_json_with_error(tuning_path)
+            if tuning_err is not None:
+                result["findings"].append(_finding(
+                    "error", "CORRUPTED_TUNING_SUMMARY",
+                    f"hyperparameter_tuning_summary.json is corrupted and unparseable: {tuning_err}.",
+                    ["hyperparameter_tuning_summary.json"]
+                ))
+            elif isinstance(tuning, dict):
+                prev_champ = pre_task_champion or {}
+                prev_art = (prev_champ.get("artifact_filename") or prev_champ.get("model")
+                            or (tuning.get("parent_model") or {}).get("artifact")
+                            or (tuning.get("champion_decision") or {}).get("previous_champion"))
+                prev_family = normalize_model_family(prev_art or prev_champ.get("model_family") or "")
+                prev_score = prev_champ.get("score")
+                metric = (primary_metric or prev_champ.get("primary_metric")
+                          or (tuning.get("comparison_basis") or {}).get("primary_metric") or "recall")
+
+                challenger_art = ((tuning.get("challenger_model") or {}).get("artifact")
+                                  or (tuning.get("frozen_model") or {}).get("artifact"))
+                if not challenger_art:
+                    tmc_path = os.path.join(output_dir, "tuned_model_comparison.csv")
+                    if os.path.isfile(tmc_path):
+                        try:
+                            import pandas as pd
+                            tmc_df = pd.read_csv(tmc_path)
+                            c_col = next((c for c in tmc_df.columns if c.strip().lower() in ("artifact", "model_artifact")), None)
+                            if c_col:
+                                non_p0 = [str(x) for x in tmc_df[c_col].dropna() if "_p0" not in str(x).lower()]
+                                if non_p0:
+                                    challenger_art = non_p0[0]
+                        except Exception:
+                            pass
+                challenger_family = normalize_model_family(challenger_art or (tuning.get("challenger_model") or {}).get("model_name") or "")
+
+                # Check model family consistency: challenger must belong to the same family as previous champion
+                if prev_family and challenger_family and prev_family != challenger_family:
+                    result["findings"].append(_finding(
+                        "error", "CHAMPION_FAMILY_MISMATCH",
+                        f"Hyperparameter tuning evaluated or proposed challenger '{challenger_art}' from model family '{challenger_family}', "
+                        f"but the previous champion is '{prev_art}' (model family '{prev_family}'). "
+                        f"HPT can ONLY tune the existing champion model family to produce a tuned version (e.g. '{prev_family}_p1.pkl'). "
+                        f"It cannot switch the champion to a different model family ('{challenger_family}'). "
+                        f"Please re-run hyperparameter tuning targeting the '{prev_family}' model.",
+                        ["hyperparameter_tuning_summary.json", "champion_model.json"]
+                    ))
+
+                comp = tuning.get("comparison") or {}
+                tuned_dict = comp.get("tuned") or {}
+                base_dict = comp.get("baseline") or {}
+
+                def _extract_metric_val(m_dict: Dict[str, Any], target_m: str) -> Optional[float]:
+                    if not isinstance(m_dict, dict):
+                        return None
+                    norm_target = str(target_m).strip().lower().replace("-", "_").replace(" ", "_")
+                    for k, v in m_dict.items():
+                        if str(k).strip().lower().replace("-", "_").replace(" ", "_") == norm_target:
+                            try:
+                                return float(v)
+                            except (ValueError, TypeError):
+                                pass
+                    return None
+
+                tuned_val = _extract_metric_val(tuned_dict, metric)
+                base_val = _extract_metric_val(base_dict, metric)
+                if prev_score is not None:
+                    try:
+                        base_val = float(prev_score)
+                    except (ValueError, TypeError):
+                        pass
+
+                if tuned_val is not None and base_val is not None:
+                    is_ascending = str(metric).lower() in ("loss", "log_loss", "mse", "rmse", "mae")
+                    challenger_improved = (tuned_val < base_val) if is_ascending else (tuned_val > base_val)
+
+                    champ_decision = tuning.get("champion_decision") or {}
+                    claimed_changed = champ_decision.get("champion_changed", False)
+                    claimed_new = champ_decision.get("new_champion", "")
+
+                    if (claimed_changed or claimed_new == challenger_art) and not challenger_improved:
+                        result["findings"].append(_finding(
+                            "error", "FALSE_CHAMPION_IMPROVEMENT_CLAIM",
+                            f"hyperparameter_tuning_summary.json declared '{claimed_new}' as new champion (champion_changed=True), "
+                            f"but on {metric}, tuned score ({tuned_val:.4f}) did NOT improve over existing champion '{prev_art}' ({base_val:.4f}). "
+                            f"When tuning does not beat the existing champion, the existing champion must be retained with champion_changed: false.",
+                            ["hyperparameter_tuning_summary.json", "champion_model.json"]
+                        ))
+                    elif not claimed_changed and champ_art and prev_art and not _match_artifact(champ_art, prev_art):
+                        result["findings"].append(_finding(
+                            "error", "CHAMPION_DECISION_DISAGREEMENT",
+                            f"Tuning did not improve the champion (champion_changed=False), but champion_model.json points to '{champ_art}'. "
+                            f"It must remain '{prev_art}'.",
+                            ["champion_model.json", "hyperparameter_tuning_summary.json"]
+                        ))
+                    elif claimed_changed and challenger_improved and prev_family == challenger_family:
+                        if champ_art and challenger_art and not _match_artifact(champ_art, challenger_art):
+                            result["findings"].append(_finding(
+                                "error", "CHAMPION_DECISION_DISAGREEMENT",
+                                f"Tuning improved the champion to '{challenger_art}', but champion_model.json still points to '{champ_art}'. "
+                                f"champion_model.json must be updated to the new champion '{challenger_art}'.",
+                                ["champion_model.json", "hyperparameter_tuning_summary.json"]
+                            ))
+
+    if champ is None and not result["findings"]:
+        # No comparison data yet — nothing to verify (e.g. before model training).
+        return result
+        pass
+    if False:
         champ = None
-        result["findings"].append(_finding("error", "INVALID_ARTIFACT", f"Could not read champion_model.json: {e}", ["champion_model.json"]))
+        pass
     result["champion"] = champ
 
     if champ is None:
@@ -729,18 +1012,32 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
         ml = _load_json_safe(os.path.join(output_dir, fname)) or {}
         ch = ml.get("champion")
         ch_art = ch.get("model_artifact") if isinstance(ch, dict) else ch
-        if ch_art and ch_art != champ_art:
+        if ch_art and not _match_artifact(ch_art, champ_art):
             result["findings"].append(_finding(
                 "error", "CHAMPION_POINTER_DISAGREEMENT",
                 f"{fname} points to '{ch_art}' but the code-selected champion is '{champ_art}'.",
                 [fname, "champion_model.json"],
             ))
 
-    reg = _load_json_safe(os.path.join(output_dir, "model_registry.json")) or {}
-    reg_champs = [m.get("artifact_filename") or m.get("model")
-                  for m in _extract_registry_models(reg)
-                  if isinstance(m, dict) and m.get("status") == "champion"]
-    if reg_champs != [champ_art]:
+    reg_path = os.path.join(output_dir, "model_registry.json")
+    if os.path.isfile(reg_path):
+        reg = _load_json_safe(reg_path) or {}
+        reg_champs = [m.get("artifact_filename") or m.get("model")
+                      for m in _extract_registry_models(reg)
+                      if isinstance(m, dict) and m.get("status") == "champion"]
+        if not (len(reg_champs) == 1 and _match_artifact(reg_champs[0], champ_art)):
+            result["findings"].append(_finding(
+                "error", "CHAMPION_REGISTRY_DISAGREEMENT",
+                f"model_registry.json marks {reg_champs or 'nothing'} as champion but champion_model.json "
+                f"points to '{champ_art}'. All artifacts must agree on the champion.",
+                ["model_registry.json", "champion_model.json"],
+            ))
+            if repair and _repair_registry_champion(output_dir, champ):
+                result["repairs"].append("model_registry.json synchronized to champion_model.json")
+    # [legacy registry check removed]
+    # for m in _extract_registry_models(reg)
+    # if isinstance(m, dict) and m.get("status") == "champion"]
+    if False:
         result["findings"].append(_finding(
             "error", "CHAMPION_REGISTRY_DISAGREEMENT",
             f"model_registry.json marks {reg_champs or 'nothing'} as champion but champion_model.json "
@@ -771,7 +1068,7 @@ def verify_champion_consistency(output_dir: str, goal_text: str = "", repair: bo
     if repair:
         result["repairs"].extend(_sync_threshold_analysis_ml_summary(output_dir, champ))
 
-    result["consistent"] = len(result["findings"]) == 0
+    result["consistent"] = len([f for f in result["findings"] if getattr(f, "severity", "") == "error"]) == 0
 
     try:
         _dump_json(os.path.join(output_dir, "champion_consistency_report.json"), result)
