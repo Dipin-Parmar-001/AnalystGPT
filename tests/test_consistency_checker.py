@@ -257,6 +257,24 @@ class TestVisualizationDescriptionCheck(unittest.TestCase):
         report = run_consistency_checks(self.tmp, persist=False)
         self.assertNotIn("viz_description_mapping_mismatch", [f.code for f in report.findings])
 
+    def test_dummy_classifier_champion_emits_warning(self):
+        with open(os.path.join(self.tmp, "dummy_p0.pkl"), "wb") as f:
+            f.write(b"dummy")
+        _write_json(os.path.join(self.tmp, "champion_model.json"), {
+            "model": "dummy_p0.pkl",
+            "artifact_filename": "dummy_p0.pkl",
+            "model_name": "DummyClassifier",
+        })
+        _write_json(os.path.join(self.tmp, "model_registry.json"), {
+            "models": [{"model_id": "dummy_p0", "artifact_filename": "dummy_p0.pkl", "status": "champion"}]
+        })
+        report = run_consistency_checks(self.tmp, persist=False)
+        dummy_findings = [f for f in report.findings if f.code == "dummy_classifier_champion"]
+        self.assertTrue(dummy_findings)
+        self.assertEqual(dummy_findings[0].severity, "minor")
+        self.assertIn("cannot be deployed or promoted as the champion", dummy_findings[0].message)
+
 
 if __name__ == "__main__":
     unittest.main()
+

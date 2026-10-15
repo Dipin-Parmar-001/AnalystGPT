@@ -249,7 +249,12 @@ sizing tasks correctly is as important as scoping them correctly.
   `model_comparison.csv`, `baseline_score.json`, `feature_importance.csv`,
   `confusion_matrix.json`, `predictions.csv`, `ml_summary.json`, `model_registry.json`,
   `champion_model.json`, plus immutable versioned model files such as
-  `logistic_regression_p0.pkl`. NEVER create a generic mutable `best_model.pkl`. If the
+  `logistic_regression_p0.pkl`. NEVER create a generic mutable `best_model.pkl`.
+  A dummy classifier model (e.g. `DummyClassifier`, Majority Class Baseline) if used can ONLY be
+  trained and evaluated for baseline comparison to establish baseline benchmark metrics — it CANNOT
+  be deployed or promoted as the champion. Promoting a dummy classifier as champion is unacceptable
+  and will cause failure on the verification. Champion selection must always promote a viable
+  non-dummy trained model. If the
   natural target for the request is continuous and no request for regression/classification
   was made, do NOT invent a binning scheme to force-fit classification.
   MLAgent ALSO supports a Hyperparameter Tuning task type (see SCOPE RULE 4 and SEQUENCING
@@ -1198,7 +1203,11 @@ Used by `model_comparison` (to pick the champion among candidates) and by
    a. primary_metric_delta (challenger - parent, validation) >= min_improvement_delta;
    b. no guardrail metric degrades by more than guardrail_tolerance on validation;
    c. the cv_stability_rule holds under identical folds and scoring (CV on TRAIN only);
-   d. the comparison basis is identical (see COMPARISON BASIS).
+   d. the comparison basis is identical (see COMPARISON BASIS);
+   e. the candidate is NOT a dummy classifier. The dummy classifier model if used can ONLY be
+      trained and evaluated on the baseline for evaluation and baseline comparison; it cannot be
+      deployed or promoted as the champion. Promoting a dummy classifier as champion is strictly
+      not acceptable and will cause failure on the verification.
 3. Otherwise `improved = false`. Reason strings must contain the actual numbers and the
    word "validation".
 4. The decision is made BEFORE the test set is touched and is never revisited because of a
@@ -1309,11 +1318,21 @@ prevalence baseline.
 
 All baseline metrics come from executed code; never type them by hand.
 
+RULE ON DUMMY CLASSIFIER / BASELINE (MANDATORY):
+The dummy classifier model if using that then only use for evaluation and baseline comparison.
+It can be trained and evaluated on the baseline, but CANNOT be deployed or promoted as the champion.
+Promoting a dummy classifier as champion is NOT ACCEPTABLE and will cause failure on the verification.
+Even if the dummy classifier scores higher on a raw metric (such as accuracy under severe class imbalance),
+it must never be promoted. Always select and promote another viable best trained model as champion.
+
 ## Model selection
 
 Do not pick a model on accuracy alone. Consider the pre-registered primary metric,
 secondary metrics, CV stability, class imbalance, business objective, FP/FN trade-off, and
 interpretability. The Planner's declared metric is authoritative.
+NEVER select or promote a DummyClassifier / baseline model as the champion: dummy models are
+strictly for baseline comparison and cannot be deployed or promoted as champion. Promoting a
+dummy classifier as champion is not acceptable and will cause failure on the verification.
 
 Always distinguish and record separately:
 1. best model by primary metric (validation),
@@ -1763,6 +1782,11 @@ One last `execute_python` call (reloading the files YOU wrote is allowed here) t
 6. The three final test artifacts pass the post-write consistency assertions (when the test
    evaluation ran) and agree on model_id, split_id, threshold, and row counts.
 7. `threshold_analysis.json` describes the current champion's artifact.
+8. The champion model in `champion_model.json` (and all artifacts that name a champion) is NOT a dummy classifier.
+   The dummy classifier model if used can ONLY be used for evaluation and baseline comparison and cannot be deployed
+   or promoted as champion; promoting it as champion is not acceptable and will cause failure on the verification.
+   If a dummy classifier was mistakenly marked as champion, update the related files (champion_model.json,
+   model_registry.json, ml_summary.json) to promote another one best model as champion.
 Fix any failure in the same task. Never report success with contradictory artifacts.
 
 
@@ -2017,6 +2041,35 @@ These may coincide, but never assume they do.
    Instead: inspect the workspace, continue only the missing steps, and if the task cannot
    finish say so plainly in the final message and `status`.
 
+10. Mistake: Confusing validation data with test data
+    Instead:
+    - Use training data to fit models, validation data for model selection and threshold
+      tuning, and held-out test data for final evaluation when the task uses a
+      train/validation/test split.
+    - Never label validation metrics or predictions as final test results.
+    - If the task uses cross-validation, a predefined split, or another evaluation strategy,
+      follow that strategy instead of forcing a fixed three-way split.
+
+11. Mistake: Inconsistent split definitions
+    Instead:
+    - Do not assume every dataset requires the same splitting strategy. Select an appropriate
+      strategy based on the dataset, task, and evaluation requirements.
+    - Once a split strategy is established, use the same split definition consistently across
+      training, evaluation, prediction generation, and reporting.
+    - Do not independently recreate or silently change partitions in downstream steps.
+    - Record sufficient split provenance, such as the strategy, partition sizes, random seed
+      where applicable, and row indices or stable identifiers where feasible.
+
+12. Mistake: Misrepresenting evaluation results
+    Instead:
+    - Clearly distinguish training, validation, cross-validation, and test results in metrics,
+      prediction artifacts, and reports.
+    - Ensure that reported metrics correspond to the actual predictions and partition they claim
+      to evaluate.
+    - Do not claim that a model has passed final test evaluation if no valid final-test
+      evaluation was performed.
+    - If the available artifacts do not establish which partition was evaluated, report the
+      limitation rather than guessing.
 """
 
 ML_SYSTEM_PROMPT = ML_AGENT
@@ -2149,7 +2202,8 @@ Selection, Selected Best Model Performance, Key Predictive Drivers & Directional
   VERIFIED_METRICS / the ML summaries. A cell is left as "not available in artifacts" only if no
   artifact holds the value.
 - Report exactly ONE best model (the champion), consistent with `champion_model.json`. Do not present
-  alternatives as co-equal "best" picks.
+  alternatives as co-equal "best" picks. Note that a dummy classifier (majority class baseline) is only
+  for baseline evaluation and comparison and can NEVER be deployed or reported as the champion model.
 - Present the key predictive drivers as two separately ranked lists: factors that increase the outcome
   ({{drivers_increasing_outcome}}) and factors that reduce it ({{drivers_reducing_outcome}}). Never mix
   them into one list. If no FACT_SHEET is provided, build the two lists from `feature_importance.csv`.

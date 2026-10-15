@@ -655,6 +655,16 @@ def _extract_json(text: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     if malformed_match:
         text_str = text_str[malformed_match.end():].strip()
 
+    # Check for direct JSON array
+    stripped = text_str.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            parsed_arr = json.loads(stripped)
+            if isinstance(parsed_arr, list):
+                return {"tasks": parsed_arr}
+        except Exception:
+            pass
+
     # Match markdown json block if present
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_str, re.DOTALL)
     if match:
@@ -710,6 +720,8 @@ def extract_response_message(response: Any) -> Any:
     """Safely extracts message object from LLM response or Portkey envelope."""
     if response is None:
         raise ValueError("LLM returned None response")
+    if isinstance(response, dict) and "error" in response and response.get("error"):
+        raise RuntimeError(f"LLM API error response: {response['error']}")
     choices = getattr(response, "choices", None)
     if choices is None and isinstance(response, dict):
         choices = response.get("choices")

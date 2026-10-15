@@ -563,6 +563,17 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
                 f"champion_model.json points to '{champ_artifact}', which does not exist on disk. Available: {', '.join(sorted(pkl_files)) or 'none'}.",
                 ["champion_model.json"],
             ))
+        from agents.preflight_gate import is_dummy_classifier
+        if is_dummy_classifier(champion):
+            champ_disp = champion.get("model_name") or champion.get("model") or champ_artifact or "DummyClassifier"
+            findings.append(Finding(
+                SEVERITY_MINOR, "dummy_classifier_champion",
+                f"Dummy classifier model ('{champ_disp}') was designated as champion in champion_model.json. "
+                f"The dummy classifier model can be trained and evaluated on the baseline but cannot be deployed or promoted as the champion. "
+                f"Please update the related files which are promoting the dummy classifier as champion (e.g. champion_model.json, model_registry.json, ml_summary.json) "
+                f"and update artifacts to promote another one best model as champion.",
+                ["champion_model.json", "model_registry.json", "ml_summary.json"],
+            ))
 
     registry = _load_json_safe(os.path.join(output_dir, "model_registry.json"))
     registry_champion_artifacts = set()

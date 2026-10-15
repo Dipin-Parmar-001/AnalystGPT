@@ -280,3 +280,98 @@ def test_post_ml_verification_no_false_positive_on_unhyphenated_naming(tmp_path)
     )
     assert res["consistent"]
     assert len([f for f in res["findings"] if f.severity == "error"]) == 0
+
+
+def test_post_ml_verification_dummy_classifier_warning(tmp_path):
+    output_dir = str(tmp_path)
+    (tmp_path / "dummy_classifier_p0.pkl").write_bytes(b"dummy")
+
+    with open(os.path.join(output_dir, "champion_model.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "model": "dummy_classifier_p0.pkl",
+            "artifact_filename": "dummy_classifier_p0.pkl",
+            "model_name": "DummyClassifier",
+            "primary_metric": "accuracy",
+            "score": 0.998,
+            "selection_basis": "baseline accuracy evaluation"
+        }, f)
+
+    with open(os.path.join(output_dir, "model_registry.json"), "w", encoding="utf-8") as f:
+        json.dump({"models": [
+            {"model_id": "dummy_classifier", "artifact_filename": "dummy_classifier_p0.pkl", "status": "champion"}
+        ]}, f)
+
+    res = verify_champion_consistency(
+        output_dir,
+        task_type="model_comparison",
+        repair=False
+    )
+    # Promoting dummy classifier as champion fails consistency check, triggering orchestrator retry
+    assert not res["consistent"]
+    dummy_findings = [f for f in res["findings"] if getattr(f, "code", "") == "DUMMY_CLASSIFIER_CHAMPION"]
+    assert len(dummy_findings) == 1
+    w = dummy_findings[0]
+    assert w.severity == "error"
+    assert "Dummy classifier model" in w.message
+    assert "cannot be deployed or promoted as the champion" in w.message
+    assert "Please update the related files which are promoting the dummy classifier as the champion" in w.message
+    assert "promote another one best model as champion" in w.message
+
+    from agents.preflight_gate import _check_champion
+    champ_obj = json.loads((tmp_path / "champion_model.json").read_text(encoding="utf-8"))
+    chk_findings = _check_champion(output_dir, champ_obj)
+    chk_dummy = [f for f in chk_findings if f.code == "DUMMY_CLASSIFIER_CHAMPION"]
+    assert len(chk_dummy) == 1
+    assert chk_dummy[0].severity == "error"
+
+
+def test_post_ml_verification_dummy_artifact_on_disk_is_valid_when_not_champion(tmp_path):
+    output_dir = str(tmp_path)
+    # Dummy classifier exists on disk as baseline artifact, but real model is champion
+    (tmp_path / "dummy_classifier_p0.pkl").write_bytes(b"dummy")
+    (tmp_path / "logistic_regression_p0.pkl").write_bytes(b"lr")
+
+    with open(os.path.join(output_dir, "champion_model.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "model": "logistic_regression_p0.pkl",
+            "artifact_filename": "logistic_regression_p0.pkl",
+            "model_name": "Logistic Regression",
+            "primary_metric": "recall",
+            "score": 0.8947
+        }, f)
+
+    with open(os.path.join(output_dir, "model_registry.json"), "w", encoding="utf-8") as f:
+        json.dump({"models": [
+            {"model_id": "dummy_classifier", "artifact_filename": "dummy_classifier_p0.pkl", "status": "evaluated"},
+            {"model_id": "logistic_regression", "artifact_filename": "logistic_regression_p0.pkl", "status": "champion"}
+        ]}, f)
+
+    res = verify_champion_consistency(
+        output_dir,
+        task_type="model_comparison",
+        repair=False
+    )
+    # Presence of dummy classifier artifact does NOT cause verification failure when it's not champion
+    assert res["consistent"]
+    dummy_findings = [f for f in res["findings"] if getattr(f, "code", "") == "DUMMY_CLASSIFIER_CHAMPION"]
+    assert len(dummy_findings) == 0
+
+
+def test_champion_selector_excludes_dummy_classifier(tmp_path):
+    import pandas as pd
+    from agents.champion_selector import select_initial_champion
+
+    d = tmp_path
+    pd.DataFrame({
+        "model": ["DummyClassifier", "LogisticRegression"],
+        "Accuracy": [0.999, 0.950],
+        "model_artifact": ["dummy_classifier_p0.pkl", "logistic_regression_p0.pkl"]
+    }).to_csv(d / "model_comparison.csv", index=False)
+    (d / "dummy_classifier_p0.pkl").write_bytes(b"dummy")
+    (d / "logistic_regression_p0.pkl").write_bytes(b"lr")
+
+    res = select_initial_champion(str(d), goal_text="evaluate models", primary_metric="accuracy")
+    assert res.is_success()
+    # LogisticRegression should be selected despite lower accuracy because DummyClassifier cannot be promoted
+    assert res.champion["artifact_filename"] == "logistic_regression_p0.pkl"
+

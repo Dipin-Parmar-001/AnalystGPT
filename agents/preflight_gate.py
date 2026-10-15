@@ -153,8 +153,36 @@ def normalize_model_family(name_or_file: str) -> str:
         "logisticregression": "logistic_regression",
         "svc": "svm",
         "linearsvc": "svm",
+        "dummyclassifier": "dummy_classifier",
+        "dummy": "dummy_classifier",
+        "majority_class_baseline": "dummy_classifier",
+        "majorityclassbaseline": "dummy_classifier",
     }
     return aliases.get(s, s)
+
+
+def is_dummy_classifier(model_info: Any) -> bool:
+    """Check if model name, artifact filename, or dict represents a dummy baseline classifier."""
+    if not model_info:
+        return False
+    targets = []
+    if isinstance(model_info, dict):
+        for k in ("model_name", "model", "artifact_filename", "artifact", "model_family", "model_id", "algorithm"):
+            v = model_info.get(k)
+            if v and isinstance(v, str):
+                targets.append(v)
+    elif isinstance(model_info, str):
+        targets.append(model_info)
+    else:
+        targets.append(str(model_info))
+
+    for s in targets:
+        clean = re.sub(r"[^a-z0-9]", "", s.lower())
+        if "dummyclassifier" in clean or "dummy" in clean:
+            return True
+        if "majorityclass" in clean:
+            return True
+    return False
 
 
 def _clean_str(s: Any) -> str:
@@ -306,10 +334,22 @@ def _check_champion(output_dir: str, champ: Optional[Dict[str, Any]], selector_r
             ))
         return findings
 
+    if is_dummy_classifier(champ):
+        champ_disp = (champ.get("model_name") or champ.get("model") or champ.get("artifact_filename") or "DummyClassifier") if isinstance(champ, dict) else "DummyClassifier"
+        findings.append(_finding(
+            "error",
+            "DUMMY_CLASSIFIER_CHAMPION",
+            f"Dummy classifier model ('{champ_disp}') was designated as champion in champion_model.json. "
+            f"The dummy classifier model can be trained and evaluated on the baseline but cannot be deployed or promoted as the champion. "
+            f"Please update the related files which are promoting the dummy classifier as the champion (e.g. champion_model.json, model_registry.json, ml_summary.json) "
+            f"and update artifacts to promote another one best model as champion.",
+            ["champion_model.json", "model_registry.json", "ml_summary.json"],
+        ))
+
     try:
         ChampionModel.model_validate(champ)
     except Exception as exc:
-        return [_finding("error", "SCHEMA_ERROR", f"champion_model.json does not match the champion schema: {exc}", ["champion_model.json"])]
+        return findings + [_finding("error", "SCHEMA_ERROR", f"champion_model.json does not match the champion schema: {exc}", ["champion_model.json"])]
 
     art = champ.get("artifact_filename") or champ.get("model")
     matched_pkl = _find_matching_artifact(art, pkl_files)
@@ -856,6 +896,22 @@ def verify_champion_consistency(
             ["champion_model.json"]
         ))
     result["champion"] = champ
+    result.setdefault("warnings", [])
+
+    if is_dummy_classifier(champ):
+        champ_disp = (champ.get("model_name") or champ.get("model") or champ.get("artifact_filename") or "DummyClassifier") if isinstance(champ, dict) else "DummyClassifier"
+        result["findings"].append(_finding(
+            "error", "DUMMY_CLASSIFIER_CHAMPION",
+            f"Dummy classifier model ('{champ_disp}') was designated as champion in champion_model.json. "
+            f"The dummy classifier model can be trained and evaluated on the baseline but cannot be deployed or promoted as the champion. "
+            f"Please update the related files which are promoting the dummy classifier as the champion (e.g. champion_model.json, model_registry.json, ml_summary.json) "
+            f"and update artifacts to promote another one best model as champion.",
+            ["champion_model.json", "model_registry.json", "ml_summary.json"]
+        ))
+        result["warnings"].append(
+            f"Dummy classifier model ('{champ_disp}') was designated as champion. "
+            f"Update related files promoting dummy classifier as champion to promote another one best model as champion."
+        )
 
     champ_art = champ.get("artifact_filename") or champ.get("model") if isinstance(champ, dict) else None
     pkl_files = [f for f in os.listdir(output_dir) if f.lower().endswith(".pkl")] if os.path.isdir(output_dir) else []

@@ -452,6 +452,13 @@ def select_initial_champion(
         candidates = [row for row in rows if row["metrics"]]
         if not candidates:
             return ChampionSelectionResult(ChampionSelectionStatus.NO_VALID_CANDIDATES, error_code="NO_VALID_CANDIDATES", error_message="No candidates with metrics found")
+        from agents.preflight_gate import is_dummy_classifier
+        viable_candidates = [
+            row for row in candidates
+            if not is_dummy_classifier(row.get("model")) and not is_dummy_classifier(row.get("artifact"))
+        ]
+        if viable_candidates:
+            candidates = viable_candidates
         metric = _pick_metric(candidates[0]["metrics"], goal_text, primary_metric)
         if metric is None:
             return ChampionSelectionResult(ChampionSelectionStatus.NO_METRIC_FOUND, error_code="NO_METRIC_FOUND", error_message="No suitable metric found")

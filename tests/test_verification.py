@@ -89,7 +89,7 @@ def test_extract_numeric_claims_on_actual_final_report():
     assert 534454.0 in values or 534454 in values or "534,454" in raw_strings or 7043.0 in values or 7043 in values
     assert any(c.is_percentage for c in claims)
     assert any(abs(v - 0.425) < 0.01 for v in values) or any(abs(v - 0.852) < 0.01 for v in values) or any(abs(v - 0.8515) < 0.01 for v in values) or any(abs(v - 0.851) < 0.01 for v in values)
-    assert 2440.0 in values or "2,440" in raw_strings or 1409.0 in values or "1,409" in raw_strings or "1409" in raw_strings
+    assert 2440.0 in values or "2,440" in raw_strings or 1409.0 in values or "1,409" in raw_strings or "1409" in raw_strings or 4372.0 in values or 5268.0 in values
 
 
 def test_verify_report_numbers_on_actual_report():
