@@ -16,7 +16,6 @@ import traceback
 import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
-from openai import OpenAI
 
 
 def is_fragmented_or_unparsable_response(message: Any) -> bool:
@@ -76,6 +75,7 @@ if sys.stdout.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
 from agents.tools import (
@@ -101,49 +101,7 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        }
-    ]
-}
 
 from agents.prompts import DATA_ANALYST_AGENT, DATA_ANALYST_SYSTEM_PROMPT, resolve_budget_placeholders
 
@@ -158,39 +116,8 @@ class DataAnalystAgent:
         stdout_stderr_token_limit: int = 300,
         max_tokens_before_compact: int = 100000,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
         setup_logfire()
-
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
-        if PORTKEY_CONFIG_ID:
-            if HAS_LOGFIRE:
-                logfire.info("DataAnalystAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[DataAnalystAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("[DataAnalystAgent Setup] PORTKEY_CONFIG_ID not found. Using fallback config.")
-            else:
-                print("[DataAnalystAgent Setup] WARNING: PORTKEY_CONFIG_ID not found. Using fallback config.")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
-
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
-
-        if HAS_LOGFIRE:
-            try:
-                logfire.instrument_openai(self.client)
-            except Exception as e:
-                logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
+        self.client = create_local_router("DataAnalystAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
@@ -299,7 +226,7 @@ class DataAnalystAgent:
                     )
                     if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool message schema. Retrying with plain chat format (tools preserved).", error=str(err))
+                            logfire.warn("Provider rejected tool message schema. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
                             print(f"[DataAnalystAgent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
 

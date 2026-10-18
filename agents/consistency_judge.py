@@ -11,7 +11,7 @@ never replaces — the deterministic gates.
 
 Guardrails so the judge cannot introduce new hallucinations:
 1. Temperature 0 and a JSON-only output contract.
-2. Robust JSON extraction; local Gemini-first/OpenRouter fallback on
+2. Robust JSON extraction; local NVIDIA/OpenRouter/Gemini fallback on
    provider failures or malformed output, after which the orchestrator emits a visible
    `judge_failed` finding (the run is never silently left unjudged).
 3. Anti-fabrication filter: every returned claim's `quote` must appear verbatim
@@ -31,7 +31,7 @@ from openai import OpenAI
 
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.prompts import CONSISTENCY_JUDGE_SYSTEM_PROMPT
-from agents.portkey_routing import create_with_thinking_route
+from agents.router import create_local_router
 
 
 def is_fragmented_or_unparsable_response(message: Any) -> bool:
@@ -90,24 +90,6 @@ except ImportError:
 load_dotenv()
 
 FALLBACK_STATUS_CODES = {400, 402, 404, 412, 429, 500, 502, 503, 504}
-GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.7-flash")
-OPENROUTER_MODELS = (
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "poolside/laguna-s-2.1:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-)
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-PORTKEY_BASE_URL = "https://api.portkey.ai/v1"
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
-
-
-def _configured_keys(names):
-    """Return configured key names and values without exposing values in logs."""
-    return [(name, os.getenv(name)) for name in names if os.getenv(name)]
-
-
 @dataclass
 class JudgedClaim:
     quote: str
@@ -208,45 +190,9 @@ class ConsistencyJudge:
         if client is not None:
             self.routes.append({"provider": "injected", "model": model_name or "injected", "client": client})
         else:
-            # 1. Primary route: Portkey gateway with PORTKEY_CONFIG_ID when configured
-            portkey_key = os.getenv("PORTKEY_API_KEY") or PORTKEY_API_KEY
-            portkey_cfg = os.getenv("PORTKEY_CONFIG_ID") or PORTKEY_CONFIG_ID
-            if portkey_key:
-                headers = {"x-portkey-api-key": portkey_key}
-                if portkey_cfg:
-                    headers["x-portkey-config"] = portkey_cfg
-                    if HAS_LOGFIRE:
-                        logfire.info("ConsistencyJudge setup using Portkey Config ID", config_id=portkey_cfg)
-                    else:
-                        print(f"[ConsistencyJudge Setup] Using Portkey Config ID: {portkey_cfg}")
-                else:
-                    headers["x-portkey-virtual-key"] = "analystgpt-openrouter"
-
-                portkey_client = OpenAI(
-                    base_url=PORTKEY_BASE_URL,
-                    api_key=portkey_key,
-                    default_headers=headers
-                )
-                portkey_model = model_name or "nemotron-3-ultra-550b-a55b"
-                if portkey_model.startswith("nvidia/"):
-                    portkey_model = portkey_model[len("nvidia/"):]
-                self.routes.append({
-                    "provider": "portkey",
-                    "model": portkey_model,
-                    "client": portkey_client,
-                })
-
-            # 2. Secondary fallbacks: local Gemini keys, then local OpenRouter keys
-            for key_name, api_key in _configured_keys(("GEMINI_API_KEY", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2")):
-                for model in GEMINI_MODELS:
-                    self.routes.append({"provider": key_name, "model": model,
-                                        "client": OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)})
-            for key_name, api_key in _configured_keys(("OPENROUTER_API_KEY", "OPENROUTER_API_KEY_1", "OPENROUTER_API_KEY_2")):
-                for model in OPENROUTER_MODELS:
-                    self.routes.append({"provider": key_name, "model": model,
-                                        "client": OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)})
-            if not self.routes:
-                raise ValueError("Configure PORTKEY_API_KEY, GEMINI_API_KEY, and/or OPENROUTER_API_KEY (numbered variants are supported) for the consistency judge.")
+            local_client = create_local_router("ConsistencyJudge")
+            self.routes.append({"provider": "local", "model": model_name or "nvidia/nemotron-3-super-120b-a12b",
+                                "client": local_client})
 
         from agents.observability import instrument_openai_client
         for route in self.routes:
@@ -268,27 +214,14 @@ class ConsistencyJudge:
             index = (start_index + offset) % route_count
             route = routes[index]
             try:
-                if route.get("provider") == "portkey":
-                    response = create_with_thinking_route(
-                        route["client"],
-                        model=route["model"],
-                        messages=[
-                            {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
-                            {"role": "user", "content": user_content},
-                        ],
-                        temperature=0.1,
-                        max_tokens=4096,
-                    )
-                else:
-                    response = route["client"].chat.completions.create(
-                        model=route["model"],
-                        messages=[
-                            {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
-                            {"role": "user", "content": user_content},
-                        ],
-                        temperature=0.1,
-                        max_tokens=4096,
-                    )
+                response = route["client"].chat.completions.create(
+                    model=route["model"],
+                    messages=[
+                        {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.1,
+                )
                 message = response.choices[0].message
                 content = getattr(message, "content", None)
                 parsed = None if is_fragmented_or_unparsable_response(message) else _extract_json_object(content or "")

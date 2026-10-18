@@ -16,6 +16,7 @@ import json
 import time
 import copy
 import traceback
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Callable
 from dataclasses import asdict
 
@@ -516,6 +517,7 @@ class WorkflowOrchestrator:
                     # missing artifact.
                     uploaded_files=self.uploaded_files or None,
                     persist=True,
+                    dataset_type=getattr(self.current_plan, "dataset_type", None),
                 )
                 self.consistency_report = consistency_report
                 findings.extend([asdict(f) for f in consistency_report.findings])
@@ -1969,6 +1971,7 @@ class WorkflowOrchestrator:
                 run_manifest = {
                     "run_id": os.path.basename(self.current_output_dir),
                     "plan_id": active_plan.plan_id,
+                    "dataset_type": getattr(active_plan, "dataset_type", "classification"),
                     "query": query_text,
                     "input_files": files_list,
                     "output_dir": self.current_output_dir,

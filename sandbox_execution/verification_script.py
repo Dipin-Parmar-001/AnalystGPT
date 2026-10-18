@@ -52,7 +52,7 @@ def safe_float(val: Any) -> Optional[float]:
 #   unique-count thresholds, never by name.
 # ---------------------------------------------------------------------------
 
-SEGMENT_MAX_CATEGORIES = 12          # skip categoricals wider than this (IDs, free text)
+SEGMENT_MAX_CATEGORIES = 60          # skip categoricals wider than this (IDs, free text)
 SEGMENT_MIN_CATEGORY_ROWS = 5        # skip tiny segments (noise / near-unique values)
 SEGMENT_MAX_NUMERIC_BY_CLASS = 15    # cap per-class numeric stats to top-K by |corr|
 SEGMENT_MAX_ENTRIES = 200            # hard cap on rate_by_category size
@@ -92,36 +92,52 @@ def declared_target_column(run_path: Path) -> Optional[str]:
     return votes.most_common(1)[0][0] if votes else None
 
 
-def detect_target_column(df: "pd.DataFrame", declared_target: Optional[str] = None) -> Optional[str]:
+def detect_target_column(
+    df: "pd.DataFrame",
+    declared_target: Optional[str] = None,
+    dataset_type: Optional[str] = None,
+) -> Optional[str]:
     """
     Picks the binary target column. Prefers the pipeline-declared target; the only
-    structural fallback is a frame with exactly one binary column. Never guesses
-    among multiple binary columns.
+    structural fallback is a frame with exactly one binary column for classification tasks.
+    Never guesses when dataset_type is regression or unsupervised.
     """
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return None
+
     if declared_target is not None:
         for c in df.columns:
             if str(c) == str(declared_target) and df[c].nunique(dropna=True) == 2:
                 return c
+        # Declared target is non-binary; do not hijack unrelated binary columns
+        return None
+
     binary_cols = [c for c in df.columns if df[c].nunique(dropna=True) == 2]
     if len(binary_cols) == 1:
         return binary_cols[0]
     return None
 
 
-def compute_segment_stats(df: "pd.DataFrame", declared_target: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def compute_segment_stats(
+    df: "pd.DataFrame",
+    declared_target: Optional[str] = None,
+    dataset_type: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Computes ground-truth segment statistics from a dataset artifact (works for
     any dataset; see the module block above for the generic design rules).
 
     Returns None when no binary target can be identified (e.g. regression runs,
-    or frames with several equally-plausible binary columns).
+    unsupervised runs, or frames with several equally-plausible binary columns).
     """
     import pandas as pd
     import numpy as np
 
     if df is None or len(df) == 0:
         return None
-    target = detect_target_column(df, declared_target)
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return None
+    target = detect_target_column(df, declared_target, dataset_type=dataset_type)
     if target is None:
         return None
 
@@ -746,8 +762,16 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
             seg_df = pd.read_csv(target_csv)
             seg_source = target_csv.name
         if seg_df is not None:
+            dataset_type = None
+            manifest_p = run_path / "run_manifest.json"
+            if manifest_p.exists():
+                try:
+                    with open(manifest_p, "r", encoding="utf-8") as mf:
+                        dataset_type = _json.load(mf).get("dataset_type")
+                except Exception:
+                    pass
             declared = declared_target_column(run_path)
-            seg_stats = compute_segment_stats(seg_df, declared_target=declared)
+            seg_stats = compute_segment_stats(seg_df, declared_target=declared, dataset_type=dataset_type)
             if seg_stats is not None:
                 seg_stats["source_file"] = seg_source
                 # Merge named segments from the raw uploads: the run-dir datasets are

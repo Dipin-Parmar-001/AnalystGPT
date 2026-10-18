@@ -281,6 +281,7 @@ task, and no Hyperparameter Tuning task.
 ```json
 {{
   "plan_id": "string (short unique id, e.g. plan_abc123)",
+  "dataset_type": "classification | regression | unsupervised",
   "user_goal": "one-line restatement of the primary objective",
   "selected_agents": ["DataAnalystAgent", "ReporterAgent"],
   "status": "draft | pending_confirmation | confirmed",
@@ -367,6 +368,10 @@ orchestration can validate it against {max_tool_calls_per_task} before dispatch.
 Include a `task_type` field on every task so downstream orchestration/validators can check
 sequencing mechanically (valid values: `cleaning`, `feature_engineering`, `stats_and_viz`,
 `model_comparison`, `unsupervised_analysis`, `hyperparameter_tuning`, `report`).
+Include a top-level `dataset_type` field (`classification`, `regression`, or `unsupervised`) to classify the problem:
+- `classification`: predicting discrete categorical labels or binary outcomes (e.g. churn, fraud, retention).
+- `regression`: predicting continuous numeric targets (e.g. price, revenue, demand, duration).
+- `unsupervised`: customer segmentation/clustering (e.g. RFM), anomaly detection, or exploratory data analysis (EDA) without a predictive target.
 
 # RULES FOR TASK CONSTRUCTION
 1. Decompose cleanly: Break requests into clear, single-purpose tasks assigned to the appropriate specialized agent, and further split any task that would exceed the per-turn tool-call budget (see TASK SIZING RULES).
@@ -805,6 +810,7 @@ Construction rules:
    (48/1695) for <reference category>". Never restate a rate you did not put in this file.
 6. Before finishing, reload and assert:
    `sf = json.load(open("stats_findings.json")); assert sf["overall"]["count"] == len(df)`.
+7. For non-classification tasks (regression or unsupervised/EDA where there is no binary classification target), set `"target_column": null`, `"overall": {"count": len(df), "positives": 0, "rate": 0.0}`, and focus on distributions, summary metrics, and correlations. Never fabricate a binary target or force binary positive-rate semantics onto continuous or clustering data.
 
 ===============================================================================
 # MANDATORY SELF-VERIFICATION BEFORE REPORTING (ANTI-HALLUCINATION — APPLIES TO EVERY TASK TYPE)

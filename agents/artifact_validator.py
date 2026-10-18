@@ -43,7 +43,7 @@ def extract_claimed_artifacts(agent_response: Any) -> List[str]:
                 claimed.append(item)
             elif isinstance(item, dict):
                 claimed.extend(extract_claimed_artifacts(item))
-        return list(set(claimed))
+        return [c for c in set(claimed) if isinstance(c, str) and c.strip()]
     if not isinstance(agent_response, dict):
         return claimed
 
@@ -65,7 +65,7 @@ def extract_claimed_artifacts(agent_response: Any) -> List[str]:
                         if isinstance(art, str):
                             claimed.append(art)
                         elif isinstance(art, dict) and "file" in art:
-                            claimed.append(art["file"])
+                            if isinstance(art.get("file"), str) and art["file"].strip(): claimed.append(art["file"])
 
             # Check saved_artifacts field (DataAnalystAgent)
             if "saved_artifacts" in summary:
@@ -79,7 +79,7 @@ def extract_claimed_artifacts(agent_response: Any) -> List[str]:
                 if isinstance(viz, list):
                     for v in viz:
                         if isinstance(v, dict) and "file" in v:
-                            claimed.append(v["file"])
+                            if isinstance(v.get("file"), str) and v["file"].strip(): claimed.append(v["file"])
                         elif isinstance(v, str):
                             claimed.append(v)
 
@@ -89,7 +89,7 @@ def extract_claimed_artifacts(agent_response: Any) -> List[str]:
                 if isinstance(artifacts, list):
                     for art in artifacts:
                         if isinstance(art, dict) and "artifact" in art:
-                            claimed.append(art["artifact"])
+                            if isinstance(art.get("artifact"), str) and art["artifact"].strip(): claimed.append(art["artifact"])
 
     # Check for generated_artifacts directly in response
     if "generated_artifacts" in agent_response:
@@ -99,10 +99,10 @@ def extract_claimed_artifacts(agent_response: Any) -> List[str]:
                 if isinstance(art, str):
                     claimed.append(art)
                 elif isinstance(art, dict) and "file" in art:
-                    claimed.append(art["file"])
+                    if isinstance(art.get("file"), str) and art["file"].strip(): claimed.append(art["file"])
 
     # Deduplicate
-    return list(set(claimed))
+    return [c for c in set(claimed) if isinstance(c, str) and c.strip()]
 
 
 def detect_fallback_generation(agent_response: Any, output_dir: str) -> Tuple[bool, List[str]]:
@@ -250,7 +250,7 @@ def find_artifact_semantic(output_dir: str, artifact_name: str) -> Optional[str]
 
     Returns the matched filename, or None if nothing satisfies the requirement.
     """
-    if not artifact_name or not os.path.isdir(output_dir):
+    if not artifact_name or not isinstance(artifact_name, str) or not output_dir or not isinstance(output_dir, str) or not os.path.isdir(output_dir):
         return None
 
     exact_path = os.path.join(output_dir, artifact_name)
@@ -299,7 +299,8 @@ def validate_artifacts(
     Returns:
         ValidationResult with validation details
     """
-    claimed_artifacts = extract_claimed_artifacts(agent_response)
+    output_dir = output_dir or ""
+    claimed_artifacts = [c for c in extract_claimed_artifacts(agent_response) if isinstance(c, str) and c.strip()]
     existing_artifacts = []
     missing_artifacts = []
 
@@ -319,7 +320,7 @@ def validate_artifacts(
     fallback_detected, fallback_indicators = detect_fallback_generation(agent_response, output_dir)
 
     # Agent-specific required artifacts
-    required_artifacts = get_required_artifacts(agent_name, task_type)
+    required_artifacts = [r for r in get_required_artifacts(agent_name, task_type) if isinstance(r, str) and r.strip()]
     for required in required_artifacts:
         required_path = os.path.join(output_dir, required)
         if not os.path.exists(required_path) and required not in missing_artifacts:

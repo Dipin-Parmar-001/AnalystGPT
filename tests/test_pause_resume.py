@@ -9,6 +9,8 @@ Verifies:
 5. Task statuses in the plan are properly updated (completed prior tasks stay completed, resumed task is in_progress, subsequent tasks are pending).
 """
 
+import os
+import tempfile
 import pytest
 from unittest.mock import MagicMock, patch
 from agents.cancellation import CancellationToken, WorkflowPausedException
@@ -112,6 +114,11 @@ def test_resume_task_id_resolution_logic():
 def test_execute_plan_skips_prior_completed_tasks_on_resume():
     """Verify execute_plan with resume_from_task_id=3 skips Tasks 1 and 2 and runs Task 3."""
     orch = WorkflowOrchestrator()
+    # Disable LLM judge, numeric repair, and mock reporter to prevent remote network calls
+    orch.enable_consistency_judge = False
+    orch.max_repair_attempts = 0
+    orch.reporter_agent.generate_report = MagicMock(return_value="# Final Report\nExecution resumed successfully.")
+
     plan = make_dummy_plan()
     plan.tasks[0].status = "completed"
     plan.tasks[1].status = "completed"
@@ -121,52 +128,53 @@ def test_execute_plan_skips_prior_completed_tasks_on_resume():
         {"task_id": 2, "status": "completed", "artifacts": ["features.csv"]},
     ]
 
-    mock_agent = MagicMock()
-    mock_agent.run_task.return_value = {
-        "status": "completed",
-        "artifacts": ["model.pkl"],
-        "summary": "Trained models",
-        "metrics": {"f1": 0.95}
-    }
-
     executed_tasks = []
 
-    def mock_resolve_agent(agent_name):
-        def _run_task_wrapper(prompt, **kwargs):
-            tid = kwargs.get("task_id")
-            executed_tasks.append(tid)
-            return {
-                "status": "completed",
-                "artifacts": [f"task_{tid}_output.txt"],
-                "summary": f"Task {tid} done"
-            }
-        mock = MagicMock()
-        mock.run_task.side_effect = _run_task_wrapper
-        mock.__class__.__name__ = agent_name
-        return mock
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch.current_output_dir = tmpdir
 
-    orch._resolve_agent = mock_resolve_agent
+        def _make_run_task_mock(agent_name):
+            def _run_task_wrapper(prompt, **kwargs):
+                tid = kwargs.get("task_id")
+                executed_tasks.append(tid)
+                art_name = f"task_{tid}_output.txt"
+                art_path = os.path.join(tmpdir, art_name)
+                with open(art_path, "w", encoding="utf-8") as f:
+                    f.write(f"Task {tid} done\n")
+                return {
+                    "status": "completed",
+                    "artifacts": [art_name],
+                    "generated_files": [art_name],
+                    "summary": f"Task {tid} done",
+                    "final_report": "# Task Report" if "reporter" in agent_name.lower() else ""
+                }
+            return _run_task_wrapper
 
-    checkpoint = {
-        "paused_task_id": 3,
-        "completed_task_results": [
-            {"task_id": 1, "status": "completed"},
-            {"task_id": 2, "status": "completed"},
-        ],
-        "output_dir": orch.current_output_dir,
-    }
+        orch.data_analyst_agent.run_task = MagicMock(side_effect=_make_run_task_mock("DataAnalystAgent"))
+        orch.ml_agent.run_task = MagicMock(side_effect=_make_run_task_mock("MLAgent"))
+        orch.reporter_agent.run_task = MagicMock(side_effect=_make_run_task_mock("ReporterAgent"))
 
-    result = orch.execute_plan(
-        plan=plan,
-        resume_from_task_id=3,
-        resume_checkpoint=checkpoint
-    )
+        checkpoint = {
+            "paused_task_id": 3,
+            "completed_task_results": [
+                {"task_id": 1, "status": "completed"},
+                {"task_id": 2, "status": "completed"},
+            ],
+            "output_dir": orch.current_output_dir,
+        }
 
-    # Tasks 1 and 2 MUST NOT have been executed
-    assert 1 not in executed_tasks
-    assert 2 not in executed_tasks
-    # Task 3 MUST be the first executed task
-    assert executed_tasks[0] == 3
-    # Tasks 1 and 2 should remain completed in plan
-    assert plan.tasks[0].status == "completed"
-    assert plan.tasks[1].status == "completed"
+        result = orch.execute_plan(
+            plan=plan,
+            resume_from_task_id=3,
+            resume_checkpoint=checkpoint
+        )
+
+        # Tasks 1 and 2 MUST NOT have been executed
+        assert 1 not in executed_tasks
+        assert 2 not in executed_tasks
+        # Task 3 MUST be the first executed task
+        assert executed_tasks[0] == 3
+        # Tasks 1 and 2 should remain completed in plan
+        assert plan.tasks[0].status == "completed"
+        assert plan.tasks[1].status == "completed"
+

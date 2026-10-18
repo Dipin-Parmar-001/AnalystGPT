@@ -6,7 +6,6 @@ import traceback
 import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
-from openai import OpenAI
 
 
 def is_fragmented_or_unparsable_response(message: Any) -> bool:
@@ -66,6 +65,7 @@ if sys.stderr.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path for direct execution
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
 from agents.tools import (
@@ -89,8 +89,6 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -98,48 +96,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Legacy dictionary export for backwards compatibility
 AVAILABLE_TOOLS = {
     "execute_python": execute_python
-}
-
-# Default Portkey Configuration for fallback & multi-provider routing
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        }
-    ]
 }
 
 from agents.prompts import SYSTEM_PROMPT, resolve_budget_placeholders
@@ -152,41 +108,8 @@ class DataAnalystAgent:
         max_tokens_before_compact: int = 100000,
         tool_manager: Optional[ToolManager] = None,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
         setup_logfire()
-
-        # Set up standard Portkey headers
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
-        if PORTKEY_CONFIG_ID:
-            if HAS_LOGFIRE:
-                logfire.info("DataAnalystAgent Setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[Agent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("PORTKEY_CONFIG_ID not found in .env. Attempting inline fallback config...")
-            else:
-                print("[Agent Setup] WARNING: PORTKEY_CONFIG_ID not found in .env. Attempting inline fallback config...")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
-
-        # Single OpenAI client routing through Portkey Gateway API
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
-
-        if HAS_LOGFIRE:
-            try:
-                logfire.instrument_openai(self.client)
-            except Exception as e:
-                logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
+        self.client = create_local_router("DataAnalystAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
@@ -223,8 +146,7 @@ class DataAnalystAgent:
 
     def _call_llm(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Any:
         """
-        Calls Portkey Gateway which handles multi-provider fallbacks, 
-        parameter overrides, and provider routing seamlessly.
+        Calls the local provider router, which handles ordered model fallbacks.
         """
         if getattr(self, "_plain_chat_mode", False):
             # Provider (e.g. Gemini) already rejected the OpenAI tool-message schema;
@@ -292,7 +214,7 @@ class DataAnalystAgent:
                     )
                     if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool message schema in agent.py. Retrying with plain chat format (tools preserved).", error=str(err))
+                            logfire.warn("Provider rejected tool message schema in agent.py. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
                             print(f"[Agent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
 
@@ -323,7 +245,7 @@ class DataAnalystAgent:
 
                 if HAS_LOGFIRE:
                     logfire.error(
-                        "Portkey Gateway LLM Request Failed",
+                        "Local Router LLM Request Failed",
                         error=str(err),
                         error_type=type(err).__name__,
                         traceback=traceback.format_exc(),
@@ -331,8 +253,8 @@ class DataAnalystAgent:
                         message_count=len(messages),
                     )
                 else:
-                    print(f"[Agent Error] Portkey Gateway request failed: {err}\n{traceback.format_exc()}")
-                raise RuntimeError(f"Portkey Gateway call failed: {err}") from err
+                    print(f"[Agent Error] Local router request failed: {err}\n{traceback.format_exc()}")
+                raise RuntimeError(f"Local router call failed: {err}") from err
 
         if HAS_LOGFIRE:
             tool_names = [t.get("function", {}).get("name") for t in effective_tools] if effective_tools else []
@@ -344,7 +266,7 @@ class DataAnalystAgent:
             ):
                 return _do_call()
         else:
-            print("[Agent LLM] Requesting Portkey Gateway...")
+            print("[Agent LLM] Requesting local provider router...")
             return _do_call()
 
     def extract_python_code(self, text: str) -> Optional[str]:

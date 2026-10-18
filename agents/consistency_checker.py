@@ -1019,7 +1019,7 @@ def _load_segment_frame(output_dir: str):
     return None, None
 
 
-def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]] = None, dataset_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Recomputes ground-truth segment statistics from the run's dataset artifacts.
 
     Falls back to a name-based segment recomputation from the dataset artifacts when no
@@ -1029,6 +1029,18 @@ def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]
     from pathlib import Path
     from sandbox_execution.verification_script import compute_segment_stats, declared_target_column
 
+    if not dataset_type:
+        manifest_path = os.path.join(output_dir, "run_manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                manifest_data = _load_json_safe(manifest_path)
+                if isinstance(manifest_data, dict):
+                    dataset_type = manifest_data.get("dataset_type")
+            except Exception:
+                pass
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return None
+
     df, source = _load_segment_frame(output_dir)
     if df is None:
         return None
@@ -1037,7 +1049,7 @@ def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]
     except Exception:
         declared = None
     try:
-        stats = compute_segment_stats(df, declared_target=declared)
+        stats = compute_segment_stats(df, declared_target=declared, dataset_type=dataset_type)
     except Exception:
         return None
     if not isinstance(stats, dict):
@@ -1075,7 +1087,7 @@ def _norm_segment_label(s: str) -> str:
     return _re.sub(r"[\s\-\u2013\u2014_]+", " ", (s or "").strip()).lower()
 
 
-def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Optional[List[str]] = None) -> List[Finding]:
+def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Optional[List[str]] = None, dataset_type: Optional[str] = None) -> List[Finding]:
     """
     Dataset-driven guard against fabricated segment statistics.
 
@@ -1109,7 +1121,7 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     findings: List[Finding] = []
     if not report_text:
         return findings
-    stats = _recompute_segment_stats(output_dir, uploaded_files)
+    stats = _recompute_segment_stats(output_dir, uploaded_files, dataset_type=dataset_type)
     if not stats:
         return findings
 
@@ -1201,7 +1213,7 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     return findings
 
 
-def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[List[str]] = None) -> List[Finding]:
+def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[List[str]] = None, dataset_type: Optional[str] = None) -> List[Finding]:
     """
     Diffs the machine-computed `stats_findings.json` (which the analyst's sandbox
     script is required to emit) against a fresh recomputation from the dataset
@@ -1210,6 +1222,19 @@ def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[L
     """
     findings: List[Finding] = []
     sf = _load_json_safe(os.path.join(output_dir, "stats_findings.json"))
+
+    if not dataset_type:
+        manifest_path = os.path.join(output_dir, "run_manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                manifest_data = _load_json_safe(manifest_path)
+                if isinstance(manifest_data, dict):
+                    dataset_type = manifest_data.get("dataset_type")
+            except Exception:
+                pass
+
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return findings
 
     # Contract-compliance signal: a stats-and-viz task ran (analyst summary with
     # generated visualizations) but the required stats artifact was never written.
@@ -1227,7 +1252,7 @@ def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[L
                 break
         return findings
 
-    stats = _recompute_segment_stats(output_dir, uploaded_files)
+    stats = _recompute_segment_stats(output_dir, uploaded_files, dataset_type=dataset_type)
     if not stats:
         return findings
 
@@ -1255,12 +1280,24 @@ def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[L
                 ["stats_findings.json", stats.get("source_file") or "dataset"],
             ))
 
+    df_cache = None
     for seg in sf.get("rate_by_category", []) or []:
         if not isinstance(seg, dict):
             continue
         key = (str(seg.get("feature", "")).lower(), str(seg.get("category", "")).lower())
         rc = recomputed.get(key)
         if rc is None:
+            if df_cache is None:
+                df_cache, _ = _load_segment_frame(output_dir)
+            feat_name = seg.get("feature")
+            cat_name = seg.get("category")
+            if df_cache is not None and feat_name in df_cache.columns:
+                try:
+                    unique_vals = set(df_cache[feat_name].dropna().astype(str).str.lower().unique())
+                    if str(cat_name).lower() in unique_vals:
+                        continue
+                except Exception:
+                    pass
             findings.append(Finding(
                 SEVERITY_MINOR, "stats_findings_unmatched_segment",
                 f"stats_findings.json references segment '{seg.get('feature')}'='{seg.get('category')}' which "
@@ -1327,6 +1364,7 @@ def run_consistency_checks(
     report_text: Optional[str] = None,
     uploaded_files: Optional[List[str]] = None,
     persist: bool = True,
+    dataset_type: Optional[str] = None,
 ) -> ConsistencyReport:
     """
     Runs all cross-artifact consistency checks for a run directory and returns
@@ -1345,8 +1383,8 @@ def run_consistency_checks(
         ("model_artifact_consistency", lambda: check_model_artifact_consistency(output_dir)),
         ("ml_result_consistency", lambda: check_ml_result_consistency(output_dir, report_text or "")),
         ("duplicate_summaries", lambda: check_duplicate_summaries(output_dir)),
-        ("segment_claims", lambda: check_segment_claims(output_dir, report_text or "", uploaded_files)),
-        ("stats_findings_consistency", lambda: check_stats_findings_consistency(output_dir, uploaded_files)),
+        ("segment_claims", lambda: check_segment_claims(output_dir, report_text or "", uploaded_files, dataset_type=dataset_type)),
+        ("stats_findings_consistency", lambda: check_stats_findings_consistency(output_dir, uploaded_files, dataset_type=dataset_type)),
         ("report_artifact_references", lambda: check_report_artifact_references(output_dir, report_text or "", uploaded_files)),
     )
 

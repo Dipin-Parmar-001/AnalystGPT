@@ -14,7 +14,6 @@ from enum import Enum
 from typing import List, Dict, Any, Optional, Callable, Union
 from dataclasses import dataclass, field, asdict
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
@@ -25,6 +24,7 @@ if sys.stdout.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.cancellation import CancellationToken, WorkflowCancelledException
@@ -40,8 +40,6 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 
 from agents.prompts import PLANNER_AGENT, PLANNER_SYSTEM_PROMPT, PLANNER_MODIFY_PROMPT
 
@@ -184,10 +182,12 @@ class ExecutionPlan:
     status: PlanStatus = PlanStatus.DRAFT
     notes: str = ""
     revision_count: int = 0
+    dataset_type: str = "classification"  # classification, regression, unsupervised
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "plan_id": self.plan_id,
+            "dataset_type": self.dataset_type,
             "query": self.query,
             "selected_agents": self.selected_agents,
             "tasks": [t.to_dict() for t in self.tasks],
@@ -205,8 +205,21 @@ class ExecutionPlan:
         except ValueError:
             status = PlanStatus.DRAFT
 
+        dataset_type = data.get("dataset_type")
+        if not dataset_type:
+            task_types = [t.task_type for t in tasks]
+            if "unsupervised_analysis" in task_types and "model_comparison" not in task_types:
+                dataset_type = "unsupervised"
+            elif any(t.primary_metric in ("rmse", "mse", "mae", "r2", "mape") for t in tasks):
+                dataset_type = "regression"
+            elif "model_comparison" not in task_types and not any("predict" in (t.title or "").lower() for t in tasks):
+                dataset_type = "unsupervised"
+            else:
+                dataset_type = "classification"
+
         return cls(
             plan_id=data.get("plan_id", str(uuid.uuid4())[:8]),
+            dataset_type=str(dataset_type).lower(),
             query=data.get("query", data.get("user_goal", "")),
             selected_agents=data.get("selected_agents", []),
             tasks=tasks,
@@ -756,26 +769,8 @@ class PlannerAgent:
         model_name: str = "nemotron-3-ultra-550b-a55b",
         max_tool_calls_per_task: int = 7
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
         setup_logfire()
-
-        headers = {"x-portkey-api-key": PORTKEY_API_KEY}
-        if PORTKEY_CONFIG_ID:
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-            if HAS_LOGFIRE:
-                logfire.info("PlannerAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[PlannerAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-        else:
-            headers["x-portkey-virtual-key"] = "analystgpt-openrouter"
-
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
+        self.client = create_local_router("PlannerAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
@@ -921,8 +916,24 @@ class PlannerAgent:
                     )
                     tasks.append(task)
 
+                # Resolve dataset_type
+                raw_dtype = parsed.get("dataset_type") if isinstance(parsed, dict) else None
+                if not raw_dtype:
+                    task_types = [t.task_type for t in tasks]
+                    if "unsupervised_analysis" in task_types and "model_comparison" not in task_types:
+                        dataset_type = "unsupervised"
+                    elif any(t.primary_metric in ("rmse", "mse", "mae", "r2", "mape") for t in tasks):
+                        dataset_type = "regression"
+                    elif "model_comparison" not in task_types and not any("predict" in (t.title or "").lower() for t in tasks):
+                        dataset_type = "unsupervised"
+                    else:
+                        dataset_type = "classification"
+                else:
+                    dataset_type = str(raw_dtype).strip().lower()
+
                 plan = ExecutionPlan(
                     plan_id=str(uuid.uuid4())[:8],
+                    dataset_type=dataset_type,
                     query=user_query,
                     selected_agents=selected_agents,
                     tasks=tasks,
@@ -1044,8 +1055,10 @@ class PlannerAgent:
                             retry_tasks.append(rt)
 
                         retry_notes = str(retry_parsed.get("notes") or plan.notes) if isinstance(retry_parsed, dict) else plan.notes
+                        retry_dtype = retry_parsed.get("dataset_type") if isinstance(retry_parsed, dict) else None
                         plan = ExecutionPlan(
                             plan_id=plan.plan_id,
+                            dataset_type=str(retry_dtype).strip().lower() if retry_dtype else plan.dataset_type,
                             query=user_query,
                             selected_agents=retry_agents,
                             tasks=retry_tasks,
@@ -1231,8 +1244,10 @@ class PlannerAgent:
                 )
                 tasks.append(task)
 
+            mod_dtype = parsed.get("dataset_type") if isinstance(parsed, dict) else None
             updated_plan = ExecutionPlan(
                 plan_id=current_plan.plan_id,
+                dataset_type=str(mod_dtype).strip().lower() if mod_dtype else current_plan.dataset_type,
                 query=current_plan.query,
                 selected_agents=selected_agents,
                 tasks=tasks,
@@ -1271,6 +1286,7 @@ class PlannerAgent:
             ))
             return ExecutionPlan(
                 plan_id=current_plan.plan_id,
+                dataset_type=current_plan.dataset_type,
                 query=current_plan.query,
                 selected_agents=current_plan.selected_agents,
                 tasks=fallback_tasks,

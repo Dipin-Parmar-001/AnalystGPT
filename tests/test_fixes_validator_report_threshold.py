@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from agents.schema import load_registry, ModelRegistry
 from agents.preflight_gate import run_preflight, _extract_registry_models, _sync_threshold_analysis_ml_summary
-from agents.artifact_validator import extract_claimed_artifacts, find_artifact_semantic
+from agents.artifact_validator import extract_claimed_artifacts, find_artifact_semantic, validate_artifacts
 from agents.reporter_agent import clean_thinking_sentences
 
 
@@ -106,6 +106,37 @@ class TestValidatorDataShapeHandling(unittest.TestCase):
         # Non-dict and null safety
         self.assertEqual(extract_claimed_artifacts(None), [])
         self.assertEqual(extract_claimed_artifacts("string"), [])
+
+    def test_artifact_validator_extract_claimed_artifacts_null_safety(self):
+        # Handles null artifact in model_artifacts and null file in generated_artifacts
+        response = {
+            "summary_data": {
+                "model_artifacts": [
+                    {"model": "Majority Class Baseline", "artifact": None},
+                    {"model": "logistic_regression", "artifact": "logistic_regression_p0.pkl"}
+                ],
+                "generated_artifacts": [
+                    None,
+                    "",
+                    {"file": None},
+                    {"file": "model_comparison.csv"}
+                ]
+            }
+        }
+        claimed = extract_claimed_artifacts(response)
+        self.assertIn("logistic_regression_p0.pkl", claimed)
+        self.assertIn("model_comparison.csv", claimed)
+        self.assertNotIn(None, claimed)
+        self.assertNotIn("", claimed)
+
+        # validate_artifacts must not throw TypeError when entries contain None
+        result = validate_artifacts(
+            agent_response=response,
+            output_dir=self.tmp,
+            agent_name="MLAgent",
+            task_type="model_comparison"
+        )
+        self.assertIsInstance(result.missing_artifacts, list)
 
     def test_find_artifact_semantic_matching(self):
         # Create a per-task variant in directory
