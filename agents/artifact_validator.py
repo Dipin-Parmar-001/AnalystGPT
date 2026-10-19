@@ -25,7 +25,7 @@ class ValidationResult:
     report_structure_issues: List[str]
 
 
-def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
+def extract_claimed_artifacts(agent_response: Any) -> List[str]:
     """
     Extract claimed artifacts from agent response.
 
@@ -35,6 +35,17 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
     - Any JSON field containing artifact filenames
     """
     claimed = []
+    if not agent_response:
+        return claimed
+    if isinstance(agent_response, list):
+        for item in agent_response:
+            if isinstance(item, str) and any(item.endswith(ext) for ext in ('.csv', '.json', '.png', '.pkl', '.md', '.txt')):
+                claimed.append(item)
+            elif isinstance(item, dict):
+                claimed.extend(extract_claimed_artifacts(item))
+        return [c for c in set(claimed) if isinstance(c, str) and c.strip()]
+    if not isinstance(agent_response, dict):
+        return claimed
 
     # Direct generated_files field
     if "generated_files" in agent_response:
@@ -54,7 +65,7 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
                         if isinstance(art, str):
                             claimed.append(art)
                         elif isinstance(art, dict) and "file" in art:
-                            claimed.append(art["file"])
+                            if isinstance(art.get("file"), str) and art["file"].strip(): claimed.append(art["file"])
 
             # Check saved_artifacts field (DataAnalystAgent)
             if "saved_artifacts" in summary:
@@ -68,7 +79,7 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
                 if isinstance(viz, list):
                     for v in viz:
                         if isinstance(v, dict) and "file" in v:
-                            claimed.append(v["file"])
+                            if isinstance(v.get("file"), str) and v["file"].strip(): claimed.append(v["file"])
                         elif isinstance(v, str):
                             claimed.append(v)
 
@@ -78,7 +89,7 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
                 if isinstance(artifacts, list):
                     for art in artifacts:
                         if isinstance(art, dict) and "artifact" in art:
-                            claimed.append(art["artifact"])
+                            if isinstance(art.get("artifact"), str) and art["artifact"].strip(): claimed.append(art["artifact"])
 
     # Check for generated_artifacts directly in response
     if "generated_artifacts" in agent_response:
@@ -88,19 +99,21 @@ def extract_claimed_artifacts(agent_response: Dict[str, Any]) -> List[str]:
                 if isinstance(art, str):
                     claimed.append(art)
                 elif isinstance(art, dict) and "file" in art:
-                    claimed.append(art["file"])
+                    if isinstance(art.get("file"), str) and art["file"].strip(): claimed.append(art["file"])
 
     # Deduplicate
-    return list(set(claimed))
+    return [c for c in set(claimed) if isinstance(c, str) and c.strip()]
 
 
-def detect_fallback_generation(agent_response: Dict[str, Any], output_dir: str) -> Tuple[bool, List[str]]:
+def detect_fallback_generation(agent_response: Any, output_dir: str) -> Tuple[bool, List[str]]:
     """
     Detect if fallback generation was used instead of actual artifact creation.
 
     Returns (fallback_detected, fallback_indicators)
     """
     fallback_indicators = []
+    if not isinstance(agent_response, dict):
+        return False, []
 
     # No response-text keyword scanning: analysis prose routinely contains words
     # like "missing" ("no missing values"), causing false fallback flags.
@@ -214,6 +227,11 @@ def _normalize_artifact_stem(name: str) -> str:
     stem = os.path.splitext(name.lower().strip())[0]
     stem = re.sub(r"[_\-]?task[_\-]?\w*$", "", stem)  # analyst_summary_task_1 -> analyst_summary
     stem = re.sub(r"[_\-]+", "", stem)                # ignore separator variants
+    # Canonicalize numeric parameters in names (dbscan_eps1 == dbscan_eps1.0).
+    def _canonical_number(match):
+        number = float(match.group(0))
+        return str(int(number)) if number.is_integer() else str(number).rstrip("0").rstrip(".")
+    stem = re.sub(r"\d+(?:\.\d+)?", _canonical_number, stem)
     return stem
 
 
@@ -232,7 +250,7 @@ def find_artifact_semantic(output_dir: str, artifact_name: str) -> Optional[str]
 
     Returns the matched filename, or None if nothing satisfies the requirement.
     """
-    if not artifact_name or not os.path.isdir(output_dir):
+    if not artifact_name or not isinstance(artifact_name, str) or not output_dir or not isinstance(output_dir, str) or not os.path.isdir(output_dir):
         return None
 
     exact_path = os.path.join(output_dir, artifact_name)
@@ -281,7 +299,8 @@ def validate_artifacts(
     Returns:
         ValidationResult with validation details
     """
-    claimed_artifacts = extract_claimed_artifacts(agent_response)
+    output_dir = output_dir or ""
+    claimed_artifacts = [c for c in extract_claimed_artifacts(agent_response) if isinstance(c, str) and c.strip()]
     existing_artifacts = []
     missing_artifacts = []
 
@@ -301,7 +320,7 @@ def validate_artifacts(
     fallback_detected, fallback_indicators = detect_fallback_generation(agent_response, output_dir)
 
     # Agent-specific required artifacts
-    required_artifacts = get_required_artifacts(agent_name, task_type)
+    required_artifacts = [r for r in get_required_artifacts(agent_name, task_type) if isinstance(r, str) and r.strip()]
     for required in required_artifacts:
         required_path = os.path.join(output_dir, required)
         if not os.path.exists(required_path) and required not in missing_artifacts:
@@ -317,11 +336,30 @@ def validate_artifacts(
         if not glob.glob(os.path.join(output_dir, "*_p*.pkl")):
             missing_artifacts.append("versioned model artifact (e.g. logistic_regression_p0.pkl)")
 
+    semantic_findings = []
+    if agent_name == "MLAgent" and task_type in {"model_comparison", "hyperparameter_tuning"}:
+        # Run cross-artifact ML checks on each ML task attempt so contradictory
+        # parameters or model lineage trigger the same bounded repair path.
+        try:
+            from agents.consistency_checker import (
+                Finding,
+                check_ml_result_consistency,
+                check_model_artifact_consistency,
+            )
+            semantic_findings.extend(check_ml_result_consistency(output_dir))
+            semantic_findings.extend(check_model_artifact_consistency(output_dir))
+        except Exception as exc:
+            from agents.consistency_checker import Finding
+            semantic_findings.append(Finding(
+                severity="minor", code="ml_consistency_check_error",
+                message=f"ML consistency validation could not run: {exc}", artifacts=[],
+            ))
+
     # Validate report structure if this is a reporter agent
     report_structure_valid = True
     report_structure_issues = []
     if agent_name == "ReporterAgent":
-        report = agent_response.get("final_report", "") or agent_response.get("response", "")
+        report = (agent_response.get("final_report", "") or agent_response.get("response", "")) if isinstance(agent_response, dict) else ""
         report_structure_valid, report_structure_issues = validate_report_structure(report)
 
     # Build hallucination warnings
@@ -344,7 +382,14 @@ def validate_artifacts(
             f"{'; '.join(report_structure_issues[:3])}"
         )
 
-    is_valid = len(missing_artifacts) == 0 and not fallback_detected and report_structure_valid
+    critical_semantic_findings = [f for f in semantic_findings if f.severity == "critical"]
+    if semantic_findings:
+        hallucination_warnings.extend(
+            f"ML consistency {f.severity} ({f.code}): {f.message}" for f in semantic_findings
+        )
+
+    is_valid = (len(missing_artifacts) == 0 and not fallback_detected and report_structure_valid
+                and not critical_semantic_findings)
 
     return ValidationResult(
         is_valid=is_valid,
@@ -384,11 +429,22 @@ def get_required_artifacts(agent_name: str, task_type: Optional[str] = None) -> 
                 # mandatory per the ML contract but their names are model-family
                 # dependent, so they are enforced by the *_p*.pkl glob check below.
             ]
+        elif task_type == "unsupervised_analysis":
+            return [
+                "unsupervised_metrics.json",
+                "unsupervised_summary.json",
+                "ml_summary.json",
+            ]
         elif task_type == "hyperparameter_tuning":
             return [
                 "tuned_model_comparison.csv",
                 "best_params.json",
                 "hyperparameter_tuning_summary.json"
+            ]
+        elif task_type in {"model_evaluation", "evaluation", "testing_and_evaluation", "threshold_selection", "test_evaluation", "testing"}:
+            return [
+                "test_metrics.json",
+                "ml_summary.json"
             ]
         else:
             return [
@@ -519,7 +575,7 @@ def build_repair_prompt(
         parts.append("")
         parts.append("  Validator failure details:")
         for reason in failure_reasons[:5]:
-            parts.append(f"     - {reason[:200]}")
+            parts.append(f"     - {reason[:600]}")
 
     parts.extend([
         "",

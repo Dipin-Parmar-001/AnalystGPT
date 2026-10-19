@@ -38,7 +38,7 @@ except ImportError as err:
     reset_global_sandbox_manager = None
     prepare_input_files = None
     HAS_MODAL = False
-    SANDBOX_TIMEOUT_S = 300
+    SANDBOX_TIMEOUT_S = 500
 
 
 # ==========================================
@@ -51,6 +51,7 @@ def execute_python(
     output_dir: Optional[str] = None,
     timeout: int = SANDBOX_TIMEOUT_S,
     extra_packages: Optional[List[str]] = None,
+    backend: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Executes Python code with input files statefully inside a Modal cloud sandbox environment.
@@ -65,14 +66,26 @@ def execute_python(
         target_output_dir = os.path.join(WORKSPACE_ROOT, target_output_dir)
 
     def _run():
-        # 1. Prepare input files into raw bytes map
+        # 1. Get Global Stateful Modal Sandbox Manager
+        manager = get_global_sandbox_manager(
+            app_name="analystGPT-agent-sandbox",
+            extra_packages=extra_packages,
+            timeout=timeout,
+            backend=backend,
+        )
+
+        # 2. Prepare input files into raw bytes map
         input_files_map: Dict[str, bytes] = {}
         if files:
             if isinstance(files, str):
                 files_list = [files]
             else:
                 files_list = files
-            input_files_map = prepare_input_files(files_list)
+            input_files_map = prepare_input_files(
+                files_list,
+                output_dir=target_output_dir,
+                sandbox_dir=getattr(manager, "_sandbox_dir", None),
+            )
 
         if HAS_LOGFIRE:
             logfire.info(
@@ -82,13 +95,6 @@ def execute_python(
             )
         else:
             print(f"[Tool execute_python] Prepared {len(input_files_map)} file(s) for execution: {list(input_files_map.keys())}", flush=True)
-
-        # 2. Get Global Stateful Modal Sandbox Manager
-        manager = get_global_sandbox_manager(
-            app_name="analystGPT-agent-sandbox",
-            extra_packages=extra_packages,
-            timeout=timeout,
-        )
 
         # 3. Run code statefully inside Modal container sandbox
         # Inject MPLBACKEND to prevent Tkinter RuntimeError in threads
@@ -197,7 +203,11 @@ EXECUTE_PYTHON_TOOL_SPEC = {
                 },
                 "files": {
                     "type": "object",
-                    "description": "Map of filename to file content or file paths provided to the container.",
+                    "description": (
+                        "Optional map of filename to file content or file paths. "
+                        "NOTE: All datasets and artifacts in FILE_REGISTRY are already present in the workspace. "
+                        "Do NOT pass existing datasets or empty placeholder values in files; leave files omitted or empty."
+                    ),
                     "additionalProperties": {"type": "string"},
                 },
                 "output_dir": {
@@ -286,39 +296,88 @@ class ToolManager:
             fn_args = raw_args
         else:
             try:
-                fn_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-            except Exception as parse_err:
-                extracted = None
-                try:
-                    from agents.fallback_parser import extract_code_from_content
-                    extracted = extract_code_from_content(str(raw_args))
-                except Exception:
-                    pass
-
-                if extracted and (fn_name == "execute_python" or fn_name == "unknown"):
-                    fn_name = "execute_python"
-                    fn_args = {"code": extracted}
+                from agents.fallback_parser import parse_and_clean_tool_args
+                ok, parsed_dict, err = parse_and_clean_tool_args(raw_args)
+                if ok:
+                    fn_args = parsed_dict
                     parse_error = None
                 else:
                     fn_args = {}
-                    parse_error = f"{type(parse_err).__name__}: {str(parse_err)}"
-                    if HAS_LOGFIRE:
-                        logfire.error(
-                            "LLM Tool Call JSON Argument Parsing Failed",
-                            tool_call_id=tool_call_id,
-                            fn_name=fn_name,
-                            raw_arguments=raw_args,
-                            parse_error=parse_error,
-                            traceback=traceback.format_exc(),
-                        )
-                    else:
-                        print(f"[Tool Parse Error] Failed to parse JSON for '{fn_name}' (ID: {tool_call_id}). Raw: {raw_args}. Error: {parse_error}")
+                    parse_error = err
+            except Exception as parse_err:
+                fn_args = {}
+                parse_error = f"{type(parse_err).__name__}: {str(parse_err)}"
 
+            if parse_error:
+                if HAS_LOGFIRE:
+                    logfire.error(
+                        "LLM Tool Call JSON Argument Parsing Failed",
+                        tool_call_id=tool_call_id,
+                        fn_name=fn_name,
+                        raw_arguments=raw_args,
+                        parse_error=parse_error,
+                        traceback=traceback.format_exc(),
+                    )
+                else:
+                    print(f"[Tool Parse Error] Failed to parse JSON for '{fn_name}' (ID: {tool_call_id}). Raw: {raw_args}. Error: {parse_error}")
 
         def _do_execute() -> Dict[str, Any]:
+            if parse_error:
+                return {
+                    "success": False,
+                    "error": f"Tool call argument parsing failed: {parse_error}",
+                    "parse_error": parse_error,
+                    "raw_arguments": raw_args,
+                    "stdout": "",
+                    "stderr": f"JSONDecodeError / Parse Error: {parse_error}\nRaw arguments received: {str(raw_args)[:500]}",
+                }
             if fn_name in self.tools:
-                if files and "files" not in fn_args:
-                    fn_args["files"] = files
+                # Sanitize and merge 'files' argument to ensure real dataset paths are not lost
+                # and empty dummy placeholder values from LLM (e.g. {"file.csv": ""}) are stripped.
+                call_files = fn_args.get("files")
+                valid_call_files: Dict[str, Any] = {}
+
+                if isinstance(call_files, dict):
+                    for k, v in call_files.items():
+                        if v is not None and (not isinstance(v, str) or v.strip()):
+                            v_clean = str(v).strip()
+                            if v_clean != str(k).strip() and "content would be loaded" not in v_clean.lower():
+                                valid_call_files[k] = v
+                elif isinstance(call_files, list):
+                    for f in call_files:
+                        if f and str(f).strip():
+                            valid_call_files[os.path.basename(str(f))] = f
+                elif isinstance(call_files, str) and call_files.strip():
+                    try:
+                        parsed_f = json.loads(call_files)
+                        if isinstance(parsed_f, dict):
+                            for k, v in parsed_f.items():
+                                if v is not None and (not isinstance(v, str) or v.strip()):
+                                    valid_call_files[k] = v
+                        elif isinstance(parsed_f, list):
+                            for f in parsed_f:
+                                if f and str(f).strip():
+                                    valid_call_files[os.path.basename(str(f))] = f
+                    except Exception:
+                        pass
+
+                # If caller provided authoritative files (e.g. from orchestrator), merge them
+                if files:
+                    if isinstance(files, list):
+                        for f in files:
+                            fname = os.path.basename(str(f))
+                            if fname not in valid_call_files and f not in valid_call_files:
+                                valid_call_files[fname] = f
+                    elif isinstance(files, dict):
+                        for f_k, f_v in files.items():
+                            if f_k not in valid_call_files:
+                                valid_call_files[f_k] = f_v
+
+                if valid_call_files:
+                    fn_args["files"] = valid_call_files
+                elif "files" in fn_args:
+                    # Remove empty/dummy files dictionary so execute_python runs against pre-mounted workspace
+                    fn_args.pop("files", None)
 
                 if "output_dir" not in fn_args or fn_args["output_dir"] == "outputs" or not os.path.isabs(fn_args.get("output_dir", "")):
                     fn_args["output_dir"] = effective_output_dir

@@ -32,16 +32,42 @@ class WorkflowCancelledException(Exception):
         }
 
 
+class WorkflowPausedException(Exception):
+    """Raised when a multi-agent workflow execution is paused by the user."""
+    def __init__(
+        self,
+        message: str = "Workflow execution was paused by user.",
+        task_id: Optional[int] = None,
+        step: Optional[str] = None
+    ):
+        super().__init__(message)
+        self.task_id = task_id
+        self.step = step
+        self.message = message
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": "paused",
+            "message": self.message,
+            "task_id": self.task_id,
+            "step": self.step
+        }
+
+
 class CancellationToken:
     """
-    Thread-safe cancellation token shared across WorkflowOrchestrator,
+    Thread-safe cancellation and pause token shared across WorkflowOrchestrator,
     agents, and sandbox execution loops.
     """
     def __init__(self):
         self._is_cancelled = threading.Event()
+        self._is_paused = threading.Event()
         self._reason = ""
+        self._pause_reason = ""
         self._cancelled_at_step: Optional[str] = None
+        self._paused_at_step: Optional[str] = None
         self._task_id: Optional[int] = None
+        self._paused_task_id: Optional[int] = None
         self._callbacks: List[Callable[[], None]] = []
 
     def cancel(
@@ -62,28 +88,72 @@ class CancellationToken:
             except Exception:
                 pass
 
+    def pause(
+        self,
+        reason: str = "User requested workflow pause",
+        step: Optional[str] = None,
+        task_id: Optional[int] = None
+    ):
+        """Signals pause immediately to all executing agents."""
+        self._pause_reason = reason
+        self._paused_at_step = step
+        self._paused_task_id = task_id
+        self._is_paused.set()
+
+        for cb in self._callbacks:
+            try:
+                cb()
+            except Exception:
+                pass
+
     @property
     def is_cancelled(self) -> bool:
         """Returns True if cancellation has been requested."""
         return self._is_cancelled.is_set()
 
     @property
+    def is_paused(self) -> bool:
+        """Returns True if pause has been requested."""
+        return self._is_paused.is_set()
+
+    @property
     def reason(self) -> str:
         return self._reason
+
+    @property
+    def pause_reason(self) -> str:
+        return self._pause_reason
 
     @property
     def cancelled_at_step(self) -> Optional[str]:
         return self._cancelled_at_step
 
     @property
+    def paused_at_step(self) -> Optional[str]:
+        return self._paused_at_step
+
+    @property
     def task_id(self) -> Optional[int]:
         return self._task_id
 
+    @property
+    def paused_task_id(self) -> Optional[int]:
+        return self._paused_task_id
+
     def check_cancelled(self, step_name: str = "", task_id: Optional[int] = None):
         """
-        Raises WorkflowCancelledException if cancellation has been requested.
+        Raises WorkflowPausedException or WorkflowCancelledException if requested.
         Call this before starting LLM calls, before tool executions, and at turn boundaries.
         """
+        if self._is_paused.is_set():
+            active_step = step_name or self._paused_at_step or "active operation"
+            active_tid = task_id if task_id is not None else self._paused_task_id
+            raise WorkflowPausedException(
+                message=f"Execution paused: {self._pause_reason or 'Paused by user'}",
+                task_id=active_tid,
+                step=active_step
+            )
+
         if self._is_cancelled.is_set():
             active_step = step_name or self._cancelled_at_step or "active operation"
             active_tid = task_id if task_id is not None else self._task_id
@@ -94,11 +164,12 @@ class CancellationToken:
             )
 
     def register_callback(self, callback: Callable[[], None]):
-        """Registers a callback to be invoked immediately when cancel is called."""
-        if self._is_cancelled.is_set():
+        """Registers a callback to be invoked immediately when cancel or pause is called."""
+        if self._is_cancelled.is_set() or self._is_paused.is_set():
             try:
                 callback()
             except Exception:
                 pass
         else:
             self._callbacks.append(callback)
+

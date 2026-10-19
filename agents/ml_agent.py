@@ -14,7 +14,55 @@ import traceback
 import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
-from openai import OpenAI
+
+
+def is_fragmented_or_unparsable_response(message: Any) -> bool:
+    """
+    Detect if the LLM response is fragmented, unparsable, or contains only
+    token usage metadata instead of actual content.
+
+    Returns True if the response should be retried.
+    """
+    if message is None:
+        return True
+
+    # Check if content is None or empty
+    content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        # If no content and no tool calls, it's likely an incomplete response
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+    # Check if content looks like token usage metadata (JSON with token fields)
+    if isinstance(content, str):
+        content_stripped = content.strip()
+        # Check for the specific token usage metadata pattern
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                # Check for token usage metadata keys
+                token_keys = {"completion_tokens", "prompt_tokens", "total_tokens",
+                             "completion_tokens_details", "prompt_tokens_details",
+                             "cost", "is_byok", "cost_details"}
+                if isinstance(parsed, dict) and token_keys.intersection(parsed.keys()):
+                    # This is token usage metadata, not actual content
+                    return True
+            except json.JSONDecodeError:
+                pass
+
+        # Check for other common fragmented response patterns
+        # e.g., empty object, just whitespace, or clearly incomplete
+        if content_stripped in ["{}", "[]", "null", ""]:
+            return True
+
+    # Check finish_reason if available (some providers include this in message)
+    finish_reason = getattr(message, "finish_reason", None)
+    if finish_reason in ["length", "content_filter", "function_call"]:
+        # These might indicate incomplete responses
+        pass
+
+    return False
 
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
@@ -25,9 +73,17 @@ if sys.stdout.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import (
+    reset_global_sandbox_manager,
+    extract_code_from_content,
+    extract_action_code_from_content,
+    create_synthetic_execute_tool_call,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
+)
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
@@ -44,49 +100,7 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        }
-    ]
-}
 
 
 class MLAgent:
@@ -97,52 +111,21 @@ class MLAgent:
 
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 7,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 1200,
-        max_tokens_before_compact: int = 12000,
+        max_tokens_before_compact: int = 100000,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
         setup_logfire()
-
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
-        if PORTKEY_CONFIG_ID:
-            if HAS_LOGFIRE:
-                logfire.info("MLAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[MLAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("[MLAgent Setup] PORTKEY_CONFIG_ID not found. Using fallback config.")
-            else:
-                print("[MLAgent Setup] WARNING: PORTKEY_CONFIG_ID not found. Using fallback config.")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
-
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
-
-        if HAS_LOGFIRE:
-            try:
-                logfire.instrument_openai(self.client)
-            except Exception as e:
-                logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
+        self.client = create_local_router("MLAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
         instrument_openai_client(self.client, agent_name="MLAgent")
 
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
         self.agent_name = "MLAgent"
@@ -222,6 +205,17 @@ class MLAgent:
                 try:
                     response = self.client.chat.completions.create(**kwargs)
                     message = response.choices[0].message
+
+                    # Check for fragmented or unparsable response (token usage metadata, etc.)
+                    if is_fragmented_or_unparsable_response(message):
+                        if HAS_LOGFIRE:
+                            logfire.warn("Detected fragmented/unparsable LLM response (token metadata only), retrying...",
+                                         content_snippet=str(getattr(message, "content", None))[:200])
+                        else:
+                            print(f"[MLAgent] Detected fragmented/unparsable LLM response, retrying...")
+                        # Treat as an error to trigger retry
+                        raise RuntimeError("Fragmented or unparsable LLM response received (token metadata only)")
+
                     return message
                 except Exception as err:
                     err_str = str(err).lower()
@@ -238,7 +232,7 @@ class MLAgent:
                     )
                     if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool message schema in MLAgent. Retrying with plain chat format (tools preserved).", error=str(err))
+                            logfire.warn("Provider rejected tool message schema in MLAgent. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
                             print(f"[MLAgent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
 
@@ -356,23 +350,43 @@ class MLAgent:
         primary_task = assigned_tasks[0] if assigned_tasks else None
         task_type = getattr(primary_task, "task_type", None) or "model_comparison"
 
-        if task_type == "hyperparameter_tuning":
+        if task_type == "unsupervised_analysis":
+            task_specific_instructions = (
+                f"Instructions for Unsupervised Analysis:\n"
+                f"1. Use the task objective to choose clustering, anomaly detection, or dimensionality reduction. Do not invent a target or labels. If the objective is underspecified, choose a defensible method and record the assumption.\n"
+                f"2. Load the requested dataset and exclude identifiers, free-text IDs, and non-feature metadata from the feature matrix. Impute missing values and scale numeric features when the chosen algorithm is distance- or scale-sensitive; record every transformation.\n"
+                f"3. For clustering, compare a small defensible set of algorithms or cluster counts. Report Silhouette (higher is better), Davies-Bouldin (lower), and Calinski-Harabasz (higher) when mathematically defined. Also report cluster sizes, noise/uncategorized share, and stability across seeds or resamples. Do not compare raw inertia across different feature spaces.\n"
+                f"4. For anomaly detection, if ground-truth labels exist and were not used for fitting, report PR-AUC and ROC-AUC plus precision@k at a stated review capacity. Without labels, report the score distribution, chosen threshold and its rationale, flagged count/rate, and a small reviewable list of flagged record IDs; do not claim accuracy.\n"
+                f"5. For dimensionality reduction, report explained variance for PCA where applicable, and trustworthiness or reconstruction error when appropriate. State what information the projection may lose.\n"
+                f"6. If independent reference labels exist, ARI/NMI may be reported as external validation only; never use them to fit or choose the representation without clearly labeling that evaluation. Metrics are not interchangeable: explain which are applicable and why any are omitted.\n"
+                f"7. Save `unsupervised_metrics.json` as JSON with `task_type`, `features_used`, `preprocessing`, `candidate_results` (list of objects with `algorithm`, `configuration`, `metrics`, `optimization_directions`, and `limitations`), and `selected_result` (object with `algorithm`, `configuration`, `metrics`, `reason`, and `limitations`). Use consistent snake_case metric keys. Save `unsupervised_summary.json` with plain-language findings. Save `ml_summary.json` and `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json`. Save `cluster_assignments.csv` for clustering with preserved identifier columns and the assigned label in a `cluster` column; for anomaly detection save scores/flags in `anomaly_scores.csv` when applicable. Save reusable fitted model/preprocessing artifacts where supported. Do not create supervised-only champion, confusion-matrix, baseline, or feature-importance artifacts.\n"
+                f"8. You have a budget of MAX {effective_max_calls} tool calls. Ground every metric in executed code and clearly label unavailable metrics instead of fabricating values."
+            )
+        elif task_type == "hyperparameter_tuning":
+            # Get primary_metric from task spec
+            primary_metric = getattr(primary_task, "primary_metric", None) if primary_task else None
+            metric_hint = f" (Planner specified: {primary_metric})" if primary_metric else ""
+
             task_specific_instructions = (
                 f"Instructions for Hyperparameter Tuning:\n"
                 f"1. You have a budget of MAX {effective_max_calls} tool calls.\n"
-                f"2. Load `model_comparison.csv` and `best_model.pkl` directly from FILE_REGISTRY.\n"
+                f"2. Load `model_comparison.csv` and the champion model artifact (from `champion_model.json[\"artifact_filename\"]`) directly from FILE_REGISTRY.\n"
                 f"3. Reconstruct training data using identical split and preprocessing from baseline.\n"
-                f"4. Bounded search: Run GridSearchCV or RandomizedSearchCV with cv=5 over the bounded parameter search space specified in your task description.\n"
-                f"5. Honest reporting: Only overwrite `best_model.pkl` if the tuned model's primary metric strictly outperforms baseline.\n"
+                f"4. Bounded search: Run GridSearchCV or RandomizedSearchCV with cv=5 over the bounded parameter search space specified in your task description. Use scoring='{primary_metric or 'roc_auc'}'{metric_hint} for the search -- this MUST match the primary_metric from the task spec / champion_model.json.\n"
+                f"5. Honest reporting: Only update `champion_model.json` to point to the tuned model if the tuned model's primary metric strictly outperforms baseline.\n"
                 f"6. MANDATORY OUTPUT ARTIFACTS:\n"
                 f"   - `tuned_model_comparison.csv` (Comparing baseline vs tuned metrics side by side)\n"
                 f"   - `best_params.json` (Winning hyperparameter combination and best CV score)\n"
                 f"   - `hyperparameter_tuning_summary.json` (Structured tuning summary JSON)\n"
                 f"   - `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json` AND `ml_summary.json` (Your own task summary with tuned-vs-baseline metric deltas — both files required)\n"
-                f"   - `best_model.pkl` (Updated only if tuned model won)\n"
+                f"   - Versioned tuned model artifact (e.g., `logistic_regression_p1_tuned.pkl`)\n"
                 f"7. Provide a concise summary of tuning results, parameter improvements, and test metric deltas."
             )
         else:
+            # Get primary_metric from task spec
+            primary_metric = getattr(primary_task, "primary_metric", None) if primary_task else None
+            metric_hint = f" (Planner specified: {primary_metric})" if primary_metric else ""
+
             task_specific_instructions = (
                 f"Instructions for Model Training & Comparison:\n"
                 f"1. Dataset Loading: If `feature_engineered_dataset.csv` or `cleaned_dataset.csv` is available in FILE_REGISTRY or inputs, load it directly. If not available, use the main dataset provided.\n"
@@ -380,15 +394,16 @@ class MLAgent:
                 f"3. Preprocessing: Use One-Hot Encoding (`pd.get_dummies(..., drop_first=True)` or `OneHotEncoder`) for nominal features, `LabelEncoder()` strictly for classification target `y`, `StandardScaler()` fit strictly on `X_train`, and `train_test_split(..., test_size=0.2, random_state=42, stratify=y if classification else None)`.\n"
                 f"4. Metrics: For classification, evaluate Accuracy, Precision, Recall, F1, ROC-AUC, **PR-AUC** (`average_precision_score`), and **5-Fold Stratified Cross-Validation** (`CV_Mean`, `CV_Std`). For regression, evaluate RMSE, MAE, R2, MSE, and 5-Fold CV R2.\n"
                 f"5. Directional Feature Importance: Extract signed `coefficient`, `absolute_importance`, and `direction` (e.g., `'reduces_churn'` / `'increases_churn'` or `'reduces_target'` / `'increases_target'`) and save to `feature_importance.csv`.\n"
-                f"6. Business-Aware Model Selection: Provide a comparative multi-metric rationale (e.g. 'Model A has highest ROC-AUC/PR-AUC while Model B has higher recall. Model A was selected because ROC-AUC was designated as primary metric...').\n"
-                f"7. MANDATORY 7 ARTIFACTS: Your script MUST save all 7 core files:\n"
-                f"   - `model_comparison.csv` (Comparing models across Accuracy, Precision, Recall, F1, ROC_AUC, PR_AUC, CV_Mean, CV_Std)\n"
-                f"   - `baseline_score.json` (Dummy baseline benchmark)\n"
+                f"6. Business-Aware Model Selection: The primary metric for selection is {primary_metric or 'roc_auc'}{metric_hint}. Provide a comparative multi-metric rationale and select the model that scores highest on this primary metric (or lowest for error metrics like RMSE).\n"
+                f"7. MANDATORY ARTIFACTS: Your script MUST save all core files:\n"
+                f"   - `model_comparison.csv` (Comparing models across Accuracy, Precision, Recall, F1, ROC_AUC, PR_AUC, CV_Mean, CV_Std, **model_artifact**)\n"
+                f"   - `baseline_score.json` (Dummy baseline benchmark using `DummyClassifier(strategy=\"most_frequent\")` labeled \"Majority Class Baseline\")\n"
                 f"   - `feature_importance.csv` (Columns: feature, coefficient, absolute_importance, direction)\n"
                 f"   - `confusion_matrix.json` (Confusion matrix data for best model)\n"
                 f"   - `predictions.csv` (Predictions with customerID, actual, predicted, probability)\n"
-                f"   - `best_model.pkl` (Best model saved via joblib.dump)\n"
+                f"   - Versioned model artifacts (e.g., `logistic_regression_p0.pkl`, `random_forest_p0.pkl` — NOT `best_model.pkl`)\n"
                 f"   - `ml_summary.json` AND `ml_summary_task_{assigned_tasks[0].task_id if assigned_tasks else 2}.json` (Structured machine learning summary — both files required)\n"
+                f"   - `model_registry.json` and `champion_model.json`\n"
                 f"8. You have a budget of MAX {effective_max_calls} tool calls.\n"
                 f"9. Output the final structured JSON summary and metric details."
             )
@@ -434,9 +449,18 @@ class MLAgent:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn}", task_id=task_id if isinstance(task_id, int) else None)
 
-            thought = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            assistant_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=assistant_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+                step_callback=_safe_callback,
+            )
 
+            thought = assistant_msg.content or ""
             if thought:
                 _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
 
@@ -503,12 +527,9 @@ class MLAgent:
                     if gf not in generated_files:
                         generated_files.append(gf)
 
-                try:
-                    args_dict = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else fn_args_raw
-                    if "code" in args_dict:
-                        executed_codes.append(args_dict["code"])
-                except Exception:
-                    pass
+                ok_args, args_dict, _ = parse_and_clean_tool_args(fn_args_raw)
+                if ok_args and "code" in args_dict:
+                    executed_codes.append(args_dict["code"])
 
                 memory_manager.append_tool_result(
                     tool_call_id=tc_id,
@@ -588,13 +609,27 @@ class MLAgent:
         summary_filename = f"ml_summary_task_{task_id_val}.json"
         main_summary_filename = "ml_summary.json"
 
-        # Check if Python script produced ml_summary.json
-        for candidate_name in [main_summary_filename, summary_filename]:
+        # Prefer this task's own summary and reject a stale supervised summary
+        # when the current task is unsupervised.
+        summary_candidates = (
+            [summary_filename, main_summary_filename]
+            if task_type == "unsupervised_analysis"
+            else [main_summary_filename, summary_filename]
+        )
+        for candidate_name in summary_candidates:
             cand_path = os.path.join(output_dir, candidate_name)
             if os.path.exists(cand_path):
                 try:
                     with open(cand_path, "r", encoding="utf-8") as sf:
-                        summary_data = json.load(sf)
+                        candidate_summary = json.load(sf)
+                    if task_type == "unsupervised_analysis" and isinstance(candidate_summary, dict):
+                        summary_type = str(candidate_summary.get("task_type", "")).lower()
+                        has_unsupervised_data = "unsupervised_metrics" in candidate_summary
+                        if not has_unsupervised_data and not any(
+                            tag in summary_type for tag in ("unsupervised", "cluster", "anomal", "dimensionality")
+                        ):
+                            continue
+                    summary_data = candidate_summary
                     if candidate_name not in generated_files:
                         generated_files.append(candidate_name)
                     break
@@ -602,7 +637,54 @@ class MLAgent:
                     pass
 
         # If not produced directly by script, assemble from generated artifact files
-        if not summary_data:
+        if not summary_data and task_type == "unsupervised_analysis":
+            unsupervised_metrics = {}
+            unsupervised_summary = {}
+            for artifact_name, destination in (
+                ("unsupervised_metrics.json", "metrics"),
+                ("unsupervised_summary.json", "summary"),
+            ):
+                try:
+                    with open(os.path.join(output_dir, artifact_name), "r", encoding="utf-8") as af:
+                        value = json.load(af)
+                    if isinstance(value, dict):
+                        if destination == "metrics":
+                            unsupervised_metrics = value
+                        else:
+                            unsupervised_summary = value
+                except Exception:
+                    pass
+            summary_data = {
+                "agent": self.agent_name,
+                "task_id": task_id_val,
+                "task_title": assigned_tasks[0].title if assigned_tasks else "Unsupervised Analysis",
+                "status": final_status,
+                "task_type": "unsupervised_analysis",
+                "source": "fallback_from_unsupervised_artifacts",
+                "unsupervised_metrics": unsupervised_metrics,
+                "unsupervised_summary": unsupervised_summary,
+                "generated_artifacts": [
+                    {"file": gf, "description": f"Generated artifact: {gf}"}
+                    for gf in generated_files
+                ],
+                "issues_and_caveats": [
+                    "Fallback summary copied the task's unsupervised metric and summary artifacts; values were not independently recomputed."
+                ],
+            }
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                with open(os.path.join(output_dir, summary_filename), "w", encoding="utf-8") as sf:
+                    json.dump(summary_data, sf, indent=2)
+                with open(os.path.join(output_dir, main_summary_filename), "w", encoding="utf-8") as sf:
+                    json.dump(summary_data, sf, indent=2)
+                if summary_filename not in generated_files:
+                    generated_files.append(summary_filename)
+                if main_summary_filename not in generated_files:
+                    generated_files.append(main_summary_filename)
+            except Exception as write_err:
+                print(f"[MLAgent] Notice saving unsupervised fallback summary: {write_err}")
+
+        if not summary_data and task_type != "unsupervised_analysis":
             # 1. Baseline Score
             baseline_data = {}
             base_path = os.path.join(output_dir, "baseline_score.json")

@@ -52,7 +52,7 @@ def safe_float(val: Any) -> Optional[float]:
 #   unique-count thresholds, never by name.
 # ---------------------------------------------------------------------------
 
-SEGMENT_MAX_CATEGORIES = 12          # skip categoricals wider than this (IDs, free text)
+SEGMENT_MAX_CATEGORIES = 60          # skip categoricals wider than this (IDs, free text)
 SEGMENT_MIN_CATEGORY_ROWS = 5        # skip tiny segments (noise / near-unique values)
 SEGMENT_MAX_NUMERIC_BY_CLASS = 15    # cap per-class numeric stats to top-K by |corr|
 SEGMENT_MAX_ENTRIES = 200            # hard cap on rate_by_category size
@@ -92,36 +92,52 @@ def declared_target_column(run_path: Path) -> Optional[str]:
     return votes.most_common(1)[0][0] if votes else None
 
 
-def detect_target_column(df: "pd.DataFrame", declared_target: Optional[str] = None) -> Optional[str]:
+def detect_target_column(
+    df: "pd.DataFrame",
+    declared_target: Optional[str] = None,
+    dataset_type: Optional[str] = None,
+) -> Optional[str]:
     """
     Picks the binary target column. Prefers the pipeline-declared target; the only
-    structural fallback is a frame with exactly one binary column. Never guesses
-    among multiple binary columns.
+    structural fallback is a frame with exactly one binary column for classification tasks.
+    Never guesses when dataset_type is regression or unsupervised.
     """
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return None
+
     if declared_target is not None:
         for c in df.columns:
             if str(c) == str(declared_target) and df[c].nunique(dropna=True) == 2:
                 return c
+        # Declared target is non-binary; do not hijack unrelated binary columns
+        return None
+
     binary_cols = [c for c in df.columns if df[c].nunique(dropna=True) == 2]
     if len(binary_cols) == 1:
         return binary_cols[0]
     return None
 
 
-def compute_segment_stats(df: "pd.DataFrame", declared_target: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def compute_segment_stats(
+    df: "pd.DataFrame",
+    declared_target: Optional[str] = None,
+    dataset_type: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Computes ground-truth segment statistics from a dataset artifact (works for
     any dataset; see the module block above for the generic design rules).
 
     Returns None when no binary target can be identified (e.g. regression runs,
-    or frames with several equally-plausible binary columns).
+    unsupervised runs, or frames with several equally-plausible binary columns).
     """
     import pandas as pd
     import numpy as np
 
     if df is None or len(df) == 0:
         return None
-    target = detect_target_column(df, declared_target)
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return None
+    target = detect_target_column(df, declared_target, dataset_type=dataset_type)
     if target is None:
         return None
 
@@ -279,6 +295,26 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                     "extension": item.suffix.lower()
                 })
 
+    # Preserve the explicitly computed unsupervised metrics for the reporter.
+    # These remain artifact-sourced values; unlike dataset shape and supervised
+    # confusion-matrix metrics, they are not independently recomputed here.
+    unsupervised_path = run_path / "unsupervised_metrics.json"
+    if unsupervised_path.is_file():
+        try:
+            with unsupervised_path.open(encoding="utf-8") as f:
+                unsupervised_metrics = json.load(f)
+            if isinstance(unsupervised_metrics, dict):
+                verified["unsupervised_metrics_artifact"] = {
+                    "source_file": unsupervised_path.name,
+                    "values_independently_recomputed": False,
+                    "content": unsupervised_metrics,
+                }
+        except (OSError, json.JSONDecodeError) as exc:
+            verified["unsupervised_metrics_artifact"] = {
+                "source_file": unsupervised_path.name,
+                "error": f"Could not read unsupervised metrics artifact: {exc}",
+            }
+
     # 1b. Versioned Model Artifacts (e.g., logistic_regression_p0.pkl, random_forest_p1_tuned.pkl)
     versioned_model_artifacts = []
     for item in sorted(run_path.glob("*_p*.pkl")):
@@ -297,6 +333,7 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
     # 2. Dataset Verification (cleaned_dataset.csv or fallback dataset CSVs)
     dataset_candidates = [
         "cleaned_dataset.csv",
+        "feature_engineered_dataset.csv",
         "cleaned_data.csv",
         "dataset.csv",
         "data.csv"
@@ -311,7 +348,10 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
     # If not found in candidates, look for any .csv that isn't model/prediction/feature
     if not target_csv:
         for item in sorted(run_path.glob("*.csv")):
-            if item.name not in ["model_comparison.csv", "feature_importance.csv", "predictions.csv"]:
+            if item.name not in [
+                "model_comparison.csv", "feature_importance.csv", "predictions.csv",
+                "cluster_assignments.csv", "anomaly_scores.csv",
+            ]:
                 target_csv = item
                 break
 
@@ -326,9 +366,18 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
 
             num_cols_list = df.select_dtypes(include=[np.number]).columns.tolist()
             cat_cols_list = df.select_dtypes(exclude=[np.number]).columns.tolist()
+            # Numeric storage does not make an identifier a quantitative
+            # feature. Keep identifier columns visible in schema metadata, but
+            # do not publish misleading means/ranges for IDs as metric stats.
+            import re
+            identifier_cols = [
+                str(col) for col in df.columns
+                if re.search(r"(?:^|[_\s-])id(?:$|[_\s-])|identifier|id$|^id", str(col), re.IGNORECASE)
+            ]
+            numeric_measure_cols = [col for col in num_cols_list if col not in identifier_cols]
 
             numeric_stats: Dict[str, Dict[str, Any]] = {}
-            for col in num_cols_list:
+            for col in numeric_measure_cols:
                 series = df[col].dropna()
                 if len(series) > 0:
                     skew_val = safe_float(series.skew())
@@ -363,6 +412,8 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                 "numeric_columns_count": len(num_cols_list),
                 "categorical_columns_count": len(cat_cols_list),
                 "numeric_columns": num_cols_list,
+                "numeric_measure_columns": numeric_measure_cols,
+                "identifier_columns": identifier_cols,
                 "categorical_columns": cat_cols_list,
                 "numeric_stats": numeric_stats,
                 "categorical_stats": categorical_stats
@@ -419,7 +470,28 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
         except Exception as e:
             verified["dataset"] = {"error": f"Failed to parse dataset {target_csv.name}: {str(e)}"}
 
-    # 4. Model Comparison (model_comparison.csv & tuned_model_comparison.csv)
+    # 4d. Model Registry & Champion Pointer (load FIRST to get primary_metric from Planner)
+    reg_path = run_path / "model_registry.json"
+    if reg_path.exists() and reg_path.is_file():
+        try:
+            with open(reg_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["model_registry"] = json.load(f)
+        except Exception as e:
+            verified["model_registry_error"] = f"Failed to parse model_registry.json: {str(e)}"
+
+    champ_path = run_path / "champion_model.json"
+    primary_metric = None
+    if champ_path.exists() and champ_path.is_file():
+        try:
+            with open(champ_path, "r", encoding="utf-8", errors="replace") as f:
+                verified["champion_model"] = json.load(f)
+            # Extract the primary_metric that was set by the Planner agent
+            if isinstance(verified["champion_model"], dict):
+                primary_metric = verified["champion_model"].get("primary_metric")
+        except Exception as e:
+            verified["champion_model_error"] = f"Failed to parse champion_model.json: {str(e)}"
+
+    # 4. Model Comparison (model_comparison.csv)
     mc_path = run_path / "model_comparison.csv"
     if mc_path.exists() and mc_path.is_file():
         try:
@@ -448,16 +520,37 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                     metrics_map[m_name] = m_dict
                 verified["model_metrics"] = metrics_map
 
-                # Determine best model
-                # Priority metrics: ROC-AUC, ROC_AUC, roc_auc, PR-AUC, F1, F1-Score, f1_score, f1, AUC, Accuracy, accuracy, R2, RMSE
+                # Determine best model using the primary_metric from champion_model.json (set by Planner)
+                # Fall back to goal-aware priority if primary_metric not available
                 target_metric = None
                 sort_ascending = False
-                for m_candidate in ["ROC-AUC", "ROC_AUC", "roc_auc", "PR-AUC", "pr_auc", "F1", "F1-Score", "f1_score", "f1", "AUC", "Accuracy", "accuracy", "R2", "r2_score"]:
-                    found_col = next((c for c in mc.columns if c.strip().lower() == m_candidate.lower()), None)
-                    if found_col:
-                        target_metric = found_col
-                        sort_ascending = False
-                        break
+
+                # Normalize metric name for matching
+                def _norm_metric_key(col: str) -> str:
+                    return col.strip().lower().replace(" ", "").replace("-", "_")
+
+                if primary_metric:
+                    # Use the primary_metric specified by the Planner
+                    pm = _norm_metric_key(primary_metric)
+                    for col in mc.columns:
+                        if _norm_metric_key(col) == pm:
+                            target_metric = col
+                            # Check if it's a metric to minimize (RMSE, MAE, MSE, log_loss)
+                            if pm in {"rmse", "mae", "mse", "log_loss"}:
+                                sort_ascending = True
+                            break
+
+                # Fallback: goal-aware priority (same logic as champion_selector)
+                if not target_metric:
+                    recall_priority = ["recall", "f1", "roc_auc", "roc-auc", "pr_auc", "pr-auc", "accuracy"]
+                    default_priority = ["roc_auc", "roc-auc", "pr_auc", "pr-auc", "f1", "recall", "accuracy"]
+                    # We don't have goal_text here, so use default priority
+                    for cand in default_priority:
+                        found_col = next((c for c in mc.columns if _norm_metric_key(c) == cand), None)
+                        if found_col:
+                            target_metric = found_col
+                            sort_ascending = False
+                            break
 
                 if not target_metric:
                     for m_candidate in ["RMSE", "rmse", "MAE", "mae", "MSE", "mse"]:
@@ -522,23 +615,6 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
         except Exception as e:
             verified["best_params_error"] = f"Failed to parse best_params.json: {str(e)}"
 
-    # 4d. Model Registry & Champion Pointer
-    reg_path = run_path / "model_registry.json"
-    if reg_path.exists() and reg_path.is_file():
-        try:
-            with open(reg_path, "r", encoding="utf-8", errors="replace") as f:
-                verified["model_registry"] = json.load(f)
-        except Exception as e:
-            verified["model_registry_error"] = f"Failed to parse model_registry.json: {str(e)}"
-
-    champ_path = run_path / "champion_model.json"
-    if champ_path.exists() and champ_path.is_file():
-        try:
-            with open(champ_path, "r", encoding="utf-8", errors="replace") as f:
-                verified["champion_model"] = json.load(f)
-        except Exception as e:
-            verified["champion_model_error"] = f"Failed to parse champion_model.json: {str(e)}"
-
     # 5. Feature Importance (feature_importance.csv)
     fi_path = run_path / "feature_importance.csv"
     if fi_path.exists() and fi_path.is_file():
@@ -592,8 +668,17 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
             preds_df = pd.read_csv(pred_path)
             total_preds = int(len(preds_df))
             pred_summary: Dict[str, Any] = {"total_predictions": total_preds}
-            pred_col = next((c for c in preds_df.columns if "pred" in c.lower() or "target" in c.lower() or "label" in c.lower()), None)
-            if pred_col:
+            # Find the discrete prediction class column (exclude probabilities, scores, raw outputs, and ground-truth labels)
+            pred_candidates = [
+                c for c in preds_df.columns
+                if ("pred" in c.lower() or "target" in c.lower() or "label" in c.lower())
+                and not any(p in c.lower() for p in ["prob", "score", "raw", "true", "actual"])
+            ]
+            if not pred_candidates:
+                pred_candidates = [c for c in preds_df.columns if c.lower() in ["predicted", "pred", "y_pred", "prediction"]]
+
+            pred_col = pred_candidates[0] if pred_candidates else None
+            if pred_col and preds_df[pred_col].nunique() <= 20:
                 vc = preds_df[pred_col].value_counts()
                 pred_summary["class_distribution"] = {str(k): int(v) for k, v in vc.items()}
                 if len(vc) == 2:
@@ -601,6 +686,16 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
                     pos_class = vc.index[1] if 1 in vc.index else vc.index[0]
                     pred_summary["positive_class_count"] = int(vc[pos_class])
                     pred_summary["positive_class_pct"] = round(float(vc[pos_class] / total_preds * 100), 2)
+            elif pred_col and pd.api.types.is_numeric_dtype(preds_df[pred_col]):
+                # Continuous prediction (e.g. regression)
+                series = pd.to_numeric(preds_df[pred_col], errors="coerce").dropna()
+                if len(series) > 0:
+                    pred_summary["continuous_stats"] = {
+                        "min": round(float(series.min()), 4),
+                        "max": round(float(series.max()), 4),
+                        "mean": round(float(series.mean()), 4),
+                        "median": round(float(series.median()), 4),
+                    }
             verified["predictions_summary"] = pred_summary
         except Exception as e:
             verified["predictions_summary_error"] = f"Failed to parse predictions.csv: {str(e)}"
@@ -667,8 +762,16 @@ def build_verified_metrics(run_dir: str = ".", uploaded_files: Optional[List[str
             seg_df = pd.read_csv(target_csv)
             seg_source = target_csv.name
         if seg_df is not None:
+            dataset_type = None
+            manifest_p = run_path / "run_manifest.json"
+            if manifest_p.exists():
+                try:
+                    with open(manifest_p, "r", encoding="utf-8") as mf:
+                        dataset_type = _json.load(mf).get("dataset_type")
+                except Exception:
+                    pass
             declared = declared_target_column(run_path)
-            seg_stats = compute_segment_stats(seg_df, declared_target=declared)
+            seg_stats = compute_segment_stats(seg_df, declared_target=declared, dataset_type=dataset_type)
             if seg_stats is not None:
                 seg_stats["source_file"] = seg_source
                 # Merge named segments from the raw uploads: the run-dir datasets are

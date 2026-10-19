@@ -90,6 +90,79 @@ def build_facts(
         if v is not None:
             facts[dst] = _fmt_pct(v)
 
+    # --- Unsupervised result metrics (from the run's explicit metric artifact) --
+    unsup_artifact = vm.get("unsupervised_metrics_artifact") or {}
+    unsup = unsup_artifact.get("content") or {}
+    if isinstance(unsup, dict):
+        if unsup.get("task_type"):
+            facts["unsupervised_task_type"] = str(unsup["task_type"])
+        selected = unsup.get("selected_result") or {}
+        if isinstance(selected, dict):
+            method = selected.get("algorithm") or selected.get("method") or selected.get("name")
+            if method:
+                facts["unsupervised_selected_method"] = str(method)
+            metrics = selected.get("metrics") or {}
+            if isinstance(metrics, dict):
+                percent_metrics = {"pr_auc", "roc_auc", "precision_at_k", "flagged_rate", "noise_share", "explained_variance_ratio"}
+                fact_keys = {
+                    "silhouette": "unsupervised_silhouette",
+                    "silhouette_score": "unsupervised_silhouette",
+                    "davies_bouldin": "unsupervised_davies_bouldin",
+                    "davies_bouldin_score": "unsupervised_davies_bouldin",
+                    "calinski_harabasz": "unsupervised_calinski_harabasz",
+                    "calinski_harabasz_score": "unsupervised_calinski_harabasz",
+                    "n_clusters": "unsupervised_cluster_count",
+                    "stability_ari": "unsupervised_stability_ari",
+                    "stability_score": "unsupervised_stability",
+                    "adjusted_rand_index": "unsupervised_ari",
+                    "ari": "unsupervised_ari",
+                    "normalized_mutual_info": "unsupervised_nmi",
+                    "nmi": "unsupervised_nmi",
+                    "explained_variance_ratio": "unsupervised_explained_variance",
+                    "trustworthiness": "unsupervised_trustworthiness",
+                    "reconstruction_error": "unsupervised_reconstruction_error",
+                    "pr_auc": "unsupervised_pr_auc",
+                    "roc_auc": "unsupervised_roc_auc",
+                    "precision_at_k": "unsupervised_precision_at_k",
+                    "flagged_rate": "unsupervised_flagged_rate",
+                    "noise_share": "unsupervised_noise_share",
+                    "cluster_count": "unsupervised_cluster_count",
+                }
+                for metric, fact_key in fact_keys.items():
+                    value = metrics.get(metric)
+                    if value is None or fact_key in facts:
+                        continue
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if metric in percent_metrics and 0 <= numeric <= 1:
+                        facts[fact_key] = _fmt_pct(numeric)
+                    elif metric == "cluster_count":
+                        facts[fact_key] = str(int(numeric))
+                    else:
+                        facts[fact_key] = _fmt_num(numeric)
+
+    assignment_path = os.path.join(output_dir, "cluster_assignments.csv")
+    if os.path.isfile(assignment_path):
+        try:
+            import pandas as pd
+            assignments = pd.read_csv(assignment_path)
+            cluster_col = next((c for c in ("cluster", "cluster_label", "cluster_id") if c in assignments.columns), None)
+            if cluster_col:
+                counts = assignments[cluster_col].value_counts(dropna=False)
+                cluster_sizes = []
+                for label, count in counts.items():
+                    try:
+                        is_noise = float(label) == -1
+                    except (TypeError, ValueError):
+                        is_noise = False
+                    display_label = "Noise" if is_noise else f"Cluster {label}"
+                    cluster_sizes.append(f"{display_label}: {int(count)}")
+                facts["unsupervised_cluster_sizes"] = "; ".join(cluster_sizes)
+        except Exception as exc:
+            print(f"[FactSheet] cluster assignment parse error: {exc}")
+
     # --- Confusion matrix (recomputed ground truth preferred) --------------------
     cm = vm.get("confusion_matrix") or {}
     tp, fp, fn, tn = (cm.get(k) for k in ("true_positives", "false_positives", "false_negatives", "true_negatives"))

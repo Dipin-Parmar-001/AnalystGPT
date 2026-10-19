@@ -11,8 +11,8 @@ never replaces — the deterministic gates.
 
 Guardrails so the judge cannot introduce new hallucinations:
 1. Temperature 0 and a JSON-only output contract.
-2. Robust JSON extraction + strict schema validation; one strict retry on an
-   unparsable response, after which the orchestrator emits a visible
+2. Robust JSON extraction; local NVIDIA/OpenRouter/Gemini fallback on
+   provider failures or malformed output, after which the orchestrator emits a visible
    `judge_failed` finding (the run is never silently left unjudged).
 3. Anti-fabrication filter: every returned claim's `quote` must appear verbatim
    (whitespace-normalized) in the report. Claims quoting text absent from the
@@ -31,6 +31,56 @@ from openai import OpenAI
 
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.prompts import CONSISTENCY_JUDGE_SYSTEM_PROMPT
+from agents.router import create_local_router
+
+
+def is_fragmented_or_unparsable_response(message: Any) -> bool:
+    """
+    Detect if the LLM response is fragmented, unparsable, or contains only
+    token usage metadata instead of actual content.
+
+    Returns True if the response should be retried.
+    """
+    if message is None:
+        return True
+
+    # Check if content is None or empty
+    content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        # If no content and no tool calls, it's likely an incomplete response
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+    # Check if content looks like token usage metadata (JSON with token fields)
+    if isinstance(content, str):
+        content_stripped = content.strip()
+        # Check for the specific token usage metadata pattern
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                # Check for token usage metadata keys
+                token_keys = {"completion_tokens", "prompt_tokens", "total_tokens",
+                             "completion_tokens_details", "prompt_tokens_details",
+                             "cost", "is_byok", "cost_details"}
+                if isinstance(parsed, dict) and token_keys.intersection(parsed.keys()):
+                    # This is token usage metadata, not actual content
+                    return True
+            except json.JSONDecodeError:
+                pass
+
+        # Check for other common fragmented response patterns
+        # e.g., empty object, just whitespace, or clearly incomplete
+        if content_stripped in ["{}", "[]", "null", ""]:
+            return True
+
+    # Check finish_reason if available (some providers include this in message)
+    finish_reason = getattr(message, "finish_reason", None)
+    if finish_reason in ["length", "content_filter", "function_call"]:
+        # These might indicate incomplete responses
+        pass
+
+    return False
 
 try:
     import logfire
@@ -39,10 +89,7 @@ except ImportError:
 
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
-
-
+FALLBACK_STATUS_CODES = {400, 402, 404, 412, 429, 500, 502, 503, 504}
 @dataclass
 class JudgedClaim:
     quote: str
@@ -82,51 +129,41 @@ def _normalize_ws(s: str) -> str:
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Extracts the first JSON object from an LLM response (fenced or bare).
-
-    Handles:
-    - Markdown fenced code blocks (```json ... ```)
-    - Bare JSON objects
-    - Multiple JSON objects (returns the first valid one with expected keys)
-    - Partial/truncated JSON (attempts to repair)
-    """
+    """Extract the final JSON answer, ignoring preceding analysis or markdown."""
     if not text:
         return None
 
     # Strategy 1: Markdown fenced code block
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence:
-        try:
-            obj = json.loads(fence.group(1))
-            if isinstance(obj, dict) and ("claims" in obj or "overall_assessment" in obj):
-                return obj
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 2: Find all balanced JSON objects in the text
-    candidates = []
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    candidates.append(text[start:i + 1])
-                    break
-        start = text.find("{", start + 1)
-
-    # Strategy 3: Try to find JSON-like content and repair common issues
-    if not candidates:
-        # Look for content that looks like our expected schema
-        json_like = re.search(r'\{.*?"claims".*?\}', text, re.DOTALL)
-        if json_like:
-            candidates.append(json_like.group(0))
-
-    # Validate candidates
-    for cand in candidates:
+    candidates = [fence.group(1)] if fence else []
+    # Gather every balanced object (respecting braces inside JSON strings),
+    # then prefer the last one because reasoning commonly precedes the answer.
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start:i + 1])
+                start = None
+    ordered = candidates[:1] + list(reversed(candidates[1:])) if fence else list(reversed(candidates))
+    for cand in ordered:
         try:
             obj = json.loads(cand)
             if isinstance(obj, dict):
@@ -173,6 +210,7 @@ def _repair_json(text: str) -> Optional[str]:
 VALID_VERDICTS = {"contradicted", "unverifiable", "supported"}
 VALID_SEVERITIES = {"critical", "minor"}
 MAX_CLAIMS = 20
+MAX_RETRIES = 3
 
 
 class ConsistencyJudge:
@@ -180,52 +218,62 @@ class ConsistencyJudge:
 
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: Optional[str] = None,
         client: Optional[OpenAI] = None,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
         setup_logfire()
-
+        self.routes = []
         if client is not None:
-            self.client = client
+            self.routes.append({"provider": "injected", "model": model_name or "injected", "client": client})
         else:
-            headers = {"x-portkey-api-key": PORTKEY_API_KEY}
-            if PORTKEY_CONFIG_ID:
-                headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-            else:
-                headers["x-portkey-config"] = json.dumps({
-                    "strategy": {"mode": "fallback", "on_status_codes": [429, 500, 502, 503, 504]},
-                    "targets": [
-                        {"virtual_key": "analystgpt-openrouter",
-                         "override_params": {"model": "nemotron-3-ultra-550b-a55b", "temperature": 0, "max_tokens": 2000}},
-                        {"virtual_key": "analystgpt-gemini",
-                         "override_params": {"model": "gemini-2.5-flash", "temperature": 0, "max_tokens": 2000}},
-                    ],
-                })
-            self.client = OpenAI(
-                base_url="https://api.portkey.ai/v1",
-                api_key=PORTKEY_API_KEY,
-                default_headers=headers,
-            )
+            local_client = create_local_router("ConsistencyJudge")
+            self.routes.append({"provider": "local", "model": model_name or "nvidia/nemotron-3-super-120b-a12b",
+                                "client": local_client})
 
-        self.model_name = model_name
-
-        # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
-        instrument_openai_client(self.client, agent_name="ConsistencyJudge")
+        for route in self.routes:
+            instrument_openai_client(route["client"], agent_name="ConsistencyJudge")
+        self.client = self.routes[0]["client"]
+        self.model_name = model_name or self.routes[0]["model"]
+        self._next_route_index = 0
 
     def _call_llm(self, user_content: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-            max_tokens=2000,
-        )
-        return response.choices[0].message.content or ""
+        routes = getattr(self, "routes", None) or [{
+            "provider": "injected",
+            "model": getattr(self, "model_name", "injected"),
+            "client": self.client,
+        }]
+        errors = []
+        route_count = len(routes)
+        start_index = getattr(self, "_next_route_index", 0) % route_count
+        for offset in range(route_count):
+            index = (start_index + offset) % route_count
+            route = routes[index]
+            try:
+                response = route["client"].chat.completions.create(
+                    model=route["model"],
+                    messages=[
+                        {"role": "system", "content": CONSISTENCY_JUDGE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.1,
+                )
+                message = response.choices[0].message
+                content = getattr(message, "content", None)
+                parsed = None if is_fragmented_or_unparsable_response(message) else _extract_json_object(content or "")
+                if parsed is None or not isinstance(parsed.get("claims"), list):
+                    errors.append(f"{route['provider']}:{route['model']} returned no valid JSON object")
+                    continue
+                # Normalize to JSON only; discard analysis, markdown, and any
+                # provider-specific reasoning text surrounding the answer.
+                self._next_route_index = (index + 1) % route_count
+                return json.dumps(parsed, ensure_ascii=False)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                detail = f"HTTP {status}" if status in FALLBACK_STATUS_CODES else f"request failed ({exc})"
+                errors.append(f"{route['provider']}:{route['model']} {detail}")
+        self._next_route_index = (start_index + 1) % route_count
+        raise RuntimeError("All consistency-judge routes failed: " + "; ".join(errors))
 
     def judge_report(
         self,
@@ -274,44 +322,105 @@ class ConsistencyJudge:
             "Audit the report now. Output ONLY the JSON object defined in your instructions."
         )
 
-        try:
-            raw = self._call_llm("\n\n".join(user_parts))
-        except Exception as e:
-            if HAS_LOGFIRE:
-                logfire.warn("ConsistencyJudge LLM call failed; proceeding without judge findings", error=str(e))
-            return JudgeResult(parse_ok=False, error=f"LLM call failed: {e}")
+        # Retry logic for LLM call (handles both call failures and unparsable responses)
+        max_retries = MAX_RETRIES
+        last_error = None
 
-        # Log raw response for debugging
-        if HAS_LOGFIRE:
-            logfire.debug("ConsistencyJudge raw response", response_preview=raw[:500])
-
-        parsed = _extract_json_object(raw)
-        if parsed is None:
-            # One strict retry: an unparsable judge response must not silently
-            # zero out the entire prose-verification layer.
-            repair_suffix = (
-                "\n\nYour previous response was not parsable as JSON. Respond AGAIN with "
-                "ONLY the raw JSON object with keys 'overall_assessment' and 'claims' — "
-                "no prose, no markdown fences, no commentary. Output MUST start with { and end with }."
-            )
+        for attempt in range(max_retries + 1):
             try:
-                raw = self._call_llm("\n\n".join(user_parts) + repair_suffix)
+                if attempt == 0:
+                    raw = self._call_llm("\n\n".join(user_parts))
+                else:
+                    # Retry with repair suffix
+                    repair_suffix = (
+                        f"\n\nYour previous response was not parsable as JSON (attempt {attempt}/{max_retries}). "
+                        "Respond AGAIN with ONLY the raw JSON object with keys 'overall_assessment' and 'claims' — "
+                        "no prose, no markdown fences, no commentary."
+                    )
+                    raw = self._call_llm("\n\n".join(user_parts) + repair_suffix)
+
+                # Log the raw response for debugging
+                if HAS_LOGFIRE:
+                    logfire.info(
+                        f"ConsistencyJudge LLM response received (attempt {attempt + 1}/{max_retries + 1})",
+                        raw_length=len(raw) if raw else 0,
+                        raw_preview=raw[:500] if raw else "EMPTY"
+                    )
+                else:
+                    print(f"[ConsistencyJudge] LLM response received (attempt {attempt + 1}/{max_retries + 1}), length: {len(raw) if raw else 0}")
+                    print(f"[ConsistencyJudge] Raw preview: {raw[:500] if raw else 'EMPTY'}")
+
+                parsed = _extract_json_object(raw)
+                if parsed is not None:
+                    # Successfully parsed
+                    if HAS_LOGFIRE:
+                        logfire.info(
+                            f"ConsistencyJudge JSON parsed successfully (attempt {attempt + 1})",
+                            claims_count=len(parsed.get("claims", [])),
+                            overall_assessment=parsed.get("overall_assessment", "")[:100]
+                        )
+                    else:
+                        print(f"[ConsistencyJudge] JSON parsed successfully (attempt {attempt + 1})")
+                        print(f"[ConsistencyJudge] Claims count: {len(parsed.get('claims', []))}")
+                    break
+                else:
+                    # Failed to parse JSON
+                    last_error = "unparsable_json"
+                    if HAS_LOGFIRE:
+                        logfire.warn(
+                            f"ConsistencyJudge returned unparsable JSON (attempt {attempt + 1}/{max_retries + 1})",
+                            raw_preview=raw[:500] if raw else "EMPTY"
+                        )
+                    else:
+                        print(f"[ConsistencyJudge] WARNING: Unparsable JSON (attempt {attempt + 1}/{max_retries + 1})")
+                        print(f"[ConsistencyJudge] Raw preview: {raw[:500] if raw else 'EMPTY'}")
+
+                    if attempt == max_retries:
+                        # All retries exhausted
+                        if HAS_LOGFIRE:
+                            logfire.error(
+                                "ConsistencyJudge failed after all retries - returning not verified",
+                                total_attempts=max_retries + 1,
+                                error=last_error,
+                                raw_response=raw[:2000] if raw else "EMPTY"
+                            )
+                        else:
+                            print(f"[ConsistencyJudge] ERROR: Failed after {max_retries + 1} attempts - returning not verified")
+                        return JudgeResult(
+                            parse_ok=False,
+                            raw_response=raw[:2000] if raw else "",
+                            error=f"unparsable_json (after {max_retries} retries)"
+                        )
+                    # Continue to next retry
+                    continue
+
             except Exception as e:
+                last_error = str(e)
                 if HAS_LOGFIRE:
-                    logfire.warn("ConsistencyJudge retry LLM call failed", error=str(e))
-                return JudgeResult(parse_ok=False, raw_response=raw[:2000],
-                                   error=f"unparsable_json (retry LLM call failed: {e})")
+                    logfire.warn(
+                        f"ConsistencyJudge LLM call failed (attempt {attempt + 1}/{max_retries + 1})",
+                        error=str(e)
+                    )
+                else:
+                    print(f"[ConsistencyJudge] LLM call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
 
-            if HAS_LOGFIRE:
-                logfire.debug("ConsistencyJudge retry raw response", response_preview=raw[:500])
-
-            parsed = _extract_json_object(raw)
-            if parsed is None:
-                if HAS_LOGFIRE:
-                    logfire.warn("ConsistencyJudge returned unparsable output after one retry; ignoring judge findings",
-                                 raw_response=raw[:1000])
-                return JudgeResult(parse_ok=False, raw_response=raw[:2000],
-                                   error="unparsable_json (after 1 retry)")
+                if attempt == max_retries:
+                    # All retries exhausted
+                    if HAS_LOGFIRE:
+                        logfire.error(
+                            "ConsistencyJudge LLM call failed after all retries - returning not verified",
+                            total_attempts=max_retries + 1,
+                            error=last_error
+                        )
+                    else:
+                        print(f"[ConsistencyJudge] ERROR: LLM call failed after {max_retries + 1} attempts - returning not verified")
+                    return JudgeResult(
+                        parse_ok=False,
+                        raw_response="",
+                        error=f"LLM call failed after {max_retries} retries: {last_error}"
+                    )
+                # Continue to next retry
+                continue
 
         norm_report = _normalize_ws(report_text)
         claims: List[JudgedClaim] = []
@@ -377,4 +486,4 @@ def judge_result_to_findings(result: JudgeResult) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    print("ConsistencyJudge module — requires PORTKEY_API_KEY to run.")
+    print("ConsistencyJudge module — configure GEMINI_API_KEY and/or OPENROUTER_API_KEY to run.")

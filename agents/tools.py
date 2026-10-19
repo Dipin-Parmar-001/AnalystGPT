@@ -16,6 +16,9 @@ from agents.fallback_parser import (
     unwrap_envelope,
     SyntheticToolCall,
     SyntheticFunction,
+    repair_json_escapes,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
 )
 
 try:
@@ -34,5 +37,8 @@ __all__ = [
     "unwrap_envelope",
     "SyntheticToolCall",
     "SyntheticFunction",
+    "repair_json_escapes",
+    "parse_and_clean_tool_args",
+    "validate_or_retry_tool_calls",
 ]
 

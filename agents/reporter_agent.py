@@ -11,10 +11,91 @@ import os
 import sys
 import json
 import re
+import uuid
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
-from openai import OpenAI
 from agents.logger import setup_logfire, HAS_LOGFIRE
+from agents.tools import validate_or_retry_tool_calls, parse_and_clean_tool_args
+
+
+def is_fragmented_or_unparsable_response(message: Any) -> bool:
+    """
+    Detect if the LLM response is fragmented, unparsable, or contains only
+    token usage metadata instead of actual content.
+
+    Returns True if the response should be retried.
+    """
+    if message is None:
+        return True
+
+    # Check if content is None or empty
+    content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        # If no content and no tool calls, it's likely an incomplete response
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+    # Check if content looks like token usage metadata (JSON with token fields)
+    if isinstance(content, str):
+        content_stripped = content.strip()
+        # Check for the specific token usage metadata pattern
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                # Check for token usage metadata keys
+                token_keys = {"completion_tokens", "prompt_tokens", "total_tokens",
+                             "completion_tokens_details", "prompt_tokens_details",
+                             "cost", "is_byok", "cost_details"}
+                if isinstance(parsed, dict) and token_keys.intersection(parsed.keys()):
+                    # This is token usage metadata, not actual content
+                    return True
+            except json.JSONDecodeError:
+                pass
+
+        # Check for other common fragmented response patterns
+        # e.g., empty object, just whitespace, or clearly incomplete
+        if content_stripped in ["{}", "[]", "null", ""]:
+            return True
+
+    # Check finish_reason if available (some providers include this in message)
+    finish_reason = getattr(message, "finish_reason", None)
+    if finish_reason in ["length", "content_filter", "function_call"]:
+        # These might indicate incomplete responses
+        pass
+
+    return False
+
+
+def clean_thinking_sentences(report_text: str) -> str:
+    """
+    Deterministically cleans internal thinking sentences, conversational self-corrections,
+    and deliberation phrases leaked into the generated report text.
+    """
+    if not report_text or not isinstance(report_text, str):
+        return report_text
+
+    cleaned = report_text
+
+    # 1. Clean parenthesized internal monologue containing thinking triggers
+    thinking_paren_pattern = re.compile(
+        r"\s*\([^)]*?\b(?:Wait\s*—|Wait\s*,|Let me check|Let's see|Let me see|Actually\s*,?\s*looking|Actually\s*,?\s*the FACT_SHEET)[^)]*?\)",
+        flags=re.IGNORECASE,
+    )
+    cleaned = thinking_paren_pattern.sub("", cleaned)
+
+    # 2. Clean standalone sentences beginning with thinking/deliberation markers
+    thinking_sentence_pattern = re.compile(
+        r"(?:(?<=\.\s)|(?<=\n)|^)[ \t]*(?:Wait\s*—|Wait\s*,|Let me check\b|Let's see\b|Let me see\b|Thinking:\s*)[^\n\.]*?(?:\.|\n|$)",
+        flags=re.IGNORECASE,
+    )
+    cleaned = thinking_sentence_pattern.sub("", cleaned)
+
+    # Clean up leftover double periods or orphan spaces
+    cleaned = re.sub(r"\.\s*\.", ".", cleaned)
+    cleaned = re.sub(r"[ \t]+(?=\n|$)", "", cleaned)
+
+    return cleaned
 
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
@@ -25,12 +106,14 @@ if sys.stdout.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC, build_verified_metrics
 from agents.prompts import REPORTER_AGENT, REPORTER_SYSTEM_PROMPT, REPORT_REPAIR_PROMPT, resolve_budget_placeholders
 from agents.memory_manager import MessageHistoryManager, sanitize_messages, convert_to_plain_chat
+from agents.portkey_routing import create_with_thinking_route, extract_reasoning_text
 from agents.planner_agent import ExecutionPlan
-from agents.cancellation import CancellationToken, WorkflowCancelledException
+from agents.cancellation import CancellationToken, WorkflowCancelledException, WorkflowPausedException
 from agents.numeric_verifier import verify_report_numbers, attach_verification_warning
 from agents.fact_sheet import fill_blanks, extract_blanks, replace_unresolved_blanks
 
@@ -43,49 +126,7 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 2500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 2500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 2500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 2500
-            }
-        }
-    ]
-}
 
 
 class ReporterAgent:
@@ -96,52 +137,23 @@ class ReporterAgent:
 
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 10,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 1000,
-        max_tokens_before_compact: int = 4000,
+        max_tokens_before_compact: int = 100000,
+        enable_numeric_verifier: bool = False,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
+        self.enable_numeric_verifier = enable_numeric_verifier
         setup_logfire()
-
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
-        if PORTKEY_CONFIG_ID:
-            if HAS_LOGFIRE:
-                logfire.info("ReporterAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[ReporterAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("[ReporterAgent Setup] PORTKEY_CONFIG_ID not found. Using fallback config.")
-            else:
-                print("[ReporterAgent Setup] WARNING: PORTKEY_CONFIG_ID not found. Using fallback config.")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
-
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
-
-        if HAS_LOGFIRE:
-            try:
-                logfire.instrument_openai(self.client)
-            except Exception as e:
-                logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
+        self.client = create_local_router("ReporterAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
         instrument_openai_client(self.client, agent_name="ReporterAgent")
 
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
         self.agent_name = "ReporterAgent"
@@ -186,12 +198,25 @@ class ReporterAgent:
 
         def _do_call():
             delays = [10, 20, 30]
+            last_err = None
             for attempt, delay in enumerate(delays + [0]):
                 try:
-                    response = self.client.chat.completions.create(**kwargs)
+                    response = create_with_thinking_route(self.client, **kwargs)
                     message = response.choices[0].message
+
+                    # Check for fragmented or unparsable response (token usage metadata, etc.)
+                    if is_fragmented_or_unparsable_response(message):
+                        if HAS_LOGFIRE:
+                            logfire.warn("Detected fragmented/unparsable LLM response (token metadata only), retrying...",
+                                         content_snippet=str(getattr(message, "content", None))[:200])
+                        else:
+                            print(f"[ReporterAgent] Detected fragmented/unparsable LLM response, retrying...")
+                        # Treat as an error to trigger retry
+                        raise RuntimeError("Fragmented or unparsable LLM response received (token metadata only)")
+
                     return message
                 except Exception as err:
+                    last_err = err
                     err_str = str(err).lower()
                     # Provider rejected the OpenAI tool-calling message schema (e.g. Gemini:
                     # "Role 'function' is not supported") - retry with plain user/assistant
@@ -206,7 +231,7 @@ class ReporterAgent:
                     )
                     if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool message schema in ReporterAgent. Retrying with plain chat format (tools preserved).", error=str(err))
+                            logfire.warn("Provider rejected tool message schema in ReporterAgent. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
                             print(f"[ReporterAgent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
 
@@ -219,7 +244,7 @@ class ReporterAgent:
                         if effective_tools:
                             fallback_kwargs["tools"] = effective_tools
                         try:
-                            fallback_resp = self.client.chat.completions.create(**fallback_kwargs)
+                            fallback_resp = create_with_thinking_route(self.client, **fallback_kwargs)
                             self._plain_chat_mode = True
                             return fallback_resp.choices[0].message
                         except Exception as fallback_err:
@@ -237,8 +262,8 @@ class ReporterAgent:
                         continue
 
                 if HAS_LOGFIRE:
-                    logfire.error("ReporterAgent LLM request failed", error=str(err))
-                raise RuntimeError(f"ReporterAgent LLM call failed: {err}") from err
+                    logfire.error("ReporterAgent LLM request failed", error=str(last_err))
+                raise RuntimeError(f"ReporterAgent LLM call failed: {last_err}") from last_err
 
         if HAS_LOGFIRE:
             with logfire.span("ReporterAgent LLM Call", model=self.model_name):
@@ -329,7 +354,17 @@ class ReporterAgent:
         # 1. Authoritative Ground Truth Verified Metrics
         if verified_metrics:
             verified_str = json.dumps(verified_metrics, indent=2, default=str)
+            if len(verified_str) > 200_000:
+                safe_vm = {k: v for k, v in verified_metrics.items() if k not in ("predictions_summary", "numeric_stats")}
+                verified_str = json.dumps(safe_vm, indent=2, default=str)[:200_000]
             user_content_parts.append(f"=== VERIFIED_METRICS (GROUND TRUTH — COMPUTED DIRECTLY FROM ARTIFACTS) ===\n{verified_str}\n")
+            unsupervised_artifact = verified_metrics.get("unsupervised_metrics_artifact")
+            if isinstance(unsupervised_artifact, dict):
+                user_content_parts.append(
+                    "=== UNSUPERVISED_METRICS_ARTIFACT (values produced by executed ML code; "
+                    "not independently recomputed by the host) ===\n"
+                    f"{json.dumps(unsupervised_artifact, indent=2, default=str)}\n"
+                )
 
         # 1b. Fact Sheet: the ONLY source the report's {{blank}} tokens may reference.
         # Values are pre-formatted by code; the reporter never types or converts numbers.
@@ -385,9 +420,11 @@ class ReporterAgent:
             f"2. You have a budget of up to {effective_max_calls} tool calls. You are not forced to execute only 1 call, but you should combine related checks efficiently.\n"
             "3. STRICT GROUNDING: Every numeric value you write in the report MUST come from `VERIFIED_METRICS` verbatim. Do not compute, round, or estimate any number yourself. If a number the report needs isn't present in `VERIFIED_METRICS`, write \"not verified in current run\" instead of guessing.\n"
             "4. On contradiction: `VERIFIED_METRICS` is authoritative. Note any upstream discrepancies in Operational Caveats.\n"
-            "5. DELIVERABLE: The report itself must be CREATED VIA A TOOL CALL. Use `execute_python` to write the complete markdown report to a file named exactly `final_report.md` (write the whole report in ONE call), e.g.:\n"
+            "5. DELIVERABLE: The report itself must be CREATED VIA A TOOL CALL. Use `execute_python` to write the complete markdown report to `final_report.md` and also save the identical contents to `reporter_final_report_delivery.md` in the SAME call. The delivery copy is required so the report is returned even if `final_report.md` was created earlier as an empty placeholder. Write the whole report in ONE call, e.g.:\n"
             "   report = \"\"\"<complete markdown report>\"\"\"\n"
             "   with open(\"final_report.md\", \"w\", encoding=\"utf-8\") as f:\n"
+            "       f.write(report)\n"
+            "   with open(\"reporter_final_report_delivery.md\", \"w\", encoding=\"utf-8\") as f:\n"
             "       f.write(report)\n"
             "   Your chat response does NOT save the report — only the `final_report.md` file written via the tool is the deliverable.\n"
             "6. Generate the complete executive markdown report following the required structure."
@@ -419,11 +456,27 @@ class ReporterAgent:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn}")
 
-            thought = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            assistant_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=assistant_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+                step_callback=_safe_callback,
+            )
 
-            if thought:
-                _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn, "thought": thought})
+            thought = assistant_msg.content or ""
+            reasoning = extract_reasoning_text(assistant_msg)
+
+            if thought or reasoning:
+                _safe_callback("llm_thought", {
+                    "agent": self.agent_name,
+                    "turn": turn,
+                    "thought": thought,
+                    "reasoning": reasoning,
+                })
 
             msg_dict: Dict[str, Any] = {"role": "assistant"}
             if assistant_msg.content:
@@ -536,18 +589,24 @@ class ReporterAgent:
         # a brief confirmation and is not persisted anywhere.
         # ==============================================================================
         report_filepath = os.path.join(output_dir, "final_report.md")
-        if os.path.exists(report_filepath):
+        delivery_filepath = os.path.join(output_dir, "reporter_final_report_delivery.md")
+        # Prefer the unique delivery artifact exported by the sandbox. A short
+        # assistant confirmation must never replace the report created in code.
+        for candidate_path in (delivery_filepath, report_filepath):
             try:
-                with open(report_filepath, "r", encoding="utf-8") as rf:
+                if not os.path.exists(candidate_path):
+                    continue
+                with open(candidate_path, "r", encoding="utf-8") as rf:
                     file_report = rf.read()
-                if file_report and file_report.strip() and len(file_report.strip()) >= len(final_report.strip()):
+                if file_report and file_report.strip() and (candidate_path == delivery_filepath or len(file_report.strip()) >= len(final_report.strip())):
                     if HAS_LOGFIRE:
-                        logfire.info("ReporterAgent retrieved final report from saved artifact", path=report_filepath, length=len(file_report))
+                        logfire.info("ReporterAgent retrieved final report from saved artifact", path=candidate_path, length=len(file_report))
                     else:
-                        print(f"[ReporterAgent] Retrieved final report from saved artifact: {report_filepath} ({len(file_report)} chars)")
-                    final_report = file_report
+                        print(f"[ReporterAgent] Retrieved final report from saved artifact: {candidate_path} ({len(file_report)} chars)")
+                    final_report = clean_thinking_sentences(file_report)
+                    break
             except Exception as read_err:
-                print(f"[ReporterAgent Warning] Could not read {report_filepath}: {read_err}. Falling back to LLM response.")
+                print(f"[ReporterAgent Warning] Could not read {candidate_path}: {read_err}.")
 
         # ==============================================================================
         # BLANK FILLING: substitute {{fact_sheet_key}} tokens with code-formatted values.
@@ -581,7 +640,7 @@ class ReporterAgent:
                         final_report = repaired_report
                         memory_manager.append_assistant({"role": "assistant", "content": final_report})
                         fill = fill_blanks(final_report, fact_sheet)
-                except WorkflowCancelledException:
+                except (WorkflowCancelledException, WorkflowPausedException):
                     raise
                 except Exception as blank_err:
                     print(f"[ReporterAgent Warning] blank repair turn failed: {blank_err}")
@@ -592,12 +651,13 @@ class ReporterAgent:
                     final_report = fill["report"]
             else:
                 final_report = fill["report"]
+        final_report = clean_thinking_sentences(final_report)
 
         # ==============================================================================
         # POST-GENERATION DETERMINISTIC NUMERIC VERIFICATION & CORRECTION LOOP
         # ==============================================================================
         self.last_verification_result = None
-        if final_report and verified_metrics:
+        if False and self.enable_numeric_verifier and final_report and verified_metrics:
             _safe_callback("verification_loop_started", {
                 "agent": self.agent_name,
                 "report_length": len(final_report)
@@ -681,21 +741,18 @@ class ReporterAgent:
                 "correction_turns_used": correction_turn
             })
 
-        # Keep the saved artifact in sync with the returned report: verification
-        # corrections or the warning banner may have modified the text after the
-        # tool call wrote final_report.md.
+        # Keep both report artifacts in sync with the returned report. The
+        # delivery copy also ensures later reads see updates to a known sandbox
+        # file even when the sandbox only exports newly created filenames.
         try:
             if final_report:
-                existing_content = ""
-                if os.path.exists(report_filepath):
-                    with open(report_filepath, "r", encoding="utf-8") as rf:
-                        existing_content = rf.read()
-                if existing_content != final_report:
-                    os.makedirs(output_dir, exist_ok=True)
-                    with open(report_filepath, "w", encoding="utf-8") as rf:
+                final_report = clean_thinking_sentences(final_report)
+                os.makedirs(output_dir, exist_ok=True)
+                for artifact_path in (report_filepath, delivery_filepath):
+                    with open(artifact_path, "w", encoding="utf-8") as rf:
                         rf.write(final_report)
-                    if HAS_LOGFIRE:
-                        logfire.info("ReporterAgent synced final_report.md with final report", path=report_filepath)
+                if HAS_LOGFIRE:
+                    logfire.info("ReporterAgent synced report artifacts", path=report_filepath, delivery_path=delivery_filepath)
         except Exception as sync_err:
             print(f"[ReporterAgent Warning] Failed to sync final_report.md: {sync_err}")
 
@@ -741,6 +798,7 @@ class ReporterAgent:
         profile_block: str = "",
         max_tool_calls: int = 5,
         cancellation_token: Optional[CancellationToken] = None,
+        step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> str:
         """
         Post-report repair pass: given the current report and the COMBINED findings
@@ -757,11 +815,19 @@ class ReporterAgent:
         if cancellation_token:
             cancellation_token.check_cancelled(step_name="ReporterAgent report repair")
 
+        def _safe_callback(event: str, data: Dict[str, Any]):
+            if step_callback:
+                try:
+                    step_callback(event, data)
+                except BaseException:
+                    pass
+
         findings_block = "\n".join(
             f"- [{f.get('severity', 'minor').upper()}] ({f.get('code', 'finding')}): {f.get('message', '')}"
             for f in findings[:25]
         )
         verified_metrics_block = json.dumps(verified_metrics or {}, indent=2, default=str)
+        repair_delivery_filename = f"reporter_repair_delivery_{uuid.uuid4().hex}.md"
 
         repair_prompt = REPORT_REPAIR_PROMPT.format(
             findings_block=findings_block,
@@ -781,7 +847,9 @@ class ReporterAgent:
             "content": repair_prompt + (
                 f"\n\nREMINDER: you have a strict budget of {max_tool_calls} tool calls. "
                 "After at most that many verification calls (or none, if not needed), output the "
-                "COMPLETE corrected markdown report as your final chat response."
+                "COMPLETE corrected markdown report as your final chat response. When writing it "
+                "with execute_python, write the identical contents to `final_report.md` and "
+                f"`{repair_delivery_filename}` in the same call."
             ),
         })
 
@@ -795,8 +863,27 @@ class ReporterAgent:
                 cancellation_token.check_cancelled(step_name=f"ReporterAgent repair turn {turn}")
 
             assistant_msg = self._call_llm(memory_manager.messages, tools=self.tool_manager.get_tool_specs())
+
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            assistant_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=assistant_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+            )
+
             thought = assistant_msg.content or ""
-            tool_calls = assistant_msg.tool_calls or []
+            reasoning = extract_reasoning_text(assistant_msg)
+
+            if thought or reasoning:
+                _safe_callback("llm_thought", {
+                    "agent": self.agent_name,
+                    "turn": turn,
+                    "thought": thought,
+                    "reasoning": reasoning,
+                })
 
             msg_dict: Dict[str, Any] = {"role": "assistant"}
             if assistant_msg.content:
@@ -868,14 +955,27 @@ class ReporterAgent:
         # execute_python; the chat response is only a fallback.
         # ======================================================================
         try:
-            artifact_path = os.path.join(self._report_output_dir(), "final_report.md")
-            if os.path.exists(artifact_path):
+            output_dir = self._report_output_dir()
+            for artifact_path in (
+                os.path.join(output_dir, repair_delivery_filename),
+                os.path.join(output_dir, "reporter_final_report_delivery.md"),
+                os.path.join(output_dir, "final_report.md"),
+            ):
+                if not os.path.exists(artifact_path):
+                    continue
                 with open(artifact_path, "r", encoding="utf-8") as rf:
                     file_report = rf.read()
-                if file_report and file_report.strip() and len(file_report.strip()) >= len((corrected or "").strip()):
+                if file_report and file_report.strip() and (
+                    artifact_path.endswith(repair_delivery_filename)
+                    or (
+                        file_report.strip() != current_report.strip()
+                        and len(file_report.strip()) >= len((corrected or "").strip())
+                    )
+                ):
                     corrected = file_report
                     if HAS_LOGFIRE:
                         logfire.info("ReporterAgent repair retrieved corrected report from artifact", path=artifact_path, length=len(file_report))
+                    break
         except Exception as read_err:
             print(f"[ReporterAgent Warning] Could not read repaired final_report.md: {read_err}. Using chat response.")
 
@@ -888,6 +988,14 @@ class ReporterAgent:
         if not corrected.strip() or len(corrected.strip()) < len(current_report.strip()) * 0.4:
             print(f"[ReporterAgent Warning] repair response too short ({len(corrected)} chars); keeping current report")
             return current_report
+
+        # Persist corrected content under both the public artifact name and its
+        # unique export name so later consumers never fall back to chat text.
+        output_dir = self._report_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        for filename in ("final_report.md", repair_delivery_filename):
+            with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as wf:
+                wf.write(corrected)
 
         if HAS_LOGFIRE:
             logfire.info(

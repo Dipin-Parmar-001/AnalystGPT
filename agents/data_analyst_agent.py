@@ -16,7 +16,55 @@ import traceback
 import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
-from openai import OpenAI
+
+
+def is_fragmented_or_unparsable_response(message: Any) -> bool:
+    """
+    Detect if the LLL response is fragmented, unparsable, or contains only
+    token usage metadata instead of actual content.
+
+    Returns True if the response should be retried.
+    """
+    if message is None:
+        return True
+
+    # Check if content is None or empty
+    content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        # If no content and no tool calls, it's likely an incomplete response
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+    # Check if content looks like token usage metadata (JSON with token fields)
+    if isinstance(content, str):
+        content_stripped = content.strip()
+        # Check for the specific token usage metadata pattern
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                # Check for token usage metadata keys
+                token_keys = {"completion_tokens", "prompt_tokens", "total_tokens",
+                             "completion_tokens_details", "prompt_tokens_details",
+                             "cost", "is_byok", "cost_details"}
+                if isinstance(parsed, dict) and token_keys.intersection(parsed.keys()):
+                    # This is token usage metadata, not actual content
+                    return True
+            except json.JSONDecodeError:
+                pass
+
+        # Check for other common fragmented response patterns
+        # e.g., empty object, just whitespace, or clearly incomplete
+        if content_stripped in ["{}", "[]", "null", ""]:
+            return True
+
+    # Check finish_reason if available (some providers include this in message)
+    finish_reason = getattr(message, "finish_reason", None)
+    if finish_reason in ["length", "content_filter", "function_call"]:
+        # These might indicate incomplete responses
+        pass
+
+    return False
 
 # Ensure UTF-8 output encoding for Windows consoles
 if sys.stdout.encoding != 'utf-8':
@@ -27,9 +75,17 @@ if sys.stdout.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import (
+    reset_global_sandbox_manager,
+    extract_code_from_content,
+    extract_action_code_from_content,
+    create_synthetic_execute_tool_call,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
+)
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 from agents.planner_agent import ExecutionPlan, TaskItem, PlanStatus
@@ -45,49 +101,7 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        }
-    ]
-}
 
 from agents.prompts import DATA_ANALYST_AGENT, DATA_ANALYST_SYSTEM_PROMPT, resolve_budget_placeholders
 
@@ -95,52 +109,21 @@ from agents.prompts import DATA_ANALYST_AGENT, DATA_ANALYST_SYSTEM_PROMPT, resol
 class DataAnalystAgent:
     def __init__(
         self,
-        model_name: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        model_name: str = "nemotron-3-ultra-550b-a55b",
         tool_manager: Optional[ToolManager] = None,
         max_tool_calls: int = 7,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 300,
-        max_tokens_before_compact: int = 3000,
+        max_tokens_before_compact: int = 100000,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
         setup_logfire()
-
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
-        if PORTKEY_CONFIG_ID:
-            if HAS_LOGFIRE:
-                logfire.info("DataAnalystAgent setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[DataAnalystAgent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("[DataAnalystAgent Setup] PORTKEY_CONFIG_ID not found. Using fallback config.")
-            else:
-                print("[DataAnalystAgent Setup] WARNING: PORTKEY_CONFIG_ID not found. Using fallback config.")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
-
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
-
-        if HAS_LOGFIRE:
-            try:
-                logfire.instrument_openai(self.client)
-            except Exception as e:
-                logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
+        self.client = create_local_router("DataAnalystAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
         instrument_openai_client(self.client, agent_name="DataAnalystAgent")
 
-        self.model_name = model_name
+        self.model_name = model_name[len("nvidia/"):] if model_name.startswith("nvidia/") else model_name
         self.tool_manager = tool_manager or ToolManager()
         self.max_tool_calls = max_tool_calls
         self.agent_name = "DataAnalystAgent"
@@ -216,6 +199,17 @@ class DataAnalystAgent:
                 try:
                     response = self.client.chat.completions.create(**kwargs)
                     message = response.choices[0].message
+
+                    # Check for fragmented or unparsable response (token usage metadata, etc.)
+                    if is_fragmented_or_unparsable_response(message):
+                        if HAS_LOGFIRE:
+                            logfire.warn("Detected fragmented/unparsable LLM response (token metadata only), retrying...",
+                                         content_snippet=str(getattr(message, "content", None))[:200])
+                        else:
+                            print(f"[DataAnalystAgent] Detected fragmented/unparsable LLM response, retrying...")
+                        # Treat as an error to trigger retry
+                        raise RuntimeError("Fragmented or unparsable LLM response received (token metadata only)")
+
                     return message
                 except Exception as err:
                     err_str = str(err).lower()
@@ -232,7 +226,7 @@ class DataAnalystAgent:
                     )
                     if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool message schema. Retrying with plain chat format (tools preserved).", error=str(err))
+                            logfire.warn("Provider rejected tool message schema. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
                             print(f"[DataAnalystAgent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
 
@@ -443,37 +437,28 @@ class DataAnalystAgent:
             if cancellation_token:
                 cancellation_token.check_cancelled(step_name=f"{self.agent_name} after LLM turn {turn + 1}", task_id=task_id)
 
-            msg_dict: Dict[str, Any] = {"role": "assistant"}
-            if response_msg.content:
-                msg_dict["content"] = response_msg.content
-            if response_msg.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in response_msg.tool_calls
-                ]
-
-            memory_manager.append_assistant(msg_dict)
+            # Validate tool call arguments; if parsing fails, retry with LLM directly without corrupting history
+            response_msg, tool_calls = validate_or_retry_tool_calls(
+                agent_name=self.agent_name,
+                assistant_msg=response_msg,
+                memory_manager=memory_manager,
+                call_llm_fn=self._call_llm,
+                tool_specs=self.tool_manager.get_tool_specs(),
+                cancellation_token=cancellation_token,
+                step_callback=_safe_callback,
+            )
 
             if response_msg.content:
                 _safe_callback("llm_thought", {"agent": self.agent_name, "turn": turn + 1, "thought": response_msg.content.strip()})
 
-            tool_calls = response_msg.tool_calls
-
-            # Structural turn classification from the provider response:
-            # - tool_calls present  -> pass to the execution layer below
-            # - content only        -> non-execution response (markdown/JSON
-            #   summary or prose). It is NEVER executed as code; the loop ends
-            #   and task completion is decided by actual execution results.
-            # Only a provider-issued 'Malformed function call:' body is parsed
-            # for recoverable code.
             if not tool_calls:
+                # Structural turn classification from the provider response:
+                # - tool_calls present  -> pass to the execution layer below
+                # - content only        -> non-execution response (markdown/JSON
+                #   summary or prose). It is NEVER executed as code; the loop ends
+                #   and task completion is decided by actual execution results.
+                # Only a provider-issued 'Malformed function call:' body is parsed
+                # for recoverable code.
                 fallback_code = extract_action_code_from_content(response_msg.content or "")
                 if fallback_code and tool_calls_count < effective_max_calls:
                     if HAS_LOGFIRE:
@@ -484,7 +469,27 @@ class DataAnalystAgent:
                     tool_calls = [synthetic_tc]
                 else:
                     final_response = response_msg.content or ""
+                    msg_dict: Dict[str, Any] = {"role": "assistant", "content": final_response}
+                    memory_manager.append_assistant(msg_dict)
                     break
+
+            msg_dict: Dict[str, Any] = {"role": "assistant"}
+            if response_msg.content:
+                msg_dict["content"] = response_msg.content
+            if tool_calls:
+                msg_dict["tool_calls"] = [
+                    tc.model_dump() if hasattr(tc, "model_dump") else (tc if isinstance(tc, dict) else {
+                        "id": getattr(tc, "id", f"call_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(tc.function, "name", "") if hasattr(tc, "function") else tc.get("function", {}).get("name", ""),
+                            "arguments": getattr(tc.function, "arguments", "{}") if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+                        }
+                    })
+                    for i, tc in enumerate(tool_calls)
+                ]
+
+            memory_manager.append_assistant(msg_dict)
 
 
             # Process requested tool calls
@@ -506,12 +511,9 @@ class DataAnalystAgent:
                     )
                     continue
 
-                try:
-                    parsed_args = json.loads(raw_args)
-                    if "code" in parsed_args:
-                        executed_code_blocks.append(parsed_args["code"])
-                except Exception:
-                    pass
+                ok_args, parsed_args, _ = parse_and_clean_tool_args(raw_args)
+                if ok_args and "code" in parsed_args:
+                    executed_code_blocks.append(parsed_args["code"])
 
                 _safe_callback("tool_executing", {
                     "agent": self.agent_name,

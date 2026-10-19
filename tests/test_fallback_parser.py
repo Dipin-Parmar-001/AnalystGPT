@@ -147,6 +147,113 @@ def test_fallback_parser():
     assert res_malformed.get("success") is True, f"Malformed args execution failed: {res_malformed}"
     assert len(executed) == 2
 
+    # 6. Test repair_json_escapes and parse_and_clean_tool_args with user's exact invalid escape pattern:
+    # 'f1': xgb_f1,\        'roc_auc': xgb_roc_auc
+    from agents.fallback_parser import repair_json_escapes, parse_and_clean_tool_args, validate_or_retry_tool_calls
+    malformed_json_args = '{"code": "import pandas as pd\\nxgb_metrics = {\\n    \'f1\': xgb_f1,\\        \'roc_auc\': xgb_roc_auc\\n}"}'
+    try:
+        json.loads(malformed_json_args)
+        assert False, "Should have failed standard json.loads"
+    except json.JSONDecodeError:
+        pass
+
+    ok, parsed_dict, err = parse_and_clean_tool_args(malformed_json_args)
+    assert ok is True, f"parse_and_clean_tool_args failed: {err}"
+    assert "code" in parsed_dict
+    assert "import pandas as pd" in parsed_dict["code"]
+
+    # 7. Test validate_or_retry_tool_calls when tool arguments fail completely:
+    # Verifies that message history in memory_manager is NOT corrupted,
+    # and retry prompt is sent to the LLM directly without corrupting history.
+    class MockMemoryManager:
+        def __init__(self):
+            self.messages = [{"role": "system", "content": "You are ML agent."}]
+
+    mock_mm = MockMemoryManager()
+
+    broken_tc = {
+        "id": "broken_call_1",
+        "type": "function",
+        "function": {
+            "name": "execute_python",
+            "arguments": '{"code": import pandas as pd, unquoted: true'
+        }
+    }
+
+    class MockAssistantMsg:
+        def __init__(self, content, tool_calls):
+            self.content = content
+            self.tool_calls = tool_calls
+
+    initial_msg = MockAssistantMsg("I will run code", [broken_tc])
+
+    llm_calls = []
+    def mock_call_llm(messages, tools=None):
+        llm_calls.append(list(messages))
+        fixed_tc = {
+            "id": "fixed_call_1",
+            "type": "function",
+            "function": {
+                "name": "execute_python",
+                "arguments": '{"code": "import pandas as pd\\nprint(1)"}'
+            }
+        }
+        return MockAssistantMsg("Here is the corrected call", [fixed_tc])
+
+    final_msg, clean_tcs = validate_or_retry_tool_calls(
+        agent_name="MLAgent",
+        assistant_msg=initial_msg,
+        memory_manager=mock_mm,
+        call_llm_fn=mock_call_llm,
+        tool_specs=[],
+        max_retries=2
+    )
+
+    # Verify: memory_manager.messages was NEVER corrupted with broken_tc!
+    assert len(mock_mm.messages) == 1
+    assert mock_mm.messages[0]["role"] == "system"
+
+    # Verify: retry was called with error message
+    assert len(llm_calls) == 1
+    retry_prompt = llm_calls[0][-1]["content"]
+    assert "Tool Call Argument Parsing Failed" in retry_prompt
+    assert "execute_python" in retry_prompt
+
+    # Verify: clean_tcs contains the fixed tool call with valid JSON
+    assert len(clean_tcs) == 1
+    assert json.loads(clean_tcs[0]["function"]["arguments"])["code"] == "import pandas as pd\nprint(1)"
+
+    # 8. Test sanitize_messages defends against corrupted tool calls
+    from agents.memory_manager import sanitize_messages
+    corrupted_history = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "run task"},
+        {
+            "role": "assistant",
+            "content": "running tool",
+            "tool_calls": [
+                {
+                    "id": "corrupted_call",
+                    "type": "function",
+                    "function": {
+                        "name": "execute_python",
+                        "arguments": "{bad_json: true"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "corrupted_call",
+            "content": "failed"
+        }
+    ]
+
+    sanitized = sanitize_messages(corrupted_history)
+    for m in sanitized:
+        if m.get("role") == "assistant":
+            assert not m.get("tool_calls"), "Unparseable tool_calls should have been dropped/converted"
+
     print("ALL FALLBACK PARSER TESTS PASSED SUCCESSFULLY!")
 
 if __name__ == "__main__":

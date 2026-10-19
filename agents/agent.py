@@ -6,7 +6,55 @@ import traceback
 import time
 from typing import List, Dict, Any, Optional, Union, Callable
 from dotenv import load_dotenv
-from openai import OpenAI
+
+
+def is_fragmented_or_unparsable_response(message: Any) -> bool:
+    """
+    Detect if the LLM response is fragmented, unparsable, or contains only
+    token usage metadata instead of actual content.
+
+    Returns True if the response should be retried.
+    """
+    if message is None:
+        return True
+
+    # Check if content is None or empty
+    content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        # If no content and no tool calls, it's likely an incomplete response
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+    # Check if content looks like token usage metadata (JSON with token fields)
+    if isinstance(content, str):
+        content_stripped = content.strip()
+        # Check for the specific token usage metadata pattern
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                # Check for token usage metadata keys
+                token_keys = {"completion_tokens", "prompt_tokens", "total_tokens",
+                             "completion_tokens_details", "prompt_tokens_details",
+                             "cost", "is_byok", "cost_details"}
+                if isinstance(parsed, dict) and token_keys.intersection(parsed.keys()):
+                    # This is token usage metadata, not actual content
+                    return True
+            except json.JSONDecodeError:
+                pass
+
+        # Check for other common fragmented response patterns
+        # e.g., empty object, just whitespace, or clearly incomplete
+        if content_stripped in ["{}", "[]", "null", ""]:
+            return True
+
+    # Check finish_reason if available (some providers include this in message)
+    finish_reason = getattr(message, "finish_reason", None)
+    if finish_reason in ["length", "content_filter", "function_call"]:
+        # These might indicate incomplete responses
+        pass
+
+    return False
 
 
 # Ensure UTF-8 output encoding for Windows consoles
@@ -17,9 +65,17 @@ if sys.stderr.encoding != 'utf-8':
 
 # Ensure workspace root is in sys.path for direct execution
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from agents.router import create_local_router
 
 from sandbox_execution import ToolManager, execute_python, EXECUTE_PYTHON_TOOL_SPEC
-from agents.tools import reset_global_sandbox_manager, extract_code_from_content, extract_action_code_from_content, create_synthetic_execute_tool_call
+from agents.tools import (
+    reset_global_sandbox_manager,
+    extract_code_from_content,
+    extract_action_code_from_content,
+    create_synthetic_execute_tool_call,
+    parse_and_clean_tool_args,
+    validate_or_retry_tool_calls,
+)
 from agents.logger import setup_logfire, HAS_LOGFIRE
 from agents.memory_manager import MessageHistoryManager, DatasetState, count_tokens, sanitize_messages, convert_to_plain_chat
 
@@ -33,8 +89,6 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-PORTKEY_API_KEY = os.getenv("PORTKEY_API_KEY")
-PORTKEY_CONFIG_ID = os.getenv("PORTKEY_CONFIG_ID")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -44,48 +98,6 @@ AVAILABLE_TOOLS = {
     "execute_python": execute_python
 }
 
-# Default Portkey Configuration for fallback & multi-provider routing
-DEFAULT_PORTKEY_CONFIG = {
-    "strategy": {
-        "mode": "fallback",
-        "on_status_codes": [429, 500, 502, 503, 504]
-    },
-    "targets": [
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-openrouter",
-            "override_params": {
-                "model": "poolside/laguna-xs-2.1:free",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-nvidia",
-            "override_params": {
-                "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        },
-        {
-            "virtual_key": "analystgpt-gemini",
-            "override_params": {
-                "model": "gemini-2.5-flash",
-                "temperature": 0.2,
-                "max_tokens": 1500
-            }
-        }
-    ]
-}
-
 from agents.prompts import SYSTEM_PROMPT, resolve_budget_placeholders
 
 class DataAnalystAgent:
@@ -93,44 +105,11 @@ class DataAnalystAgent:
         self,
         keep_last_tool_pairs: int = 2,
         stdout_stderr_token_limit: int = 200,
-        max_tokens_before_compact: int = 3000,
+        max_tokens_before_compact: int = 100000,
         tool_manager: Optional[ToolManager] = None,
     ):
-        if not PORTKEY_API_KEY:
-            raise ValueError("PORTKEY_API_KEY is not set in environment variables.")
-
         setup_logfire()
-
-        # Set up standard Portkey headers
-        headers = {
-            "x-portkey-api-key": PORTKEY_API_KEY,
-        }
-
-        if PORTKEY_CONFIG_ID:
-            if HAS_LOGFIRE:
-                logfire.info("DataAnalystAgent Setup using Portkey Config ID", config_id=PORTKEY_CONFIG_ID)
-            else:
-                print(f"[Agent Setup] Using Portkey Config ID: {PORTKEY_CONFIG_ID}")
-            headers["x-portkey-config"] = PORTKEY_CONFIG_ID
-        else:
-            if HAS_LOGFIRE:
-                logfire.warn("PORTKEY_CONFIG_ID not found in .env. Attempting inline fallback config...")
-            else:
-                print("[Agent Setup] WARNING: PORTKEY_CONFIG_ID not found in .env. Attempting inline fallback config...")
-            headers["x-portkey-config"] = json.dumps(DEFAULT_PORTKEY_CONFIG)
-
-        # Single OpenAI client routing through Portkey Gateway API
-        self.client = OpenAI(
-            base_url="https://api.portkey.ai/v1",
-            api_key=PORTKEY_API_KEY,
-            default_headers=headers
-        )
-
-        if HAS_LOGFIRE:
-            try:
-                logfire.instrument_openai(self.client)
-            except Exception as e:
-                logfire.warn("Failed to instrument OpenAI client with Logfire", error=str(e))
+        self.client = create_local_router("DataAnalystAgent")
 
         # Local observability: per-call latency, served model, token metrics
         from agents.observability import instrument_openai_client
@@ -167,8 +146,7 @@ class DataAnalystAgent:
 
     def _call_llm(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Any:
         """
-        Calls Portkey Gateway which handles multi-provider fallbacks, 
-        parameter overrides, and provider routing seamlessly.
+        Calls the local provider router, which handles ordered model fallbacks.
         """
         if getattr(self, "_plain_chat_mode", False):
             # Provider (e.g. Gemini) already rejected the OpenAI tool-message schema;
@@ -177,7 +155,7 @@ class DataAnalystAgent:
         else:
             sanitized_messages = sanitize_messages(messages)
         kwargs = {
-            "model": "nvidia/nemotron-3-ultra-550b-a55b",
+            "model": "nemotron-3-ultra-550b-a55b",
             "messages": sanitized_messages,
         }
         effective_tools = tools if tools is not None else self.tool_manager.get_tool_specs()
@@ -190,6 +168,16 @@ class DataAnalystAgent:
                 try:
                     response = self.client.chat.completions.create(**kwargs)
                     message = response.choices[0].message
+
+                    # Check for fragmented or unparsable response (token usage metadata, etc.)
+                    if is_fragmented_or_unparsable_response(message):
+                        if HAS_LOGFIRE:
+                            logfire.warn("Detected fragmented/unparsable LLM response (token metadata only), retrying...",
+                                         content_snippet=str(getattr(message, "content", None))[:200])
+                        else:
+                            print(f"[Agent] Detected fragmented/unparsable LLM response, retrying...")
+                        # Treat as an error to trigger retry
+                        raise RuntimeError("Fragmented or unparsable LLM response received (token metadata only)")
 
                     if HAS_LOGFIRE:
                         tool_calls_summary = []
@@ -226,13 +214,13 @@ class DataAnalystAgent:
                     )
                     if is_schema_rejection:
                         if HAS_LOGFIRE:
-                            logfire.warn("Portkey/Provider rejected tool message schema in agent.py. Retrying with plain chat format (tools preserved).", error=str(err))
+                            logfire.warn("Provider rejected tool message schema in agent.py. Retrying with plain chat format (tools preserved).", error=str(err))
                         else:
                             print(f"[Agent] Provider tool schema rejected ({err}). Retrying with plain chat format (tools preserved)...")
 
                         plain_msgs = convert_to_plain_chat(messages)
                         fallback_kwargs = {
-                            "model": kwargs.get("model", "nvidia/nemotron-3-ultra-550b-a55b"),
+                            "model": kwargs.get("model", "nemotron-3-ultra-550b-a55b"),
                             "messages": plain_msgs,
                         }
                         if effective_tools:
@@ -257,7 +245,7 @@ class DataAnalystAgent:
 
                 if HAS_LOGFIRE:
                     logfire.error(
-                        "Portkey Gateway LLM Request Failed",
+                        "Local Router LLM Request Failed",
                         error=str(err),
                         error_type=type(err).__name__,
                         traceback=traceback.format_exc(),
@@ -265,8 +253,8 @@ class DataAnalystAgent:
                         message_count=len(messages),
                     )
                 else:
-                    print(f"[Agent Error] Portkey Gateway request failed: {err}\n{traceback.format_exc()}")
-                raise RuntimeError(f"Portkey Gateway call failed: {err}") from err
+                    print(f"[Agent Error] Local router request failed: {err}\n{traceback.format_exc()}")
+                raise RuntimeError(f"Local router call failed: {err}") from err
 
         if HAS_LOGFIRE:
             tool_names = [t.get("function", {}).get("name") for t in effective_tools] if effective_tools else []
@@ -278,7 +266,7 @@ class DataAnalystAgent:
             ):
                 return _do_call()
         else:
-            print("[Agent LLM] Requesting Portkey Gateway...")
+            print("[Agent LLM] Requesting local provider router...")
             return _do_call()
 
     def extract_python_code(self, text: str) -> Optional[str]:
@@ -316,7 +304,15 @@ class DataAnalystAgent:
 
                 def _do_turn():
                     response_msg = self._call_llm(self.memory_manager.messages, tools=self.tool_manager.get_tool_specs())
-                    self.memory_manager.append_assistant_response(response_msg)
+
+                    response_msg, tool_calls = validate_or_retry_tool_calls(
+                        agent_name="Agent",
+                        assistant_msg=response_msg,
+                        memory_manager=self.memory_manager,
+                        call_llm_fn=self._call_llm,
+                        tool_specs=self.tool_manager.get_tool_specs(),
+                        step_callback=_safe_callback,
+                    )
 
                     if response_msg.content:
                         if HAS_LOGFIRE:
@@ -325,7 +321,6 @@ class DataAnalystAgent:
                             print(f"\n[AI Assistant Thought]:\n{response_msg.content.strip()}\n", flush=True)
                         _safe_callback("llm_thought", {"turn": turn + 1, "thought": response_msg.content.strip()})
 
-                    tool_calls = response_msg.tool_calls
                     if not tool_calls:
                         fallback_code = extract_action_code_from_content(response_msg.content or "")
                         if fallback_code:
@@ -336,11 +331,14 @@ class DataAnalystAgent:
                             synthetic_tc = create_synthetic_execute_tool_call(fallback_code, f"fallback_call_{turn + 1}")
                             tool_calls = [synthetic_tc]
                         else:
+                            self.memory_manager.append_assistant_response(response_msg)
                             if HAS_LOGFIRE:
                                 logfire.info("Agent turn loop finished with final response")
                             _safe_callback("turn_finished", {"turn": turn + 1, "response": response_msg.content or ""})
                             return response_msg.content or ""
 
+
+                    self.memory_manager.append_assistant_response(response_msg)
 
                     if HAS_LOGFIRE:
                         logfire.info("Agent requested tool execution", tool_count=len(tool_calls))

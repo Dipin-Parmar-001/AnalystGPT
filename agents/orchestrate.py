@@ -14,7 +14,9 @@ import os
 import sys
 import json
 import time
+import copy
 import traceback
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Callable
 from dataclasses import asdict
 
@@ -37,7 +39,7 @@ from agents.planner_agent import PlannerAgent, ExecutionPlan, TaskItem, PlanStat
 from agents.data_analyst_agent import DataAnalystAgent
 from agents.ml_agent import MLAgent
 from agents.reporter_agent import ReporterAgent
-from agents.cancellation import CancellationToken, WorkflowCancelledException
+from agents.cancellation import CancellationToken, WorkflowCancelledException, WorkflowPausedException
 from agents.artifact_validator import (
     validate_artifacts,
     validate_and_get_warning,
@@ -49,7 +51,8 @@ from agents.artifact_validator import (
 )
 from agents.run_context import build_dataset_profile, render_dataset_profile_block
 from agents.consistency_checker import run_consistency_checks, ConsistencyReport, count_by_severity
-from agents.preflight_gate import run_preflight, verify_champion_consistency
+from agents.preflight_gate import run_preflight, verify_champion_consistency, _load_json_safe
+from agents.champion_selector import select_initial_champion, evaluate_challenger, ChampionSelectionResult
 from agents.fact_sheet import build_facts
 from agents.observability import (
     get_recorder,
@@ -63,6 +66,17 @@ try:
     import logfire
 except ImportError:
     logfire = None
+
+
+def _load_json_safe(path: str) -> Optional[Any]:
+    """Safely load JSON file, returning None on missing file or parse error."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def build_post_verification_retry_prompt(unverified_errors: List[str]) -> str:
@@ -140,8 +154,13 @@ def _normalize_champion_pointer(output_dir: str) -> Optional[str]:
     target = _canon(champ_artifact)
     matches = [f for f in pkl_files if _canon(f) == target]
     if len(matches) != 1:
+        # Also match by stripping underscores/non-alphanumerics completely
+        clean_target = _re.sub(r"[^a-z0-9]", "", target[:-4] if target.endswith(".pkl") else target)
+        matches = [f for f in pkl_files if _re.sub(r"[^a-z0-9]", "", f[:-4] if f.endswith(".pkl") else f) == clean_target]
+    if len(matches) != 1:
         return None
     champ["model"] = matches[0]
+    champ["artifact_filename"] = matches[0]
     champ["pointer_normalized_from"] = champ_artifact
     with open(champ_path, "w", encoding="utf-8") as f:
         json.dump(champ, f, indent=2)
@@ -159,10 +178,10 @@ class WorkflowOrchestrator:
     def __init__(
         self,
         tool_manager: Optional[ToolManager] = None,
-        planner_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
-        analyst_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
-        ml_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
-        reporter_model: str = "nvidia/nemotron-3-ultra-550b-a55b",
+        planner_model: str = "nemotron-3-ultra-550b-a55b",
+        analyst_model: str = "nemotron-3-ultra-550b-a55b",
+        ml_model: str = "nemotron-3-ultra-550b-a55b",
+        reporter_model: str = "nemotron-3-ultra-550b-a55b",
     ):
         setup_logfire()
 
@@ -187,7 +206,8 @@ class WorkflowOrchestrator:
         self.reporter_agent = ReporterAgent(
             model_name=reporter_model,
             tool_manager=self.tool_manager,
-            max_tool_calls=10
+            max_tool_calls=10,
+            enable_numeric_verifier=False,
         )
 
         self.current_plan: Optional[ExecutionPlan] = None
@@ -196,6 +216,8 @@ class WorkflowOrchestrator:
         self.final_report: str = ""
         self.current_output_dir: str = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token: Optional[CancellationToken] = None
+        self.last_pause_checkpoint: Optional[Dict[str, Any]] = None
+        self.current_active_task: Optional[Any] = None
 
         # Persist model names for later use (e.g. the consistency judge defaults
         # to reporter_model when judge_model is not set).
@@ -215,6 +237,7 @@ class WorkflowOrchestrator:
 
         # Hybrid verification & severity policy settings
         self.enable_consistency_judge: bool = True   # LLM prose-consistency judge (hybrid stack)
+        self.enable_numeric_verifier: bool = False   # Deterministic numeric verifier (DISABLED per user request)
         self.judge_model: Optional[str] = None       # Defaults to reporter_model
         self.severity_thresholds: Dict[str, int] = {
             "max_critical_findings": 0,  # >0 critical findings => failed-consistency
@@ -239,6 +262,8 @@ class WorkflowOrchestrator:
         self.final_report = ""
         self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs")
         self.cancellation_token = None
+        self.last_pause_checkpoint = None
+        self.current_active_task = None
         self.last_run_findings = []
         self.last_run_manifest = {}
         self.consistency_report = None
@@ -267,6 +292,135 @@ class WorkflowOrchestrator:
             "message": "No active execution was running to cancel."
         }
 
+    def pause_execution(self, reason: str = "User paused the workflow") -> Dict[str, Any]:
+        """
+        Immediately signals pause to the running workflow.
+        Halts in-progress agent task, tool execution, or LLM wait immediately.
+        The interrupted task is NOT marked as complete and will be re-executed upon resume.
+        """
+        active_tid = self.current_active_task.task_id if getattr(self, "current_active_task", None) else None
+        if self.cancellation_token:
+            self.cancellation_token.pause(
+                reason=reason,
+                step=f"Task #{active_tid}" if active_tid else "active step",
+                task_id=active_tid
+            )
+            # Create a provisional checkpoint immediately so last_pause_checkpoint is non-null
+            try:
+                if self.current_plan and not self.last_pause_checkpoint:
+                    paused_task_id = active_tid or 1
+                    safe_plan_dict = None
+                    try:
+                        safe_plan_dict = self.current_plan.to_dict()
+                    except Exception:
+                        safe_plan_dict = {"plan_id": getattr(self.current_plan, "plan_id", "wf_plan"), "tasks": []}
+
+                    safe_results = []
+                    try:
+                        for tr in list(self.completed_task_results or []):
+                            if isinstance(tr, dict):
+                                safe_results.append(dict(tr))
+                            else:
+                                safe_results.append(tr)
+                    except Exception:
+                        safe_results = []
+
+                    self.last_pause_checkpoint = {
+                        "workflow_id": getattr(self.current_plan, "plan_id", None) or f"wf_{int(time.time())}",
+                        "status": "paused",
+                        "paused_at": datetime.now().isoformat(),
+                        "paused_task_id": paused_task_id,
+                        "paused_step": f"Task #{paused_task_id}",
+                        "reason": reason,
+                        "user_query": getattr(self.current_plan, "query", ""),
+                        "input_files": list(getattr(self, "uploaded_files", []) or []),
+                        "output_dir": self.current_output_dir,
+                        "plan": safe_plan_dict,
+                        "completed_task_results": safe_results,
+                        "generated_artifacts": list(self.generated_artifacts or []),
+                        "final_report": self.final_report or "",
+                    }
+            except Exception as snap_err:
+                print(f"[Orchestrator Warning] Provisional pause checkpoint creation skipped: {snap_err}")
+
+            return {
+                "status": "paused",
+                "message": f"Pause signal dispatched: {reason}",
+                "plan_id": self.current_plan.plan_id if self.current_plan else None,
+                "task_id": active_tid
+            }
+        return {
+            "status": "idle",
+            "message": "No active execution was running to pause."
+        }
+
+    def save_checkpoint_to_disk(self, filepath: str, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Saves workflow state checkpoint to a JSON file on disk (in workflows/).
+        Allows user to shut down sessions and resume the paused workflow later.
+        """
+        data = checkpoint or self.last_pause_checkpoint
+        if not data:
+            if not self.current_plan:
+                raise ValueError("No active plan or paused workflow to save.")
+            data = {
+                "workflow_id": self.current_plan.plan_id or f"wf_{int(time.time())}",
+                "status": "paused",
+                "paused_at": datetime.now().isoformat(),
+                "paused_task_id": 1,
+                "paused_step": "paused_state",
+                "reason": "Manual save to disk",
+                "user_query": self.current_plan.query,
+                "input_files": getattr(self, "uploaded_files", []),
+                "output_dir": self.current_output_dir,
+                "plan": self.current_plan.to_dict(),
+                "completed_task_results": copy.deepcopy(self.completed_task_results),
+                "generated_artifacts": list(self.generated_artifacts),
+                "final_report": self.final_report,
+            }
+
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+        print(f"[Orchestrator] Saved workflow checkpoint to {filepath}")
+        return {
+            "status": "saved",
+            "filepath": filepath,
+            "workflow_id": data.get("workflow_id"),
+            "paused_task_id": data.get("paused_task_id")
+        }
+
+    def load_checkpoint_from_disk(self, filepath: str) -> Dict[str, Any]:
+        """
+        Loads saved workflow checkpoint from disk and restores state in orchestrator.
+        """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Workflow checkpoint file not found: {filepath}")
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.last_pause_checkpoint = data
+        if "plan" in data and isinstance(data["plan"], dict):
+            self.current_plan = ExecutionPlan.from_dict(data["plan"])
+            self.current_plan.status = PlanStatus.PAUSED
+        if "completed_task_results" in data:
+            self.completed_task_results = data["completed_task_results"]
+        if "generated_artifacts" in data:
+            self.generated_artifacts = data["generated_artifacts"]
+        if "final_report" in data:
+            self.final_report = data["final_report"]
+        if "output_dir" in data:
+            self.current_output_dir = data["output_dir"]
+            if hasattr(self.tool_manager, "set_output_dir"):
+                self.tool_manager.set_output_dir(self.current_output_dir)
+        if "input_files" in data:
+            self.uploaded_files = data["input_files"]
+
+        print(f"[Orchestrator] Loaded workflow checkpoint from {filepath} (paused at Task #{data.get('paused_task_id')})")
+        return data
+
     def _get_consistency_judge(self):
         """Lazily instantiates the LLM consistency judge (hybrid verification layer)."""
         if self._consistency_judge_instance is not None:
@@ -284,14 +438,14 @@ class WorkflowOrchestrator:
     def _run_final_verification(self, query_text: str, active_plan) -> Dict[str, Any]:
         """
         Full verification pass over the current final report using ALL methods:
-        1. Deterministic numeric verification (report claims vs VERIFIED_METRICS)
+        1. Deterministic numeric verification (report claims vs VERIFIED_METRICS) - DISABLED by default
         2. Deterministic cross-artifact consistency checks
         3. LLM prose-consistency judge (skipped if unavailable)
 
         Returns {"findings": [..], "verified_metrics": {..}, "numeric": {..}} where
         findings is the merged list consumed by the repair loop and severity policy.
         """
-        with logfire.span("Orchestrator: Final Verification Pass (numeric + consistency + judge)",
+        with logfire.span("Orchestrator: Final Verification Pass (numeric:DISABLED + consistency + judge)",
                           report_length=len(self.final_report or "")):
             findings: List[Dict[str, Any]] = []
 
@@ -310,13 +464,14 @@ class WorkflowOrchestrator:
                 logfire.warn("Orchestrator: verified_metrics.json not found; numeric verification skipped",
                              output_dir=self.current_output_dir)
 
-            # 1. Numeric verification of the report itself
-            numeric_summary: Dict[str, Any] = {}
-            if self.final_report and verified_metrics:
+            # 1. Numeric verification of the report itself (DISABLED - controlled by enable_numeric_verifier flag)
+            numeric_summary: Dict[str, Any] = {"enabled": False}
+            if False and self.enable_numeric_verifier and self.final_report and verified_metrics:
                 try:
                     from agents.numeric_verifier import verify_report_numbers
                     numeric_res = verify_report_numbers(self.final_report, verified_metrics)
                     numeric_summary = {
+                        "enabled": True,
                         "is_valid": numeric_res.is_valid,
                         "total_claims": numeric_res.total_claims_count,
                         "verified_count": numeric_res.verified_count,
@@ -341,6 +496,8 @@ class WorkflowOrchestrator:
                             })
                 except Exception as num_err:
                     logfire.error("Orchestrator: numeric verification failed", error=str(num_err))
+            else:
+                logfire.info("Orchestrator: numeric verification SKIPPED (enable_numeric_verifier=False)")
 
             # 1b. Normalize the champion pointer against the artifacts actually on
             # disk. Agents occasionally record a display name (e.g.
@@ -362,6 +519,7 @@ class WorkflowOrchestrator:
                     # missing artifact.
                     uploaded_files=self.uploaded_files or None,
                     persist=True,
+                    dataset_type=getattr(self.current_plan, "dataset_type", None),
                 )
                 self.consistency_report = consistency_report
                 findings.extend([asdict(f) for f in consistency_report.findings])
@@ -434,13 +592,13 @@ class WorkflowOrchestrator:
             }
 
     def _repair_final_report(self, verification: Dict[str, Any], files_list: List[str],
-                             step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> int:
+                             step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """
         Post-report repair loop. While critical findings remain and attempts are
         left: combine ALL findings (numeric + consistency + judge) into ONE
         correction prompt and repair via a compact agent turn with a dedicated
         5-call sandbox budget, then re-verify with all methods. Returns the
-        number of repair attempts used.
+        updated verification dictionary.
         """
         def _cb(event: str, data: Dict[str, Any]):
             if step_callback:
@@ -451,7 +609,7 @@ class WorkflowOrchestrator:
 
         repair_attempts_used = 0
         while repair_attempts_used < self.max_repair_attempts:
-            critical = [f for f in verification["findings"] if f.get("severity") == "critical"]
+            critical = [f for f in verification.get("findings", []) if f.get("severity") == "critical"]
             if not critical:
                 break
 
@@ -487,14 +645,20 @@ class WorkflowOrchestrator:
                 logfire.warn("Orchestrator: could not build dataset profile for repair prompt", error=str(profile_err))
                 profile_block = ""
 
-            corrected = self.reporter_agent.repair_report(
-                current_report=self.final_report,
-                findings=verification["findings"],
-                verified_metrics=verification.get("verified_metrics") or {},
-                profile_block=profile_block,
-                max_tool_calls=5,
-                cancellation_token=self.cancellation_token,
-            )
+            try:
+                corrected = self.reporter_agent.repair_report(
+                    current_report=self.final_report,
+                    findings=verification.get("findings", []),
+                    verified_metrics=verification.get("verified_metrics") or {},
+                    profile_block=profile_block,
+                    max_tool_calls=5,
+                    cancellation_token=self.cancellation_token,
+                    step_callback=step_callback,
+                )
+            except Exception as repair_err:
+                logfire.error("Orchestrator: report repair encountered exception", error=str(repair_err))
+                print(f"[Orchestrator Error] Report repair failed: {repair_err}")
+                break
 
             if not corrected or corrected == self.final_report:
                 logfire.warn("Orchestrator: repair produced no changed report; stopping repair loop",
@@ -520,11 +684,13 @@ class WorkflowOrchestrator:
                 "report_length": len(self.final_report),
             })
 
-            # Re-verify the repaired report with ALL methods
-            verification = self._run_final_verification(query_text="", active_plan=None)
+            # Re-verify the repaired report with ALL methods and update verification in-place
+            new_verification = self._run_final_verification(query_text="", active_plan=None)
+            verification.clear()
+            verification.update(new_verification)
 
         self.repair_attempts_used = repair_attempts_used
-        return repair_attempts_used
+        return verification
 
     def _classify_run_status(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -691,6 +857,7 @@ class WorkflowOrchestrator:
                     user_query=user_query,
                     dataset_context=dataset_context,
                     max_tool_calls_per_task=max_tool_calls_per_task,
+                    step_callback=step_callback,
                     cancellation_token=cancellation_token
                 )
         rec.add_duration("plan_creation_time_s", time.perf_counter() - plan_t0)
@@ -737,6 +904,7 @@ class WorkflowOrchestrator:
                 updated_plan = self.planner_agent.modify_plan(
                     target_plan,
                     modification_prompt,
+                    step_callback=step_callback,
                     cancellation_token=cancellation_token
                 )
         self.current_plan = updated_plan
@@ -783,20 +951,27 @@ class WorkflowOrchestrator:
         max_tool_calls_per_agent: int = 10,
         step_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
+        resume_from_task_id: Optional[int] = None,
+        resume_checkpoint: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes each task in the plan using its assigned specialized agent.
-        Supports instant cancellation, explicit failure/completion telemetry,
+        Supports instant cancellation, pausing/resuming, explicit failure/completion telemetry,
         and artifact preservation.
         """
         from datetime import datetime
 
-        active_plan = plan or self.current_plan
+        if resume_checkpoint and not plan and "plan" in resume_checkpoint:
+            active_plan = ExecutionPlan.from_dict(resume_checkpoint["plan"])
+            self.current_plan = active_plan
+        else:
+            active_plan = plan or self.current_plan
+
         if not active_plan:
             raise ValueError("No active plan provided for execution.")
 
-        query_text = user_query or active_plan.query
-        files_list = files or []
+        query_text = user_query or (resume_checkpoint.get("user_query") if resume_checkpoint else None) or active_plan.query
+        files_list = files or (resume_checkpoint.get("input_files") if resume_checkpoint else None) or []
         self.uploaded_files = list(files_list)
 
         # One run = one JSONL file in logs/. If create_plan already started the
@@ -806,10 +981,44 @@ class WorkflowOrchestrator:
         # Setup cancellation token
         self.cancellation_token = cancellation_token or CancellationToken()
 
-        # Create new unique run output directory
+        # Handle directory and state retention for resume vs fresh run
         run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs", f"run_{run_timestamp}")
-        os.makedirs(self.current_output_dir, exist_ok=True)
+        if resume_checkpoint:
+            self.current_output_dir = resume_checkpoint.get("output_dir", self.current_output_dir)
+            if self.current_output_dir:
+                dir_name = os.path.basename(self.current_output_dir)
+                if dir_name.startswith("run_"):
+                    run_timestamp = dir_name[4:]
+            if resume_from_task_id is None:
+                resume_from_task_id = resume_checkpoint.get("paused_task_id", 1)
+            # Retain only results completed strictly before resume_from_task_id
+            self.completed_task_results = [
+                tr for tr in resume_checkpoint.get("completed_task_results", [])
+                if tr.get("task_id", 0) < (resume_from_task_id or 1)
+            ]
+            self.generated_artifacts = list(resume_checkpoint.get("generated_artifacts", []))
+            self.final_report = resume_checkpoint.get("final_report", "")
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            print(f"[Orchestrator] Resuming workflow from checkpoint at Task #{resume_from_task_id} in {self.current_output_dir}")
+        elif resume_from_task_id is not None:
+            # Resuming in-memory: preserve output dir, keep prior completed tasks
+            if self.current_output_dir:
+                dir_name = os.path.basename(self.current_output_dir)
+                if dir_name.startswith("run_"):
+                    run_timestamp = dir_name[4:]
+            self.completed_task_results = [
+                tr for tr in self.completed_task_results
+                if tr.get("task_id", 0) < resume_from_task_id
+            ]
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            print(f"[Orchestrator] Resuming in-memory workflow at Task #{resume_from_task_id} in {self.current_output_dir}")
+        else:
+            # Fresh execution: create new unique run output directory
+            self.current_output_dir = os.path.join(WORKSPACE_ROOT, "outputs", f"run_{run_timestamp}")
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            self.completed_task_results = []
+            self.generated_artifacts = []
+            self.final_report = ""
 
         if hasattr(self.tool_manager, "set_output_dir"):
             self.tool_manager.set_output_dir(self.current_output_dir)
@@ -848,10 +1057,12 @@ class WorkflowOrchestrator:
                 "plan_id": active_plan.plan_id,
                 "total_tasks": len(active_plan.tasks),
                 "selected_agents": active_plan.selected_agents,
-                "output_dir": self.current_output_dir
+                "output_dir": self.current_output_dir,
+                "resumed_from_task": resume_from_task_id
             })
 
-            self.completed_task_results = []
+            if resume_from_task_id is None:
+                self.completed_task_results = []
             has_reporter_task = False
             current_active_task: Optional[TaskItem] = None
 
@@ -860,8 +1071,21 @@ class WorkflowOrchestrator:
                 self.cancellation_token.check_cancelled(step_name="Workflow start")
 
                 for task in active_plan.tasks:
+                    # If resuming, skip tasks strictly before resume_from_task_id that were already completed
+                    if resume_from_task_id is not None and task.task_id < resume_from_task_id:
+                        if task.status == "completed" or any(tr.get("task_id") == task.task_id for tr in self.completed_task_results):
+                            task.status = "completed"
+                            print(f"[Orchestrator] Skipping already completed Task #{task.task_id}: {task.title}")
+                            continue
+
+                    # If resuming, ensure tasks after the resumed task remain pending
+                    if resume_from_task_id is not None and task.task_id > resume_from_task_id:
+                        if task.status in ["in_progress", "paused"]:
+                            task.status = "pending"
+
+                    self.current_active_task = task
                     current_active_task = task
-                    # Check cancellation before starting each task
+                    # Check cancellation or pause before starting each task
                     self.cancellation_token.check_cancelled(
                         step_name=f"Before Task #{task.task_id}: {task.title}",
                         task_id=task.task_id
@@ -914,6 +1138,13 @@ class WorkflowOrchestrator:
                         last_failure_kind = None  # "artifact_validation" or "post_verification"
                         last_missing_artifacts: list = []  # Missing artifacts from the previous attempt (drives targeted repair)
                         last_fallback_detected = False  # Fallback flag from the previous attempt
+
+                        # Snapshot pre-task champion before ML task runs (e.g. initial champion before HPT)
+                        pre_ml_champion = None
+                        if isinstance(agent_instance, MLAgent) or getattr(task, "task_type", None) in ("model_comparison", "hyperparameter_tuning"):
+                            champ_file_path = os.path.join(self.current_output_dir, "champion_model.json")
+                            if os.path.isfile(champ_file_path):
+                                pre_ml_champion = _load_json_safe(champ_file_path)
 
                         while attempt <= max_retries and not validation_passed and not task_validation_failed:
                             _attempt_t0 = time.perf_counter()
@@ -978,8 +1209,10 @@ class WorkflowOrchestrator:
                                 fact_sheet = None
                                 if attempt == 0:
                                     try:
-                                        preflight = run_preflight(self.current_output_dir, goal_text=query_text)
-                                        if preflight.get("repairs"):
+                                        preflight = run_preflight(self.current_output_dir, goal_text=query_text, repair=True)
+                                        if preflight.get("repairs_applied"):
+                                            print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs_applied']}", flush=True)
+                                        elif preflight.get("repairs"):  # backward compat
                                             print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs']}", flush=True)
                                         # Refresh verified metrics after possible artifact repairs
                                         verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
@@ -1250,6 +1483,22 @@ class WorkflowOrchestrator:
                                         [f"Unverified numeric claim in report (must match VERIFIED_METRICS verbatim): '{c}'" for c in unverified[:10]]
                                         or [f"Post-verification failed: {pv.get('unverified_count', 'unknown')} unverified numeric claims in the report."]
                                     )
+                            elif isinstance(agent_instance, MLAgent) or getattr(task, "task_type", None) in ("model_comparison", "hyperparameter_tuning"):
+                                ml_verif = verify_champion_consistency(
+                                    output_dir=self.current_output_dir,
+                                    goal_text=query_text,
+                                    repair=False,
+                                    task_type=getattr(task, "task_type", None),
+                                    pre_task_champion=pre_ml_champion,
+                                    primary_metric=getattr(task, "primary_metric", None),
+                                )
+                                if not ml_verif.get("consistent", True):
+                                    post_verification_failed = True
+                                    post_verification_errors = [
+                                        f.message if hasattr(f, "message") else (f.get("message") if isinstance(f, dict) else str(f))
+                                        for f in ml_verif.get("findings", [])
+                                        if (getattr(f, "severity", None) or (f.get("severity") if isinstance(f, dict) else "")) == "error"
+                                    ] or ["Post-ML verification failed: champion and artifact consistency requirements were not met."]
 
                             if validation_result.is_valid and not post_verification_failed:
                                 # Validation passed!
@@ -1299,7 +1548,7 @@ class WorkflowOrchestrator:
                                     last_missing_artifacts = list(validation_result.missing_artifacts or [])
                                     last_fallback_detected = validation_result.fallback_detected
                                 else:
-                                    failure_kind = "post_verification"
+                                    failure_kind = "post_ml_verification" if (isinstance(agent_instance, MLAgent) or getattr(task, "task_type", None) in ("model_comparison", "hyperparameter_tuning")) else "post_verification"
                                     last_validation_errors = post_verification_errors
                                     last_missing_artifacts = []
                                     last_fallback_detected = False
@@ -1451,123 +1700,50 @@ class WorkflowOrchestrator:
                     else:
                         _execute_task()
 
-                    # Post-task champion consistency gate: after EVERY ML task,
-                    # verify all champion-mentioning artifacts agree (they are
-                    # rewritten/repaired in place; findings never stop the run).
-                    if isinstance(agent_instance, MLAgent):
-                        # Reconstruct ml_files for potential repair retry
-                        current_dataset_file = None
-                        for cand in ["feature_engineered_dataset.csv", "cleaned_dataset.csv", "cleaned_data.csv"]:
-                            cand_path = os.path.join(self.current_output_dir, cand)
-                            if cand in self.generated_artifacts or os.path.exists(cand_path):
-                                current_dataset_file = cand
-                                break
-
-                        ml_files = list(files_list)
-                        if current_dataset_file:
-                            full_cand_path = os.path.join(self.current_output_dir, current_dataset_file)
-                            if full_cand_path not in ml_files and current_dataset_file not in ml_files:
-                                ml_files.insert(0, full_cand_path)
-
-                        vm_path = os.path.join(self.current_output_dir, "verified_metrics.json")
-                        if os.path.exists(vm_path) and vm_path not in ml_files and "verified_metrics.json" not in ml_files:
-                            ml_files.append(vm_path)
-
-                        # Run champion consistency check with retry for disagreements
-                        max_champ_retries = 1  # Single targeted retry for champion pointer fixes
-                        champ_retry = 0
-                        while champ_retry <= max_champ_retries:
-                            try:
-                                champ_check = verify_champion_consistency(
-                                    self.current_output_dir, goal_text=query_text
+                    # Post-task champion selection: after model_comparison task, select initial champion.
+                    # After hyperparameter_tuning task, evaluate challenger against current champion.
+                    if isinstance(agent_instance, MLAgent) and task.task_type in ("model_comparison", "hyperparameter_tuning"):
+                        try:
+                            primary_metric = task.primary_metric
+                            if task.task_type == "model_comparison":
+                                champ_result = select_initial_champion(
+                                    self.current_output_dir,
+                                    goal_text=query_text,
+                                    primary_metric=primary_metric
                                 )
-                                if champ_check.get("repairs"):
-                                    print(f"[Orchestrator] Champion consistency repairs (Task #{task.task_id}): "
-                                          f"{champ_check['repairs']}", flush=True)
-
-                                # Check for champion disagreement findings that need targeted retry
-                                champ_disagreement_findings = [
-                                    f for f in champ_check.get("findings", [])
-                                    if f.get("code") in (
-                                        "champion_pointer_disagreement",
-                                        "champion_registry_disagreement",
-                                        "stale_champion_pointer",
-                                        "stale_threshold_analysis",
-                                        "champion_disagreement_ml_summary",
-                                        "threshold_analysis_model_mismatch",
-                                        "registry_missing_artifact",
-                                        "artifact_load_verification_failed",
-                                    )
-                                ]
-
-                                if champ_disagreement_findings and champ_retry < max_champ_retries:
-                                    champ_retry += 1
-                                    print(f"[Orchestrator] Champion disagreement detected (attempt {champ_retry}/{max_champ_retries}), running targeted repair...")
-                                    if HAS_LOGFIRE:
-                                        logfire.info(
-                                            "Champion disagreement retry",
-                                            task_id=task.task_id,
-                                            attempt=champ_retry,
-                                            findings=[f["code"] for f in champ_disagreement_findings],
-                                        )
-
-                                    # Run targeted repair using MLAgent with champion repair prompt
-                                    # The repair only fixes metadata pointers, doesn't retrain models
-                                    try:
-                                        # Build champion repair prompt
-                                        vr = ValidationResult(
-                                            is_valid=False,
-                                            missing_artifacts=[],
-                                            existing_artifacts=[],
-                                            fallback_detected=False,
-                                            hallucination_warnings=[f["message"] for f in champ_disagreement_findings],
-                                            report_structure_valid=True,
-                                            report_structure_issues=[]
-                                        )
-                                        repair_prompt = build_champion_repair_prompt(
-                                            vr, agent_class_name, task.title, task.description,
-                                            self.current_output_dir, [f["message"] for f in champ_disagreement_findings]
-                                        )
-
-                                        # Run the repair
-                                        agent_res = agent_instance.run_task(
-                                            prompt=repair_prompt,
-                                            uploaded_files=ml_files,
-                                            plan=active_plan,
-                                            task_id=task.task_id,
-                                            max_tool_calls=5,  # Small budget for pointer fixes only
-                                            step_callback=step_callback,
-                                            cancellation_token=self.cancellation_token
-                                        )
-
-                                        # Collect any generated files
-                                        for gf in agent_res.get("generated_files", []) or []:
-                                            if gf not in self.generated_artifacts:
-                                                self.generated_artifacts.append(gf)
-
-                                        # Continue loop to re-verify
-                                        continue
-
-                                    except Exception as repair_err:
-                                        print(f"[Orchestrator Notice] champion repair failed: {repair_err}")
-                                        if HAS_LOGFIRE:
-                                            logfire.warn("Champion repair attempt failed", error=str(repair_err))
-                                        # Continue to re-check anyway (maybe auto-repair worked)
-
-                                # If consistent or max retries reached, log and break
-                                if not champ_check.get("consistent", True):
-                                    if HAS_LOGFIRE:
-                                        logfire.warn(
-                                            "Champion consistency check found disagreements after ML task",
-                                            task_id=task.task_id,
-                                            detail=[f["message"] for f in champ_check.get("findings", [])],
-                                            retries_exhausted=champ_retry >= max_champ_retries
-                                        )
-                                break  # Exit retry loop
-
-                            except Exception as champ_err:
-                                print(f"[Orchestrator Notice] champion consistency check skipped: {champ_err}")
-                                break
+                                # Handle new ChampionSelectionResult type
+                                if isinstance(champ_result, ChampionSelectionResult):
+                                    if champ_result.is_success() and champ_result.champion:
+                                        champ = champ_result.champion
+                                        print(f"[Orchestrator] Initial champion selected (Task #{task.task_id}): "
+                                              f"{champ['model_name']} ({champ_result.primary_metric_name or primary_metric}={champ['score']:.4f})", flush=True)
+                                    else:
+                                        print(f"[Orchestrator] Champion selection issue (Task #{task.task_id}): {champ_result.error_message or champ_result.status.value}", flush=True)
+                                elif champ_result and isinstance(champ_result, dict) and not champ_result.get("error"):
+                                    # Backward compat
+                                    print(f"[Orchestrator] Initial champion selected (Task #{task.task_id}): "
+                                          f"{champ_result['model_name']} ({champ_result.get('primary_metric_name', primary_metric)}={champ_result['score']:.4f})", flush=True)
+                                elif champ_result and isinstance(champ_result, dict) and champ_result.get("error"):
+                                    print(f"[Orchestrator] Champion selection issue (Task #{task.task_id}): {champ_result['message']}", flush=True)
+                            elif task.task_type == "hyperparameter_tuning":
+                                champ_result = evaluate_challenger(
+                                    self.current_output_dir,
+                                    goal_text=query_text,
+                                    primary_metric=primary_metric
+                                )
+                                if isinstance(champ_result, ChampionSelectionResult):
+                                    if champ_result.is_success() and champ_result.champion:
+                                        champ = champ_result.champion
+                                        print(f"[Orchestrator] Challenger evaluated (Task #{task.task_id}): "
+                                              f"champion={champ['model_name']} ({champ_result.primary_metric_name or primary_metric}={champ['score']:.4f})", flush=True)
+                                    else:
+                                        print(f"[Orchestrator] Challenger evaluation issue (Task #{task.task_id}): {champ_result.error_message or champ_result.status.value}", flush=True)
+                                elif champ_result and isinstance(champ_result, dict):
+                                    # Backward compat
+                                    print(f"[Orchestrator] Challenger evaluated (Task #{task.task_id}): "
+                                          f"champion={champ_result['model_name']} ({champ_result.get('primary_metric_name', primary_metric)}={champ_result['score']:.4f})", flush=True)
+                        except Exception as champ_err:
+                            print(f"[Orchestrator Notice] champion selection skipped: {champ_err}")
 
                     # Global counters: per-task latency, status, retries
                     task_duration = time.perf_counter() - task_t0
@@ -1627,7 +1803,9 @@ class WorkflowOrchestrator:
                             fact_sheet = None
                             try:
                                 preflight = run_preflight(self.current_output_dir, goal_text=query_text)
-                                if preflight.get("repairs"):
+                                if preflight.get("repairs_applied"):
+                                    print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs_applied']}", flush=True)
+                                elif preflight.get("repairs"):  # backward compat
                                     print(f"[Orchestrator] Preflight repairs applied: {preflight['repairs']}", flush=True)
                                 verified_metrics = build_verified_metrics(self.current_output_dir, uploaded_files=files_list)
                                 fact_sheet = build_facts(self.current_output_dir, verified_metrics, preflight)
@@ -1752,8 +1930,8 @@ class WorkflowOrchestrator:
                 # calls per attempt), re-verifying with all methods after each.
                 with task_context(agent="ReporterAgent", phase="repair"):
                     with get_recorder().step_timer("report_repair"):
-                        self._repair_final_report(verification, files_list, step_callback=step_callback)
-                findings = verification["findings"]
+                        verification = self._repair_final_report(verification, files_list, step_callback=step_callback)
+                findings = verification.get("findings", [])
 
                 classification = self._classify_run_status(findings)
                 workflow_status = classification["status"]
@@ -1798,6 +1976,7 @@ class WorkflowOrchestrator:
                 run_manifest = {
                     "run_id": os.path.basename(self.current_output_dir),
                     "plan_id": active_plan.plan_id,
+                    "dataset_type": getattr(active_plan, "dataset_type", "classification"),
                     "query": query_text,
                     "input_files": files_list,
                     "output_dir": self.current_output_dir,
@@ -1881,6 +2060,74 @@ class WorkflowOrchestrator:
                     "repair_attempts_used": getattr(self, "repair_attempts_used", 0),
                     "status_message": workflow_message,
                     "run_manifest": run_manifest
+                }
+
+            except WorkflowPausedException as pause_err:
+                active_plan.status = PlanStatus.PAUSED
+                paused_task_id = pause_err.task_id or (current_active_task.task_id if current_active_task else 1)
+
+                # Mark the currently running task as "paused", NOT completed!
+                if current_active_task:
+                    current_active_task.status = "paused"
+                    current_active_task.result = f"Paused during execution ({pause_err.step or 'in-progress step'}). Will re-execute on resume."
+
+                # Keep subsequent tasks in pending state
+                for t in active_plan.tasks:
+                    if t.task_id > paused_task_id and t.status in ["in_progress", "paused"]:
+                        t.status = "pending"
+
+                # Filter out any incomplete result for paused_task_id or later
+                self.completed_task_results = [
+                    tr for tr in self.completed_task_results
+                    if tr.get("task_id", 0) < paused_task_id
+                ]
+
+                pause_msg = (
+                    f"Workflow paused at {pause_err.step or (f'Task #{paused_task_id}' if paused_task_id else 'in-progress step')}. "
+                    f"In-progress step halted immediately and will be re-executed upon resuming."
+                )
+
+                checkpoint = {
+                    "workflow_id": active_plan.plan_id or f"wf_{int(time.time())}",
+                    "status": "paused",
+                    "paused_at": datetime.now().isoformat(),
+                    "paused_task_id": paused_task_id,
+                    "paused_step": pause_err.step or f"Task #{paused_task_id}",
+                    "reason": pause_err.message,
+                    "user_query": query_text,
+                    "input_files": files_list,
+                    "output_dir": self.current_output_dir,
+                    "plan": active_plan.to_dict(),
+                    "completed_task_results": copy.deepcopy(self.completed_task_results),
+                    "generated_artifacts": list(self.generated_artifacts),
+                    "final_report": self.final_report,
+                }
+                self.last_pause_checkpoint = checkpoint
+
+                _safe_callback("workflow_paused", {
+                    "status": "paused",
+                    "plan_id": active_plan.plan_id,
+                    "task_id": paused_task_id,
+                    "step": pause_err.step,
+                    "message": pause_msg,
+                    "output_dir": self.current_output_dir,
+                    "artifacts": self.generated_artifacts,
+                    "completed_tasks": len(self.completed_task_results),
+                    "checkpoint": checkpoint,
+                })
+
+                if HAS_LOGFIRE:
+                    logfire.info("Workflow Paused by User", reason=pause_err.message, step=pause_err.step, task_id=paused_task_id)
+
+                return {
+                    "status": "paused",
+                    "message": pause_msg,
+                    "plan": active_plan.to_dict(),
+                    "task_results": self.completed_task_results,
+                    "generated_artifacts": self.generated_artifacts,
+                    "output_dir": self.current_output_dir,
+                    "paused_task_id": paused_task_id,
+                    "checkpoint": checkpoint,
                 }
 
             except WorkflowCancelledException as cancel_err:
@@ -1980,6 +2227,7 @@ class WorkflowOrchestrator:
                     workflow_result = _execute_workflow()
             return workflow_result
         finally:
+            self.current_active_task = None
             # Close the run: writes the run_summary event + run_metrics.json.
             try:
                 status = workflow_result.get("status") if isinstance(workflow_result, dict) else "failed"

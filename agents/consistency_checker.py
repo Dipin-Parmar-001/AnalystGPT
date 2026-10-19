@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, asdict
 
 from agents.run_context import build_dataset_profile
 from agents.logger import setup_logfire
+from agents.preflight_gate import _match_artifact, _find_matching_artifact
 
 try:
     import logfire
@@ -151,9 +152,16 @@ def check_dataset_shape_claims(output_dir: str, profile: Dict[str, Any]) -> List
     datasets = profile.get("datasets", {})
     ds_entries = [ds for ds in datasets.values() if ds and not ds.get("error")]
 
-    def _matches_any(claimed: Tuple[Optional[int], Optional[int]]) -> bool:
+    def _matches_any(claimed: Tuple[Optional[int], Optional[int]], target_file: Optional[str] = None) -> bool:
         c_rows, c_cols = claimed
-        for ds in ds_entries:
+        candidates = ds_entries
+        if target_file:
+            target = os.path.basename(str(target_file)).lower()
+            derived = next((ds for name, ds in (profile.get("derived_artifacts") or {}).items()
+                            if str(name).lower() == target), None)
+            named = next((ds for ds in ds_entries if str(ds.get("file", "")).lower() == target), None)
+            candidates = [ds for ds in ([named] if named else [derived]) if ds and not ds.get("error")]
+        for ds in candidates:
             r_ok = c_rows is None or ds.get("rows") is None or c_rows == ds["rows"]
             c_ok = c_cols is None or ds.get("cols") is None or c_cols == ds["cols"]
             if r_ok and c_ok and (c_rows is not None or c_cols is not None):
@@ -172,12 +180,23 @@ def check_dataset_shape_claims(output_dir: str, profile: Dict[str, Any]) -> List
             shape = _shape_like(value)
             if shape is None:
                 continue
+            # Bind explicitly named output shapes to the artifact registered
+            # under the same output role. This prevents a coincidentally equal
+            # shape in an unrelated CSV from validating the claim.
+            target_file = None
+            shape_key = jpath.rsplit(".", 1)[-1]
+            output_files = summary.get("output_files") or {}
+            if shape_key.endswith("_output_shape") and isinstance(output_files, dict):
+                role = shape_key[:-len("_output_shape")]
+                target_file = output_files.get(role)
+            if shape_key == "output_shape":
+                target_file = summary.get("output_file") or target_file
             # 'initial' is task-relative: the raw upload for the cleaning task but
             # cleaned/FE for downstream tasks — so both initial and processed shape
             # claims use match-any semantics. A claim is only a hallucination when
             # it matches NO dataset artifact on disk (uploads included).
             is_initial = ".initial_shape" in jpath or jpath.startswith("initial_shape")
-            if not _matches_any(shape):
+            if not _matches_any(shape, target_file):
                 actual_desc = "; ".join(
                     f"{ds['file']}={ds['rows']}x{ds['cols']}" for ds in ds_entries if ds.get("rows")
                 ) or "no dataset artifacts profiled"
@@ -213,6 +232,203 @@ def check_dataset_shape_claims(output_dir: str, profile: Dict[str, Any]) -> List
                 ["feature_engineering_summary.json"],
             ))
 
+    # Reconcile row counts for every explicitly linked input/output pair. A
+    # grain change is acceptable only when its metadata explains the operation
+    # and the output is unique at the declared grouping key(s).
+    artifact_entries = {
+        str(ds.get("file", "")).lower(): ds
+        for ds in list(datasets.values()) + list((profile.get("derived_artifacts") or {}).values())
+        if isinstance(ds, dict) and ds.get("file") and not ds.get("error")
+    }
+
+    def _summary_outputs(summary: Dict[str, Any]):
+        outputs = []
+        seen = set()
+        output_file = summary.get("output_file")
+        if output_file:
+            outputs.append((None, output_file))
+            seen.add(os.path.basename(str(output_file)).lower())
+        output_files = summary.get("output_files")
+        if isinstance(output_files, dict):
+            for role, filename in output_files.items():
+                key = os.path.basename(str(filename)).lower() if filename else ""
+                if filename and key not in seen:
+                    outputs.append((str(role), filename))
+                    seen.add(key)
+        return outputs
+
+    for summary_path in sorted(glob.glob(os.path.join(output_dir, "*summary*.json"))):
+        if os.path.basename(summary_path) == "dataset_profile.json":
+            continue
+        summary = _load_json_safe(summary_path)
+        if not isinstance(summary, dict):
+            continue
+        input_file = summary.get("source_file") or summary.get("input_file")
+        if not input_file:
+            continue
+        source = artifact_entries.get(os.path.basename(str(input_file)).lower())
+        if not source:
+            continue
+
+        row_grain = summary.get("row_grain") if isinstance(summary.get("row_grain"), dict) else {}
+        input_grain = summary.get("input_grain") or row_grain.get("input")
+        row_change = summary.get("row_count_change") if isinstance(summary.get("row_count_change"), dict) else {}
+        row_changes = summary.get("row_count_changes") if isinstance(summary.get("row_count_changes"), dict) else {}
+        row_operations_by_role = summary.get("row_operations_by_role")
+        row_operations_by_role = row_operations_by_role if isinstance(row_operations_by_role, dict) else {}
+        shared_row_ops = summary.get("row_operations") or summary.get("row_reconciliation")
+        output_grains = summary.get("output_grains") if isinstance(summary.get("output_grains"), dict) else {}
+
+        for role, output_file in _summary_outputs(summary):
+            target = artifact_entries.get(os.path.basename(str(output_file)).lower())
+            if not target:
+                continue
+            delta = int(target.get("rows", 0)) - int(source.get("rows", 0))
+            if not delta:
+                continue
+
+            change = row_changes.get(role) if role else None
+            change = change if isinstance(change, dict) else row_change if role is None else {}
+            row_ops = row_operations_by_role.get(role) if role else shared_row_ops
+            output_grain = (output_grains.get(role) if role else None) or summary.get("output_grain") or row_grain.get("output")
+            grouping_keys = change.get("grouping_keys")
+            transition_ok = bool(
+                input_grain and output_grain and change.get("reason")
+                and change.get("input_rows") == source.get("rows")
+                and change.get("output_rows") == target.get("rows")
+                and str(input_grain) == str(source.get("row_grain", "undeclared"))
+                and str(output_grain) == str(target.get("row_grain", "undeclared"))
+                and isinstance(grouping_keys, list) and grouping_keys
+            )
+            if transition_ok:
+                try:
+                    import pandas as pd
+                    frame = pd.read_csv(os.path.join(output_dir, target["file"]))
+                    transition_ok = all(key in frame.columns for key in grouping_keys)
+                    if transition_ok:
+                        transition_ok = not frame.duplicated(subset=grouping_keys).any()
+                except Exception:
+                    transition_ok = False
+
+            operations_ok = False
+            if isinstance(row_ops, dict):
+                input_rows = row_ops.get("initial_rows", row_ops.get("input_rows"))
+                output_rows = row_ops.get("retained", row_ops.get("output_rows"))
+                removed = row_ops.get("removed") or []
+                added = row_ops.get("added") or []
+                if isinstance(removed, list) and isinstance(added, list):
+                    try:
+                        removed_count = sum(int(item.get("count", 0)) for item in removed if isinstance(item, dict))
+                        added_count = sum(int(item.get("count", 0)) for item in added if isinstance(item, dict))
+                        complete = all(isinstance(item, dict) and item.get("reason") and "count" in item
+                                       for item in removed + added)
+                        operations_ok = bool(
+                            input_rows == source.get("rows") and output_rows == target.get("rows")
+                            and complete and input_rows - removed_count + added_count == output_rows
+                        )
+                    except (TypeError, ValueError):
+                        operations_ok = False
+
+            if not transition_ok and not operations_ok:
+                findings.append(Finding(
+                    SEVERITY_CRITICAL, "artifact_row_count_change_unreconciled",
+                    f"{os.path.basename(str(output_file))} changed rows from {source.get('rows')} to {target.get('rows')} ({delta:+d}) without a verified row operation or declared grain transition with matching counts and unique grouping keys.",
+                    [os.path.basename(str(input_file)), os.path.basename(str(output_file)), os.path.basename(summary_path)],
+                ))
+
+    return findings
+
+
+def _canonical_param(value: Any) -> Any:
+    """Make JSON numeric strings and equivalent int/float parameters comparable."""
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+            return int(number) if number.is_integer() else number
+        except (ValueError, AttributeError):
+            return value.strip().lower()
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def check_ml_result_consistency(output_dir: str, report_text: str = "") -> List[Finding]:
+    """Cross-check clustering counts and tuning parameters against their artifacts."""
+    findings: List[Finding] = []
+    tuning = _load_json_safe(os.path.join(output_dir, "hyperparameter_tuning_summary.json"))
+    best = _load_json_safe(os.path.join(output_dir, "best_params.json"))
+    if isinstance(tuning, dict) and isinstance(best, dict):
+        expected = tuning.get("best_params") or (tuning.get("challenger_model") or {})
+        if isinstance(expected, dict) and "best_parameters" in expected and isinstance(expected["best_parameters"], dict):
+            expected = expected["best_parameters"]
+        actual = best.get("best_parameters") or best.get("best_params") or {}
+        if isinstance(expected, dict) and isinstance(actual, dict):
+            keys = set(expected) | set(actual)
+            mismatches = [k for k in sorted(keys) if k not in expected or k not in actual or
+                          _canonical_param(expected[k]) != _canonical_param(actual[k])]
+            if mismatches:
+                findings.append(Finding(
+                    SEVERITY_CRITICAL, "tuning_parameter_disagreement",
+                    "best_params.json and hyperparameter_tuning_summary.json disagree on "
+                    + ", ".join(f"{k} ({expected.get(k, 'missing')} vs {actual.get(k, 'missing')})" for k in mismatches)
+                    + ". Use the executed search result and model metadata as ground truth.",
+                    ["best_params.json", "hyperparameter_tuning_summary.json"],
+                ))
+
+    # The tuned comparison table is another execution artifact; its parameter
+    # text and challenger row must agree with the structured search result.
+    tuned_csv = os.path.join(output_dir, "tuned_model_comparison.csv")
+    if isinstance(tuning, dict) and os.path.isfile(tuned_csv):
+        try:
+            import pandas as pd
+            table = pd.read_csv(tuned_csv)
+            challenger = tuning.get("challenger_model") or {}
+            expected = {k: _canonical_param(v) for k, v in challenger.items()
+                        if k in {"n_clusters", "eps", "min_samples", "init", "n_init", "linkage"}}
+            mismatches = []
+            for _, row in table.iterrows():
+                artifact = str(row.get("artifact", row.get("model_artifact", "")))
+                if artifact and artifact != str(challenger.get("artifact", "")):
+                    continue
+                config = str(row.get("configuration", ""))
+                for key, value in expected.items():
+                    match = re.search(rf"\b{re.escape(key)}\s*=\s*([^,;]+)", config, re.IGNORECASE)
+                    if match and _canonical_param(match.group(1)) != value:
+                        mismatches.append(f"{key} ({value} vs {match.group(1).strip()})")
+            if mismatches:
+                findings.append(Finding(
+                    SEVERITY_CRITICAL, "tuned_artifact_parameter_disagreement",
+                    "tuned_model_comparison.csv disagrees with the challenger metadata: "
+                    + ", ".join(dict.fromkeys(mismatches)) + ".",
+                    ["tuned_model_comparison.csv", "hyperparameter_tuning_summary.json"],
+                ))
+        except Exception as exc:
+            findings.append(Finding(SEVERITY_MINOR, "tuned_parameter_check_error",
+                                    f"Could not verify tuned comparison parameters: {exc}", ["tuned_model_comparison.csv"]))
+
+    predictions_path = os.path.join(output_dir, "predictions.csv")
+    if os.path.isfile(predictions_path):
+        try:
+            import pandas as pd
+            frame = pd.read_csv(predictions_path)
+            cluster_col = next((c for c in frame.columns if c.strip().lower() in {"cluster", "cluster_label", "label"}), None)
+            if cluster_col:
+                counts = frame[cluster_col].value_counts(dropna=False).to_dict()
+                actual_counts = {str(k): int(v) for k, v in counts.items()}
+                # Validate report statements that explicitly give cluster sizes.
+                for label, count in actual_counts.items():
+                    pattern = rf"cluster\s*{re.escape(label)}[^\n\r]{{0,100}}?([\d,]+)\s+(?:customers|samples|records)"
+                    for match in re.finditer(pattern, report_text, re.IGNORECASE):
+                        claimed = int(match.group(1).replace(",", ""))
+                        if claimed != count:
+                            findings.append(Finding(
+                                SEVERITY_CRITICAL, "cluster_count_mismatch",
+                                f"Report claims Cluster {label} has {claimed:,} records; predictions.csv contains {count:,}.",
+                                ["predictions.csv", "final_report.md"],
+                            ))
+        except Exception as exc:
+            findings.append(Finding(SEVERITY_MINOR, "cluster_count_check_error",
+                                    f"Could not verify prediction cluster counts: {exc}", ["predictions.csv"]))
     return findings
 
 
@@ -248,6 +464,8 @@ def check_phantom_columns(output_dir: str, profile: Dict[str, Any]) -> List[Find
     findings: List[Finding] = []
     all_columns: set = set()
     for ds in profile.get("datasets", {}).values():
+        all_columns.update(ds.get("columns") or [])
+    for ds in (profile.get("derived_artifacts") or {}).values():
         all_columns.update(ds.get("columns") or [])
     if not all_columns:
         return findings
@@ -342,27 +560,42 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
 
     champion = _load_json_safe(os.path.join(output_dir, "champion_model.json"))
     if isinstance(champion, dict):
-        champ_artifact = champion.get("model") or champion.get("artifact_filename")
-        if champ_artifact and champ_artifact not in pkl_files:
+        champ_artifact = champion.get("artifact_filename") or champion.get("model")
+        if champ_artifact and not _find_matching_artifact(champ_artifact, pkl_files):
             findings.append(Finding(
                 SEVERITY_CRITICAL, "stale_champion_pointer",
                 f"champion_model.json points to '{champ_artifact}', which does not exist on disk. Available: {', '.join(sorted(pkl_files)) or 'none'}.",
                 ["champion_model.json"],
             ))
-        elif champ_artifact and champ_artifact in pkl_files:
-            # Verify the artifact can be loaded and metadata matches
-            _verify_artifact_load(output_dir, champ_artifact, champion, findings)
+        from agents.preflight_gate import is_dummy_classifier
+        if is_dummy_classifier(champion):
+            champ_disp = champion.get("model_name") or champion.get("model") or champ_artifact or "DummyClassifier"
+            findings.append(Finding(
+                SEVERITY_MINOR, "dummy_classifier_champion",
+                f"Dummy classifier model ('{champ_disp}') was designated as champion in champion_model.json. "
+                f"The dummy classifier model can be trained and evaluated on the baseline but cannot be deployed or promoted as the champion. "
+                f"Please update the related files which are promoting the dummy classifier as champion (e.g. champion_model.json, model_registry.json, ml_summary.json) "
+                f"and update artifacts to promote another one best model as champion.",
+                ["champion_model.json", "model_registry.json", "ml_summary.json"],
+            ))
 
     registry = _load_json_safe(os.path.join(output_dir, "model_registry.json"))
     registry_champion_artifacts = set()
     if registry is not None:
         entries = registry.get("models") if isinstance(registry, dict) else registry
         if isinstance(entries, list):
+            artifact_parameter_map: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 artifact = entry.get("artifact_filename") or entry.get("artifact")
-                if artifact and artifact not in pkl_files:
+                params = entry.get("model_parameters") or {}
+                if artifact and isinstance(params, dict):
+                    comparable = {k: _canonical_param(v) for k, v in params.items()
+                                  if k in {"n_clusters", "eps", "min_samples", "linkage", "init", "n_init"}
+                                  and v is not None}
+                    artifact_parameter_map.setdefault(artifact, []).append((str(entry.get("model_id", "?")), comparable))
+                if artifact and not _find_matching_artifact(artifact, pkl_files):
                     findings.append(Finding(
                         SEVERITY_CRITICAL, "registry_missing_artifact",
                         f"model_registry.json entry '{entry.get('model_id', '?')}' references '{artifact}', which does not exist on disk.",
@@ -371,14 +604,42 @@ def check_model_artifact_consistency(output_dir: str) -> List[Finding]:
                 if isinstance(entry.get("status"), str) and entry["status"].lower() == "champion" and artifact:
                     registry_champion_artifacts.add(artifact)
 
+            for artifact, mappings in artifact_parameter_map.items():
+                distinct = {json.dumps(params, sort_keys=True, default=str) for _, params in mappings}
+                if len(distinct) > 1:
+                    findings.append(Finding(
+                        SEVERITY_CRITICAL, "artifact_metadata_parameter_collision",
+                        f"model_registry.json maps artifact '{artifact}' to conflicting model parameters: "
+                        + "; ".join(f"{model_id}={params}" for model_id, params in mappings[:6])
+                        + ". Each parameterized model artifact must resolve to the artifact actually trained with those parameters.",
+                        ["model_registry.json"],
+                    ))
+
         if isinstance(champion, dict) and registry_champion_artifacts:
-            champ_artifact = champion.get("model") or champion.get("artifact_filename")
-            if champ_artifact and champ_artifact not in registry_champion_artifacts:
+            champ_artifact = champion.get("artifact_filename") or champion.get("model")
+            if champ_artifact and not any(_match_artifact(champ_artifact, reg_art) for reg_art in registry_champion_artifacts):
                 findings.append(Finding(
                     SEVERITY_CRITICAL, "champion_registry_disagreement",
                     f"champion_model.json points to '{champ_artifact}' but model_registry.json marks {sorted(registry_champion_artifacts)} as champion. All artifacts must agree on the champion.",
                     ["champion_model.json", "model_registry.json"],
                 ))
+
+            champion_entry = next((e for e in entries if isinstance(e, dict) and
+                                   _match_artifact(e.get("artifact_filename") or e.get("artifact"), champ_artifact) and
+                                   str(e.get("status", "")).lower() == "champion"), None)
+            if champion_entry:
+                champ_params = champion_entry.get("model_parameters") or {}
+                conflicts = [key for key in ("model_family", "n_clusters", "eps", "linkage")
+                             if key in champion and key in (champ_params if key != "model_family" else champion_entry)
+                             and _canonical_param(champion[key]) != _canonical_param(
+                                 champion_entry.get(key) if key == "model_family" else champ_params.get(key))]
+                if conflicts:
+                    findings.append(Finding(
+                        SEVERITY_CRITICAL, "champion_metadata_disagreement",
+                        "champion_model.json and the champion registry entry disagree on "
+                        + ", ".join(conflicts) + ".",
+                        ["champion_model.json", "model_registry.json"],
+                    ))
 
     # tuned_model_comparison.csv rows must reference real, correctly-labeled artifacts
     tuned_path = os.path.join(output_dir, "tuned_model_comparison.csv")
@@ -478,8 +739,10 @@ def _load_csv_bounded(path: str):
     """Loads a CSV with pandas, or returns None if unreadable."""
     try:
         import pandas as pd
-
-        return pd.read_csv(path, nrows=200000)
+        try:
+            return pd.read_csv(path, nrows=200000)
+        except UnicodeDecodeError:
+            return pd.read_csv(path, nrows=200000, encoding="latin-1")
     except Exception:
         return None
 
@@ -497,23 +760,53 @@ def check_cleaning_integrity(output_dir: str, profile: Dict[str, Any]) -> List[F
     findings: List[Finding] = []
     raw_entry = profile.get("datasets", {}).get("raw")
     cleaned_entry = profile.get("datasets", {}).get("cleaned")
-    if not raw_entry or not cleaned_entry or raw_entry.get("error") or cleaned_entry.get("error"):
+    if not cleaned_entry or cleaned_entry.get("error"):
+        return findings
+    cleaned_path = os.path.join(output_dir, cleaned_entry.get("file", ""))
+    if not os.path.exists(cleaned_path):
+        cleaned_path = cleaned_entry.get("file", "")
+    cleaned_df = _load_csv_bounded(cleaned_path)
+    if cleaned_df is None:
+        return findings
+
+    # A declared datetime conversion must leave a usable datetime-like column,
+    # not a wholly null float column (the observed InvoiceDate regression).
+    for summary_name in ("cleaning_summary.json", "analyst_summary.json"):
+        summary = _load_json_safe(os.path.join(output_dir, summary_name))
+        conversions = summary.get("dtype_conversions", []) if isinstance(summary, dict) else []
+        for item in conversions if isinstance(conversions, list) else []:
+            if not isinstance(item, dict) or "datetime" not in str(item.get("dtype_after", "")).lower():
+                continue
+            col = item.get("column")
+            if col in cleaned_df.columns:
+                series = cleaned_df[col]
+                if float(series.isna().mean()) >= 0.99:
+                    findings.append(Finding(
+                        SEVERITY_CRITICAL, "critical_datetime_column_lost",
+                        f"{summary_name} says {col} was converted to {item.get('dtype_after')}, but the cleaned dataset has {series.isna().mean():.1%} null values in that column.",
+                        [summary_name, cleaned_entry.get("file", "cleaned_dataset.csv")],
+                    ))
+    if not raw_entry:
         return findings
     raw_path = raw_entry.get("path") or os.path.join(output_dir, raw_entry.get("file", ""))
     if not os.path.exists(raw_path):
         raw_path = raw_entry.get("file", "")
-    cleaned_path = os.path.join(output_dir, cleaned_entry.get("file", ""))
-    if not os.path.exists(cleaned_path):
-        cleaned_path = cleaned_entry.get("file", "")
     raw_df = _load_csv_bounded(raw_path)
-    cleaned_df = _load_csv_bounded(cleaned_path)
-    if raw_df is None or cleaned_df is None:
+    if raw_df is None:
         return findings
 
     shared = [c for c in raw_df.columns if c in cleaned_df.columns]
     collapsed: List[str] = []
     dropped: List[str] = []
+    null_regressions: List[str] = []
     for col in shared:
+        try:
+            before_null = float(raw_df[col].isna().mean())
+            after_null = float(cleaned_df[col].isna().mean())
+            if before_null < 0.10 and after_null >= 0.99:
+                null_regressions.append(f"'{col}' ({before_null:.1%} -> {after_null:.1%})")
+        except Exception:
+            pass
         try:
             raw_n = int(raw_df[col].nunique(dropna=True))
             clean_n = int(cleaned_df[col].nunique(dropna=True))
@@ -543,6 +836,13 @@ def check_cleaning_integrity(output_dir: str, profile: Dict[str, Any]) -> List[F
             + ". If this is an intentional merge/binning, document it in cleaning_summary.json.",
             [cleaned_entry.get("file", "cleaned_dataset.csv")],
         ))
+    if null_regressions:
+        findings.append(Finding(
+            SEVERITY_CRITICAL, "critical_column_null_rate_regression",
+            "Critical shared column(s) became almost entirely null during cleaning (before -> after): "
+            + "; ".join(null_regressions[:8]) + ". Preserve source values and validate dtype/null-rate changes after reloading the saved CSV.",
+            [raw_entry.get("file", "source dataset"), cleaned_entry.get("file", "cleaned_dataset.csv")],
+        ))
     return findings
 
 
@@ -561,7 +861,7 @@ def check_threshold_analysis(output_dir: str, champion_artifact: Optional[str] =
     """
     findings: List[Finding] = []
     ta = _load_json_safe(os.path.join(output_dir, "threshold_analysis.json"))
-    if not isinstance(ta, dict) or ta.get("applicable") is not True:
+    if not isinstance(ta, dict) or ta.get("applicable") is False or ("recommended_threshold" not in ta and ta.get("applicable") is not True):
         return findings
 
     # Verify the threshold analysis belongs to the champion model
@@ -776,7 +1076,7 @@ def _load_segment_frame(output_dir: str):
     return None, None
 
 
-def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]] = None, dataset_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Recomputes ground-truth segment statistics from the run's dataset artifacts.
 
     Falls back to a name-based segment recomputation from the dataset artifacts when no
@@ -786,6 +1086,18 @@ def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]
     from pathlib import Path
     from sandbox_execution.verification_script import compute_segment_stats, declared_target_column
 
+    if not dataset_type:
+        manifest_path = os.path.join(output_dir, "run_manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                manifest_data = _load_json_safe(manifest_path)
+                if isinstance(manifest_data, dict):
+                    dataset_type = manifest_data.get("dataset_type")
+            except Exception:
+                pass
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return None
+
     df, source = _load_segment_frame(output_dir)
     if df is None:
         return None
@@ -794,7 +1106,7 @@ def _recompute_segment_stats(output_dir: str, uploaded_files: Optional[List[str]
     except Exception:
         declared = None
     try:
-        stats = compute_segment_stats(df, declared_target=declared)
+        stats = compute_segment_stats(df, declared_target=declared, dataset_type=dataset_type)
     except Exception:
         return None
     if not isinstance(stats, dict):
@@ -832,7 +1144,7 @@ def _norm_segment_label(s: str) -> str:
     return _re.sub(r"[\s\-\u2013\u2014_]+", " ", (s or "").strip()).lower()
 
 
-def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Optional[List[str]] = None) -> List[Finding]:
+def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Optional[List[str]] = None, dataset_type: Optional[str] = None) -> List[Finding]:
     """
     Dataset-driven guard against fabricated segment statistics.
 
@@ -866,7 +1178,7 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     findings: List[Finding] = []
     if not report_text:
         return findings
-    stats = _recompute_segment_stats(output_dir, uploaded_files)
+    stats = _recompute_segment_stats(output_dir, uploaded_files, dataset_type=dataset_type)
     if not stats:
         return findings
 
@@ -958,7 +1270,7 @@ def check_segment_claims(output_dir: str, report_text: str, uploaded_files: Opti
     return findings
 
 
-def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[List[str]] = None) -> List[Finding]:
+def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[List[str]] = None, dataset_type: Optional[str] = None) -> List[Finding]:
     """
     Diffs the machine-computed `stats_findings.json` (which the analyst's sandbox
     script is required to emit) against a fresh recomputation from the dataset
@@ -967,6 +1279,19 @@ def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[L
     """
     findings: List[Finding] = []
     sf = _load_json_safe(os.path.join(output_dir, "stats_findings.json"))
+
+    if not dataset_type:
+        manifest_path = os.path.join(output_dir, "run_manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                manifest_data = _load_json_safe(manifest_path)
+                if isinstance(manifest_data, dict):
+                    dataset_type = manifest_data.get("dataset_type")
+            except Exception:
+                pass
+
+    if dataset_type and str(dataset_type).lower() in ("regression", "unsupervised"):
+        return findings
 
     # Contract-compliance signal: a stats-and-viz task ran (analyst summary with
     # generated visualizations) but the required stats artifact was never written.
@@ -984,7 +1309,7 @@ def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[L
                 break
         return findings
 
-    stats = _recompute_segment_stats(output_dir, uploaded_files)
+    stats = _recompute_segment_stats(output_dir, uploaded_files, dataset_type=dataset_type)
     if not stats:
         return findings
 
@@ -1012,12 +1337,24 @@ def check_stats_findings_consistency(output_dir: str, uploaded_files: Optional[L
                 ["stats_findings.json", stats.get("source_file") or "dataset"],
             ))
 
+    df_cache = None
     for seg in sf.get("rate_by_category", []) or []:
         if not isinstance(seg, dict):
             continue
         key = (str(seg.get("feature", "")).lower(), str(seg.get("category", "")).lower())
         rc = recomputed.get(key)
         if rc is None:
+            if df_cache is None:
+                df_cache, _ = _load_segment_frame(output_dir)
+            feat_name = seg.get("feature")
+            cat_name = seg.get("category")
+            if df_cache is not None and feat_name in df_cache.columns:
+                try:
+                    unique_vals = set(df_cache[feat_name].dropna().astype(str).str.lower().unique())
+                    if str(cat_name).lower() in unique_vals:
+                        continue
+                except Exception:
+                    pass
             findings.append(Finding(
                 SEVERITY_MINOR, "stats_findings_unmatched_segment",
                 f"stats_findings.json references segment '{seg.get('feature')}'='{seg.get('category')}' which "
@@ -1060,6 +1397,9 @@ def check_report_artifact_references(
     referenced = set(re.findall(r"\b[\w\-.]+\.(?:png|csv|json|pkl|md)\b", report_text))
     referenced = {r for r in referenced if r != "final_report.md"}
     on_disk = set(os.listdir(output_dir)) if os.path.isdir(output_dir) else set()
+    # A wildcard such as `model_p*.pkl` is prose notation, not a reference to
+    # a literal `_p0.pkl` file.
+    referenced = {r for r in referenced if not r.startswith("_")}
     # Raw uploads live outside the run dir; referencing them is legitimate.
     for f in uploaded_files or []:
         if f:
@@ -1081,6 +1421,7 @@ def run_consistency_checks(
     report_text: Optional[str] = None,
     uploaded_files: Optional[List[str]] = None,
     persist: bool = True,
+    dataset_type: Optional[str] = None,
 ) -> ConsistencyReport:
     """
     Runs all cross-artifact consistency checks for a run directory and returns
@@ -1103,9 +1444,10 @@ def run_consistency_checks(
         ("threshold_analysis", lambda: check_threshold_analysis(output_dir, champion_artifact)),
         ("viz_descriptions", lambda: check_visualization_descriptions(output_dir)),
         ("model_artifact_consistency", lambda: check_model_artifact_consistency(output_dir)),
+        ("ml_result_consistency", lambda: check_ml_result_consistency(output_dir, report_text or "")),
         ("duplicate_summaries", lambda: check_duplicate_summaries(output_dir)),
-        ("segment_claims", lambda: check_segment_claims(output_dir, report_text or "", uploaded_files)),
-        ("stats_findings_consistency", lambda: check_stats_findings_consistency(output_dir, uploaded_files)),
+        ("segment_claims", lambda: check_segment_claims(output_dir, report_text or "", uploaded_files, dataset_type=dataset_type)),
+        ("stats_findings_consistency", lambda: check_stats_findings_consistency(output_dir, uploaded_files, dataset_type=dataset_type)),
         ("report_artifact_references", lambda: check_report_artifact_references(output_dir, report_text or "", uploaded_files)),
     )
 
