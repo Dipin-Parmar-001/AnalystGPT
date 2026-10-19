@@ -1,6 +1,0 @@
-model_list:
-  - model_name: deepseek-v4-pro
-    litellm_params:
-      model: openai/deepseek-ai/deepseek-v4-pro-0813
-      api_base: https://integrate.api.nvidia.com/v1
-      api_key: os.environ/NVIDIA_API_KEY

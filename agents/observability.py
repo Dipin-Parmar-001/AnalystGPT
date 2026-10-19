@@ -261,6 +261,7 @@ def aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     open_steps: Dict[str, Dict[str, Any]] = {}
     errors: List[Dict[str, Any]] = []
     custom_metrics: Dict[str, List[float]] = {}
+    key_metrics: List[str] = []
 
     for ev in events:
         if not isinstance(ev, dict):
@@ -268,7 +269,14 @@ def aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         event = ev.get("event")
         events_by_type[event] = events_by_type.get(event, 0) + 1
 
-        if event == "counter":
+        if event == "plan_created":
+            for m in (ev.get("key_metrics") or []):
+                if m and m not in key_metrics:
+                    key_metrics.append(m)
+            if ev.get("primary_metric") and ev.get("primary_metric") not in key_metrics:
+                key_metrics.append(ev.get("primary_metric"))
+
+        elif event == "counter":
             key = ev.get("counter") or "unknown"
             counters[key] = counters.get(key, 0) + float(ev.get("amount") or 1)
         elif event == "duration":
@@ -345,8 +353,13 @@ def aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                                                      "agent": ev.get("agent"),
                                                      "status": None,
                                                      "duration_s": None,
+                                                     "primary_metric": ev.get("primary_metric"),
                                                      "retries": 0})
             t["retries"] = max(t.get("retries", 0), int(ev.get("attempt") or 0))
+            if ev.get("primary_metric"):
+                t["primary_metric"] = ev.get("primary_metric")
+                if ev.get("primary_metric") not in key_metrics:
+                    key_metrics.append(ev.get("primary_metric"))
 
         elif event == "task_completed":
             t = tasks.setdefault(ev.get("task_id"), {"task_id": ev.get("task_id"),
@@ -354,11 +367,16 @@ def aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                                                      "agent": ev.get("agent"),
                                                      "status": ev.get("status"),
                                                      "duration_s": ev.get("duration_s"),
+                                                     "primary_metric": ev.get("primary_metric"),
                                                      "retries": 0})
             t.update({"title": ev.get("title", t.get("title")),
                       "agent": ev.get("agent", t.get("agent")),
                       "status": ev.get("status", t.get("status")),
                       "duration_s": ev.get("duration_s", t.get("duration_s"))})
+            if ev.get("primary_metric"):
+                t["primary_metric"] = ev.get("primary_metric")
+                if ev.get("primary_metric") not in key_metrics:
+                    key_metrics.append(ev.get("primary_metric"))
             if ev.get("retries") is not None:
                 t["retries"] = int(ev.get("retries") or 0)
 
@@ -420,6 +438,7 @@ def aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             "calls": tool_calls,
         },
         "tasks": list(tasks.values()),
+        "key_metrics": key_metrics,
         "steps": steps,
         "errors": errors,
     }

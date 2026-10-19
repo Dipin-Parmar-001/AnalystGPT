@@ -133,6 +133,31 @@ export default function WorkspaceView({
                 <StatRow label="Plan" value={plan ? `#${plan.plan_id}` : '—'} />
                 <StatRow label="Tasks completed" value={`${completedTasks} / ${plan ? plan.tasks.length : 0}`} />
                 <StatRow label="Datasets selected" value={selectedFiles.length} />
+                {(() => {
+                  const taskMetrics = (plan?.tasks || []).map((t) => t.primary_metric).filter(Boolean);
+                  const metrics = Array.from(new Set([...(plan?.key_metrics || []), ...taskMetrics]));
+                  let val = 'NULL';
+                  let tone = 'text-ink-faint font-code';
+
+                  if (metrics.length > 0) {
+                    val = metrics.join(', ');
+                    tone = 'text-accent-deep font-code font-semibold';
+                  } else if (plan?.effective_metric) {
+                    val = `${plan.effective_metric} (will use)`;
+                    tone = 'text-accent-deep font-code font-semibold';
+                  } else if ((plan?.tasks || []).some(t => t.task_type?.includes('model'))) {
+                    val = (plan.dataset_type === 'regression' ? 'rmse' : 'roc_auc') + ' (will use)';
+                    tone = 'text-accent-deep font-code font-semibold';
+                  }
+
+                  return (
+                    <StatRow
+                      label="Key Metric"
+                      value={val}
+                      tone={tone}
+                    />
+                  );
+                })()}
               </div>
               <div>
                 <StatRow label="Artifacts produced" value={artifacts.length} />
@@ -176,16 +201,30 @@ export default function WorkspaceView({
                 <h4 className="text-[13px] font-semibold text-ink">Active plan preview</h4>
               </div>
               <ul className="pt-3 space-y-2">
-                {plan.tasks.slice(0, 5).map((t) => (
-                  <li key={t.task_id} className="flex items-start gap-2 text-[12px]">
-                    {t.status === 'completed' ? (
-                      <CheckCircle2 className="w-3.5 h-3.5 text-accent mt-0.5 shrink-0" />
-                    ) : (
-                      <span className="w-3.5 h-3.5 mt-0.5 rounded-full border border-edge-strong shrink-0" />
-                    )}
-                    <span className="text-ink-soft leading-snug">{t.title}</span>
-                  </li>
-                ))}
+                {plan.tasks.slice(0, 5).map((t) => {
+                  const hasModel = t.task_type?.includes('model') || t.task_type === 'hyperparameter_tuning';
+                  return (
+                    <li key={t.task_id} className="flex items-start justify-between gap-2 text-[12px]">
+                      <div className="flex items-start gap-2 min-w-0">
+                        {t.status === 'completed' ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-accent mt-0.5 shrink-0" />
+                        ) : (
+                          <span className="w-3.5 h-3.5 mt-0.5 rounded-full border border-edge-strong shrink-0" />
+                        )}
+                        <span className="text-ink-soft leading-snug truncate">{t.title}</span>
+                      </div>
+                      {t.primary_metric ? (
+                        <span className="shrink-0 text-[10.5px] font-code px-1.5 py-0.5 rounded bg-accent-wash text-accent-deep border border-accent-edge font-medium">
+                          🎯 {t.primary_metric}
+                        </span>
+                      ) : (t.effective_metric || hasModel) ? (
+                        <span className="shrink-0 text-[10.5px] font-code px-1.5 py-0.5 rounded bg-accent-wash/60 text-accent-deep border border-accent-edge font-medium" title="Will use default metric">
+                          🎯 {t.effective_metric || 'roc_auc'} <span className="opacity-75 text-[9px] font-sans">(will use)</span>
+                        </span>
+                      ) : null}
+                    </li>
+                  );
+                })}
                 {plan.tasks.length > 5 && (
                   <li className="text-[12px] text-ink-faint pl-5">
                     +{plan.tasks.length - 5} more in Execution Plan

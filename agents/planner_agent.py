@@ -122,6 +122,20 @@ def infer_task_type(title: str = "", description: str = "", assigned_agent: str 
     return "stats_and_viz"
 
 
+def get_effective_primary_metric(task_type: Optional[str] = None, primary_metric: Optional[str] = None, dataset_type: Optional[str] = None) -> Optional[str]:
+    """Returns explicit primary_metric if set, or the default metric the downstream pipeline will use."""
+    if primary_metric:
+        return primary_metric
+    if task_type in ("model_comparison", "hyperparameter_tuning", "model_evaluation", "evaluation", "testing_and_evaluation", "threshold_selection"):
+        dtype = (dataset_type or "").lower()
+        if dtype == "regression":
+            return "rmse"
+        elif dtype == "unsupervised":
+            return "silhouette_score"
+        return "roc_auc"
+    return None
+
+
 @dataclass
 class TaskItem:
     task_id: Any = 1
@@ -138,7 +152,9 @@ class TaskItem:
     primary_metric: Optional[str] = None  # e.g., "recall", "roc_auc", "pr_auc", "f1", "accuracy"
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["effective_metric"] = get_effective_primary_metric(self.task_type, self.primary_metric)
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TaskItem":
@@ -183,8 +199,29 @@ class ExecutionPlan:
     notes: str = ""
     revision_count: int = 0
     dataset_type: str = "classification"  # classification, regression, unsupervised
+    key_metrics: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        explicit_metrics = list(self.key_metrics) if self.key_metrics else []
+        for t in self.tasks:
+            if t.primary_metric and t.primary_metric not in explicit_metrics:
+                explicit_metrics.append(t.primary_metric)
+
+        # What metric is going to be used if not on the plan
+        effective_metrics = list(explicit_metrics)
+        for t in self.tasks:
+            eff = get_effective_primary_metric(t.task_type, t.primary_metric, self.dataset_type)
+            if eff and eff not in effective_metrics:
+                effective_metrics.append(eff)
+
+        has_ml = any(t.task_type in ("model_comparison", "hyperparameter_tuning", "model_evaluation") for t in self.tasks)
+        if not effective_metrics and has_ml:
+            default_m = "rmse" if self.dataset_type == "regression" else ("silhouette_score" if self.dataset_type == "unsupervised" else "roc_auc")
+            effective_metrics = [default_m]
+
+        primary_m = explicit_metrics[0] if explicit_metrics else None
+        effective_m = effective_metrics[0] if effective_metrics else None
+
         return {
             "plan_id": self.plan_id,
             "dataset_type": self.dataset_type,
@@ -193,7 +230,11 @@ class ExecutionPlan:
             "tasks": [t.to_dict() for t in self.tasks],
             "status": self.status.value if isinstance(self.status, PlanStatus) else str(self.status),
             "notes": self.notes,
-            "revision_count": self.revision_count
+            "revision_count": self.revision_count,
+            "key_metrics": explicit_metrics if explicit_metrics else None,
+            "primary_metric": primary_m,
+            "effective_metric": effective_m,
+            "effective_metrics": effective_metrics
         }
 
     @classmethod
@@ -217,6 +258,10 @@ class ExecutionPlan:
             else:
                 dataset_type = "classification"
 
+        key_metrics = data.get("key_metrics", [])
+        if not key_metrics:
+            key_metrics = list(dict.fromkeys([t.primary_metric for t in tasks if t.primary_metric]))
+
         return cls(
             plan_id=data.get("plan_id", str(uuid.uuid4())[:8]),
             dataset_type=str(dataset_type).lower(),
@@ -225,7 +270,8 @@ class ExecutionPlan:
             tasks=tasks,
             status=status,
             notes=data.get("notes", ""),
-            revision_count=data.get("revision_count", 0)
+            revision_count=data.get("revision_count", 0),
+            key_metrics=key_metrics
         )
 
 
@@ -931,6 +977,8 @@ class PlannerAgent:
                 else:
                     dataset_type = str(raw_dtype).strip().lower()
 
+                key_metrics = list(dict.fromkeys([t.primary_metric for t in tasks if t.primary_metric]))
+
                 plan = ExecutionPlan(
                     plan_id=str(uuid.uuid4())[:8],
                     dataset_type=dataset_type,
@@ -939,7 +987,8 @@ class PlannerAgent:
                     tasks=tasks,
                     status=PlanStatus.DRAFT,
                     notes=notes,
-                    revision_count=0
+                    revision_count=0,
+                    key_metrics=key_metrics
                 )
 
                 # 2. Validate prerequisites
@@ -1245,15 +1294,18 @@ class PlannerAgent:
                 tasks.append(task)
 
             mod_dtype = parsed.get("dataset_type") if isinstance(parsed, dict) else None
+            resolved_dtype = str(mod_dtype).strip().lower() if mod_dtype else current_plan.dataset_type
+            mod_metrics = list(dict.fromkeys([t.primary_metric for t in tasks if t.primary_metric]))
             updated_plan = ExecutionPlan(
                 plan_id=current_plan.plan_id,
-                dataset_type=str(mod_dtype).strip().lower() if mod_dtype else current_plan.dataset_type,
+                dataset_type=resolved_dtype,
                 query=current_plan.query,
                 selected_agents=selected_agents,
                 tasks=tasks,
                 status=PlanStatus.MODIFIED,
                 notes=notes,
-                revision_count=current_plan.revision_count + 1
+                revision_count=current_plan.revision_count + 1,
+                key_metrics=mod_metrics
             )
 
             # Validate and self-correct if modified plan has prerequisite errors

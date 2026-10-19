@@ -862,21 +862,28 @@ class WorkflowOrchestrator:
                 )
         rec.add_duration("plan_creation_time_s", time.perf_counter() - plan_t0)
         self.current_plan = plan
+        plan_dict = plan.to_dict()
+        key_metrics = plan_dict.get("key_metrics", [])
+        primary_metric = plan_dict.get("primary_metric")
         rec.log_event(
             "plan_created",
             plan_id=plan.plan_id,
             task_count=len(plan.tasks),
             selected_agents=plan.selected_agents,
+            key_metrics=key_metrics,
+            primary_metric=primary_metric,
             plan_duration_s=round(time.perf_counter() - plan_t0, 6),
         )
 
         if step_callback:
             step_callback("plan_created", {
-                "plan": plan.to_dict(),
+                "plan": plan_dict,
                 "plan_id": plan.plan_id,
                 "selected_agents": plan.selected_agents,
                 "tasks": [t.to_dict() for t in plan.tasks],
-                "notes": plan.notes
+                "notes": plan.notes,
+                "key_metrics": key_metrics,
+                "primary_metric": primary_metric
             })
 
         return plan
@@ -1098,7 +1105,8 @@ class WorkflowOrchestrator:
                         "task_id": task.task_id,
                         "title": task.title,
                         "assigned_agent": agent_class_name,
-                        "description": task.description
+                        "description": task.description,
+                        "primary_metric": task.primary_metric
                     })
 
                     task.status = "in_progress"
@@ -1762,6 +1770,7 @@ class WorkflowOrchestrator:
                         status=task.status,
                         duration_s=round(task_duration, 3),
                         retries=(task_result_entry or {}).get("validation_retries", 0),
+                        primary_metric=task.primary_metric,
                     )
                     reset_task_context(task_ctx_token)
 
@@ -1775,7 +1784,8 @@ class WorkflowOrchestrator:
                         "task_id": task.task_id,
                         "title": task.title,
                         "status": task.status,
-                        "assigned_agent": agent_class_name
+                        "assigned_agent": agent_class_name,
+                        "primary_metric": task.primary_metric
                     })
 
                 # If no explicit Reporter task was executed or report is empty, synthesize final report now

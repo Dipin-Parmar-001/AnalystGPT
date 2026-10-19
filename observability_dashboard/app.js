@@ -145,10 +145,28 @@ function renderKpis(s) {
 
   const failedTasks = tasks.filter(t => t.status === "failed" || t.status === "validation_failed").length;
   const completedTasks = tasks.filter(t => t.status === "completed").length;
+  const explicitKeyMetrics = Array.from(new Set([
+    ...(s.key_metrics || []),
+    ...tasks.map(t => t.primary_metric).filter(Boolean)
+  ]));
+  const hasModelTasks = tasks.some(t => {
+    const txt = String(t.title || t.agent || "").toLowerCase();
+    return txt.includes("model") || txt.includes("train") || txt.includes("tuning") || txt.includes("predict");
+  });
+  let metricVal = "NULL";
+  let metricSub = "No metrics needed";
+  if (explicitKeyMetrics.length > 0) {
+    metricVal = explicitKeyMetrics.join(", ");
+    metricSub = "Planner optimization target";
+  } else if (hasModelTasks) {
+    metricVal = "roc_auc (will use)";
+    metricSub = "Not on plan · default for pipeline";
+  }
 
   const kpis = [
     { label: "Workflow latency", value: fmtSecs(wf?.duration_s ?? s.meta?.elapsed_s), sub: wf ? "step total" : "run elapsed", cls: "" },
     { label: "Plan creation", value: fmtSecs(plan?.total_s), sub: plan ? `${plan.count} plan call(s), avg ${fmtSecs(plan.avg_s)}` : "—", cls: "" },
+    { label: "Selected Key Metric", value: metricVal, sub: metricSub, cls: metricVal !== "NULL" ? "good" : "" },
     { label: "LLM total latency", value: fmtSecs(llm.latency?.total_s), sub: `${fmtNum(llm.latency?.count || 0)} calls · avg ${fmtSecs(llm.latency?.avg_s)} · p99 ${fmtSecs(llm.latency?.p99_s)}`, cls: "" },
     { label: "LLM failure rate", value: pct(llm.failure_rate), sub: `${fmtNum(llm.failed || 0)} failed / ${fmtNum(llm.calls || 0)}`, cls: llm.failure_rate > 0 ? "bad" : "good" },
     { label: "Tool exec time (total)", value: fmtSecs(tools.latency?.total_s), sub: `${fmtNum(tools.latency?.count || 0)} calls · avg ${fmtSecs(tools.latency?.avg_s)} · p99 ${fmtSecs(tools.latency?.p99_s)}`, cls: "" },
@@ -304,16 +322,29 @@ function renderTasks(s) {
   const tasks = s.tasks || [];
   if (!tasks.length) { $("tasks-table").innerHTML = `<div class="empty">No tasks recorded.</div>`; return; }
   $("tasks-table").innerHTML = `<table>
-    <thead><tr><th>#</th><th>Title</th><th>Agent</th><th>Status</th><th class="num">Duration</th><th class="num">Retries</th></tr></thead>
+    <thead><tr><th>#</th><th>Title</th><th>Agent</th><th>Key Metric</th><th>Status</th><th class="num">Duration</th><th class="num">Retries</th></tr></thead>
     <tbody>
-      ${tasks.map(t => `<tr>
-        <td>${esc(t.task_id ?? "—")}</td>
-        <td>${esc(t.title || "—")}</td>
-        <td>${esc(t.agent || "—")}</td>
-        <td><span class="pill ${t.status === "completed" ? "ok" : (String(t.status).includes("fail") ? "bad" : "warn")}">${esc(t.status || "—")}</span></td>
-        <td class="num">${fmtSecs(t.duration_s)}</td>
-        <td class="num">${fmtNum(t.retries || 0)}</td>
-      </tr>`).join("")}
+      ${tasks.map(t => {
+        const isModel = String(t.agent || "").includes("ML") ||
+          String(t.title || "").toLowerCase().includes("model") ||
+          String(t.title || "").toLowerCase().includes("train") ||
+          String(t.title || "").toLowerCase().includes("tuning");
+        let metricHtml = `<span class="muted font-code">NULL</span>`;
+        if (t.primary_metric) {
+          metricHtml = `<span class="pill ok">🎯 ${esc(t.primary_metric)}</span>`;
+        } else if (isModel) {
+          metricHtml = `<span class="pill ok" style="opacity:0.9">🎯 roc_auc <small style="opacity:0.75">(will use)</small></span>`;
+        }
+        return `<tr>
+          <td>${esc(t.task_id ?? "—")}</td>
+          <td>${esc(t.title || "—")}</td>
+          <td>${esc(t.agent || "—")}</td>
+          <td>${metricHtml}</td>
+          <td><span class="pill ${t.status === "completed" ? "ok" : (String(t.status).includes("fail") ? "bad" : "warn")}">${esc(t.status || "—")}</span></td>
+          <td class="num">${fmtSecs(t.duration_s)}</td>
+          <td class="num">${fmtNum(t.retries || 0)}</td>
+        </tr>`;
+      }).join("")}
     </tbody>
   </table>`;
 }

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   ListChecks, CheckCircle2, Clock, Loader2, XCircle, AlertTriangle,
-  BrainCircuit, BarChart3, Cpu, FileText, Edit3, Send, Bot, Play
+  BrainCircuit, BarChart3, Cpu, FileText, Edit3, Send, Bot, Play, Target
 } from 'lucide-react';
 
 const AGENT_BADGES = {
@@ -164,6 +164,52 @@ export default function PlanViewer({ plan, isRunning, onExecutePlan, onModifyPla
           </form>
         )}
 
+        {/* Selected Key Metrics Banner */}
+        {(() => {
+          const explicitMetrics = Array.from(new Set([
+            ...(plan.key_metrics || []),
+            ...(plan.tasks || []).map((t) => t.primary_metric).filter(Boolean)
+          ]));
+          const effectiveMetric = plan.effective_metric || (plan.dataset_type === 'regression' ? 'rmse' : plan.dataset_type === 'unsupervised' ? 'silhouette_score' : (plan.tasks || []).some(t => t.task_type?.includes('model')) ? 'roc_auc' : null);
+
+          return (
+            <div className="flex flex-wrap items-center justify-between gap-2.5 p-3.5 rounded-lg bg-paper border border-edge-soft text-[12.5px]">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-ink">
+                  <Target className="w-4 h-4 text-accent" />
+                  Selected Key Metric{explicitMetrics.length > 1 ? 's' : ''}:
+                </span>
+                {explicitMetrics.length > 0 ? (
+                  explicitMetrics.map((m, i) => (
+                    <span
+                      key={i}
+                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-accent-wash text-accent-deep border border-accent-edge font-code font-semibold text-[11.5px]"
+                    >
+                      🎯 {m}
+                    </span>
+                  ))
+                ) : effectiveMetric ? (
+                  <span
+                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-accent-wash/80 text-accent-deep border border-accent-edge font-code font-semibold text-[11.5px]"
+                    title="Primary metric not explicitly on plan — pipeline will use this default"
+                  >
+                    🎯 {effectiveMetric} <span className="text-[10px] opacity-75 font-sans font-normal">(will use)</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-paper text-ink-faint border border-edge font-code font-semibold text-[11.5px]">
+                    NULL
+                  </span>
+                )}
+              </div>
+              {plan.dataset_type && (
+                <span className="text-[11px] font-medium text-ink-faint bg-card border border-edge rounded px-2 py-0.5 capitalize">
+                  Pipeline: {plan.dataset_type}
+                </span>
+              )}
+            </div>
+          );
+        })()}
+
         {/* Planner strategy notes */}
         {plan.notes && (
           <div className="p-3.5 rounded-lg bg-paper border border-edge-soft text-[12.5px] text-ink-soft leading-relaxed">
@@ -209,11 +255,27 @@ export default function PlanViewer({ plan, isRunning, onExecutePlan, onModifyPla
                     </div>
                   </div>
                   <p className="text-[12.5px] text-ink-soft mt-1 leading-relaxed">{task.description}</p>
-                  {task.expected_output && (
-                    <p className="text-[11.5px] text-ink-faint mt-1.5">
-                      Deliverable: <span className="font-code text-[11px]">{task.expected_output}</span>
-                    </p>
-                  )}
+                  <div className="flex flex-wrap items-center gap-2.5 mt-2">
+                    {task.primary_metric ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-accent-wash/80 border border-accent-edge text-accent-deep text-[11px] font-medium font-code">
+                        <Target className="w-3 h-3 text-accent" />
+                        Key Metric: {task.primary_metric}
+                      </span>
+                    ) : (task.task_type === 'model_comparison' || task.task_type === 'hyperparameter_tuning' || task.task_type === 'model_evaluation' || task.effective_metric) ? (
+                      <span
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-accent-wash/50 border border-accent-edge/60 text-accent-deep text-[11px] font-medium font-code"
+                        title="Primary metric not explicitly set on plan — pipeline will use this default"
+                      >
+                        <Target className="w-3 h-3 text-accent" />
+                        Key Metric: {task.effective_metric || (plan.dataset_type === 'regression' ? 'rmse' : 'roc_auc')} <span className="text-[9.5px] opacity-75 font-sans">(will use)</span>
+                      </span>
+                    ) : null}
+                    {task.expected_output && (
+                      <span className="text-[11.5px] text-ink-faint">
+                        Deliverable: <span className="font-code text-[11px]">{task.expected_output}</span>
+                      </span>
+                    )}
+                  </div>
                 </div>
               </li>
             );
